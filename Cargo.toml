@@ -1,0 +1,65 @@
+[package]
+name = "tachyon-desync"
+version = "0.0.2"
+edition = "2024"
+description = "Standalone Adaptive Packet Desynchronization Client with Per-List Profiles and Wintun/Proxy Capture"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/Dushnilin/tachyon-desync"
+
+[[bin]]
+name = "tachyon-desync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+getrandom = "0.3"
+lru = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+smoltcp = { path = "vendor/smoltcp", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-tcp-cubic",
+    "socket-udp",
+    "assembler-max-segment-count-32",
+] }
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+    "fs",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Graphics_Dwm",
+] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false

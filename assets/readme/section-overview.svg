@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 64" width="1200" height="64">
+  <title>Tachyon Desync Overview</title>
+  <rect width="1200" height="64" rx="12" fill="#0d1117" stroke="#21262d" stroke-width="1.2"/>
+  <rect x="18" y="18" width="4" height="28" rx="2" fill="#38bdf8"/>
+  <text x="36" y="38" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="18" font-weight="700">Ключевые возможности и интерфейс</text>
+  <text x="1176" y="37" text-anchor="end" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">OVERVIEW · GPU UI · WINDOWS / LINUX / MACOS</text>
+</svg>

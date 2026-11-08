@@ -1,0 +1,304 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза (например, v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: windows-amd64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout tachyon-desync
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Checkout private desync engine from Dushnilin/tachyon-core-src
+        uses: actions/checkout@v4
+        with:
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: main
+          sparse-checkout: |
+            crates/core-runtime/src/outbound
+          path: _tachyon_core_src
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test & Build tachyon-desync.exe (Release)
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
+          TACHYON_CORE_OUTBOUND: ${{ github.workspace }}\_tachyon_core_src\crates\core-runtime\src\outbound
+        run: |
+          Remove-Item -Path .cargo\config.toml -ErrorAction SilentlyContinue
+          cargo test
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package Windows release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $bin = "target\x86_64-pc-windows-msvc\release\tachyon-desync.exe"
+          Copy-Item $bin "artifacts\tachyon-desync-windows-amd64.exe"
+          Compress-Archive -Path $bin -DestinationPath "artifacts\tachyon-desync-windows-amd64.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-windows-amd64
+          path: artifacts/*
+
+  build-linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            deb_arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - arch: arm64
+            deb_arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout tachyon-desync
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Checkout private desync engine from Dushnilin/tachyon-core-src
+        uses: actions/checkout@v4
+        with:
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: main
+          sparse-checkout: |
+            crates/core-runtime/src/outbound
+          path: _tachyon_core_src
+
+      - name: Install Linux GUI & OpenGL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build tachyon-desync (Linux ${{ matrix.arch }})
+        env:
+          TACHYON_CORE_OUTBOUND: ${{ github.workspace }}/_tachyon_core_src/crates/core-runtime/src/outbound
+        run: |
+          rm -f .cargo/config.toml
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Linux .tar.gz and .deb
+        run: |
+          mkdir -p artifacts
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+          bin="target/${{ matrix.target }}/release/tachyon-desync"
+          strip "$bin" || true
+
+          tar -czf "artifacts/tachyon-desync-linux-${{ matrix.arch }}.tar.gz" -C "target/${{ matrix.target }}/release" tachyon-desync
+
+          pkg_dir="deb_root"
+          mkdir -p "$pkg_dir/DEBIAN" "$pkg_dir/usr/bin" "$pkg_dir/usr/share/applications"
+          cp "$bin" "$pkg_dir/usr/bin/tachyon-desync"
+          chmod 0755 "$pkg_dir/usr/bin/tachyon-desync"
+
+          cat > "$pkg_dir/DEBIAN/control" <<EOF
+          Package: tachyon-desync
+          Version: ${ver}
+          Section: net
+          Priority: optional
+          Architecture: ${{ matrix.deb_arch }}
+          Depends: libc6, libgl1, libx11-6, libxkbcommon0, iproute2
+          Maintainer: Dushnilin <Dushnilin@gmail.com>
+          Description: Native L3/L4/L7 adaptive packet desynchronizer with OpenGL GUI and TUN/SOCKS5 capture.
+          EOF
+
+          cat > "$pkg_dir/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          if command -v setcap >/dev/null 2>&1; then
+            setcap cap_net_admin,cap_net_raw+eip /usr/bin/tachyon-desync || true
+          fi
+          exit 0
+          EOF
+          chmod 0755 "$pkg_dir/DEBIAN/postinst"
+
+          cat > "$pkg_dir/usr/share/applications/tachyon-desync.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Tachyon Desync
+          Comment=L3/L4/L7 adaptive packet desynchronizer
+          Exec=/usr/bin/tachyon-desync
+          Terminal=false
+          Categories=Network;Utility;
+          EOF
+
+          dpkg-deb --build "$pkg_dir" "artifacts/tachyon-desync_${{ matrix.deb_arch }}.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-linux-${{ matrix.arch }}
+          path: artifacts/*
+
+  build-macos:
+    name: macos-universal
+    runs-on: macos-latest
+    steps:
+      - name: Checkout tachyon-desync
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Checkout private desync engine from Dushnilin/tachyon-core-src
+        uses: actions/checkout@v4
+        with:
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: main
+          sparse-checkout: |
+            crates/core-runtime/src/outbound
+          path: _tachyon_core_src
+
+      - name: Install Rust stable (arm64 + x86_64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build tachyon-desync (Apple Silicon + Intel)
+        env:
+          TACHYON_CORE_OUTBOUND: ${{ github.workspace }}/_tachyon_core_src/crates/core-runtime/src/outbound
+        run: |
+          rm -f .cargo/config.toml
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Package macOS .tar.gz and Universal .dmg (.app)
+        run: |
+          mkdir -p artifacts
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+
+          tar -czf "artifacts/tachyon-desync-macos-arm64.tar.gz" -C "target/aarch64-apple-darwin/release" tachyon-desync
+          tar -czf "artifacts/tachyon-desync-macos-amd64.tar.gz" -C "target/x86_64-apple-darwin/release" tachyon-desync
+
+          app_dir="dmg_root/Tachyon Desync.app/Contents"
+          mkdir -p "$app_dir/MacOS" "$app_dir/Resources"
+          lipo -create \
+            target/aarch64-apple-darwin/release/tachyon-desync \
+            target/x86_64-apple-darwin/release/tachyon-desync \
+            -output "$app_dir/MacOS/tachyon-desync"
+          chmod 0755 "$app_dir/MacOS/tachyon-desync"
+
+          cat > "$app_dir/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key>
+            <string>Tachyon Desync</string>
+            <key>CFBundleExecutable</key>
+            <string>tachyon-desync</string>
+            <key>CFBundleIdentifier</key>
+            <string>io.tachyon.desync</string>
+            <key>CFBundleName</key>
+            <string>Tachyon Desync</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${ver}</string>
+            <key>CFBundleVersion</key>
+            <string>${ver}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          ln -s /Applications dmg_root/Applications
+          hdiutil create -volname "Tachyon Desync" -srcfolder dmg_root -ov -format UDZO "artifacts/tachyon-desync-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-macos
+          path: artifacts/*
+
+  release:
+    name: publish-release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS and Release Notes
+        run: |
+          cd artifacts
+          sha256sum tachyon-desync* > SHA256SUMS
+          cd ..
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+          awk -v want="## $ver" '
+            /^## / { inside = ($0 == want) }
+            inside
+          ' CHANGELOG.md > section.md
+          if ! grep -q '^## ' section.md; then
+            cp CHANGELOG.md section.md
+          fi
+          {
+            echo "## tachyon-desync v${ver}"
+            echo ""
+            tail -n +2 section.md
+            echo ""
+            echo "### SHA-256"
+            echo ""
+            echo '```text'
+            cat artifacts/SHA256SUMS
+            echo '```'
+          } > release_notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+            gh release edit "$tag" --title "v${ver}" --notes-file release_notes.md
+          else
+            gh release create "$tag" artifacts/* --title "v${ver}" --notes-file release_notes.md
+          fi

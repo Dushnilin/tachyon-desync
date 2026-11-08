@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 220" width="1200" height="220">
+  <title>Tachyon Desync Pipeline</title>
+  <rect width="1200" height="220" rx="14" fill="#0d1117" stroke="#21262d" stroke-width="1.2"/>
+  <text x="32" y="34" fill="#e2e8f0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14" font-weight="700">Архитектура конвейера перехвата и десинхронизации пакетов (Windows · Linux · macOS)</text>
+  <text x="1168" y="34" text-anchor="end" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11">L3 TUN -> L4 SMOLTCP -> L7 SNI/ALPN -> ADAPTIVE BRAIN -> 32 KiB GATE</text>
+
+  <g transform="translate(28, 56)">
+    <rect x="0" y="0" width="210" height="136" rx="10" fill="#131822" stroke="#263144" stroke-width="1.2"/>
+    <text x="16" y="26" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">01 · ПЕРЕХВАТ ОС</text>
+    <text x="16" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">TUN L3 / SOCKS5</text>
+    <text x="16" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Win: Wintun + IP_UNICAST_IF</text>
+    <text x="16" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Linux: /dev/net/tun + SO_MARK</text>
+    <text x="16" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• macOS: utun + IP_BOUND_IF</text>
+
+    <line x1="210" y1="68" x2="234" y2="68" stroke="#38bdf8" stroke-width="1.5"/>
+
+    <rect x="234" y="0" width="210" height="136" rx="10" fill="#131822" stroke="#263144" stroke-width="1.2"/>
+    <text x="250" y="26" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">02 · КЛАССИФИКАТОР</text>
+    <text x="250" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">SNI + Чистый DNS</text>
+    <text x="250" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Разбор TLS ClientHello / HTTP</text>
+    <text x="250" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• DNS :1253/:5353 + 1.1.1.1</text>
+    <text x="250" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• 10 списков + PID фильтр</text>
+
+    <line x1="444" y1="68" x2="468" y2="68" stroke="#38bdf8" stroke-width="1.5"/>
+
+    <rect x="468" y="0" width="210" height="136" rx="10" fill="#131822" stroke="#38bdf8" stroke-width="1.2"/>
+    <text x="484" y="26" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">03 · ADAPTIVE BRAIN</text>
+    <text x="484" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">Выбор рецепта L1–L3</text>
+    <text x="484" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• L1: Память домена (7 сут)</text>
+    <text x="484" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• L2: Кэш подсети /24</text>
+    <text x="484" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• L3: Глобальный рейтинг канала</text>
+
+    <line x1="678" y1="68" x2="702" y2="68" stroke="#38bdf8" stroke-width="1.5"/>
+
+    <rect x="702" y="0" width="210" height="136" rx="10" fill="#131822" stroke="#263144" stroke-width="1.2"/>
+    <text x="718" y="26" fill="#d99b26" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">04 · ТРАНСФОРМАЦИЯ</text>
+    <text x="718" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">16 TCP + 4 UDP</text>
+    <text x="718" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• TlsRec + 7-точечный Split</text>
+    <text x="718" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Fake (MD5 / PAWS / BadSeq / TTL)</text>
+    <text x="718" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Disorder / OOB / IPv6 Ext</text>
+
+    <line x1="912" y1="68" x2="936" y2="68" stroke="#4cc38a" stroke-width="1.5"/>
+
+    <rect x="936" y="0" width="208" height="136" rx="10" fill="#131822" stroke="#4cc38a" stroke-width="1.2"/>
+    <text x="952" y="26" fill="#4cc38a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">05 · ВЕРИФИКАЦИЯ</text>
+    <text x="952" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">Гейт 32 КиБ + RST</text>
+    <text x="952" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Контроль ≥ 32 КиБ приёма</text>
+    <text x="952" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Авто-переобучение при RST</text>
+    <text x="952" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Сохранение в runtime-state</text>
+  </g>
+</svg>
