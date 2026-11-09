@@ -127,6 +127,13 @@ pub mod cache_file {
     pub const BUCKET_DESYNC: &str = "desync";
     pub type SharedCacheFile = Arc<Mutex<CacheFile>>;
 
+    #[derive(Debug, Clone, Default)]
+    pub struct CacheFileOptions {
+        pub enabled: bool,
+        pub path: String,
+        pub flush_interval: std::time::Duration,
+    }
+
     #[derive(Default, Serialize, Deserialize)]
     struct DiskBuckets {
         buckets: HashMap<String, HashMap<String, Vec<u8>>>,
@@ -138,7 +145,22 @@ pub mod cache_file {
     }
 
     impl CacheFile {
-        pub fn open(path: PathBuf) -> SharedCacheFile {
+        pub fn open(opts: CacheFileOptions) -> std::io::Result<Option<Self>> {
+            if !opts.enabled || opts.path.is_empty() {
+                return Ok(None);
+            }
+            let path = PathBuf::from(&opts.path);
+            let data: DiskBuckets = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            Ok(Some(Self {
+                path: Some(path),
+                data,
+            }))
+        }
+
+        pub fn open_shared(path: PathBuf) -> SharedCacheFile {
             let data: DiskBuckets = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -147,6 +169,11 @@ pub mod cache_file {
                 path: Some(path),
                 data,
             }))
+        }
+
+        pub fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_to_disk();
+            Ok(())
         }
 
         pub fn flush_to_disk(&self) {

@@ -1544,8 +1544,9 @@ impl TachyonGuiApp {
                 .unwrap_or_default();
             if !hc_items.is_empty() {
                 let mut probe_failed_domain: Option<String> = None;
-                for row in hc_items.chunks(3) {
-                    ui.columns(3, |cols| {
+                let hc_cols = if ui.available_width() < 480.0 { 2 } else { 3 };
+                for row in hc_items.chunks(hc_cols) {
+                    ui.columns(hc_cols, |cols| {
                         for (c_idx, item) in row.iter().enumerate() {
                             Self::card_frame(item.ok).show(&mut cols[c_idx], |ui| {
                                 ui.horizontal(|ui| {
@@ -1718,8 +1719,9 @@ impl TachyonGuiApp {
                 let mut strat_action: Option<(String, String)> = None;
                 let mut edit_action: Option<String> = None;
 
-                for pair in lists_snapshot.chunks(2) {
-                    ui.columns(2, |cols| {
+                let service_cols = if ui.available_width() >= 560.0 { 2 } else { 1 };
+                for pair in lists_snapshot.chunks(service_cols) {
+                    ui.columns(service_cols, |cols| {
                         for (col_idx, item) in pair.iter().enumerate() {
                             Self::card_frame(item.enabled).show(&mut cols[col_idx], |ui| {
                                 ui.horizontal(|ui| {
@@ -1903,77 +1905,84 @@ impl TachyonGuiApp {
                     .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for pair in learned.chunks(2) {
-                            ui.columns(2, |cols| {
-                                for (c_idx, d) in pair.iter().enumerate() {
-                                    Frame::new()
-                                        .fill(BG_ELEVATED)
-                                        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                                        .corner_radius(CornerRadius::same(4))
-                                        .inner_margin(Margin::symmetric(8, 5))
-                                        .show(&mut cols[c_idx], |ui| {
-                                            ui.horizontal(|ui| {
+                        for d in &learned {
+                            Frame::new()
+                                .fill(BG_ELEVATED)
+                                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                                .corner_radius(CornerRadius::same(4))
+                                .inner_margin(Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button(RichText::new("×").size(10.0))
+                                                    .clicked()
+                                                {
+                                                    remove_host = Some(d.host.clone());
+                                                }
+
+                                                Self::keycap(
+                                                    ui,
+                                                    &format!(
+                                                        "#{:02} {}",
+                                                        d.recipe_id, d.recipe_code
+                                                    ),
+                                                );
+
+                                                let (badge_txt, badge_col) = if d.verified {
+                                                    ("32K OK", SEMANTIC_OK)
+                                                } else {
+                                                    (
+                                                        if is_en { "Probe" } else { "Тест" },
+                                                        SEMANTIC_WARN,
+                                                    )
+                                                };
+                                                ui.label(
+                                                    RichText::new(badge_txt)
+                                                        .monospace()
+                                                        .size(10.0)
+                                                        .color(badge_col),
+                                                );
+
+                                                let tier_short = if d.tier.starts_with("L1") {
+                                                    "L1"
+                                                } else {
+                                                    "L2"
+                                                };
+                                                ui.label(
+                                                    RichText::new(tier_short)
+                                                        .monospace()
+                                                        .size(9.5)
+                                                        .color(TEXT_MUTED),
+                                                );
+
                                                 ui.with_layout(
-                                                    Layout::right_to_left(Align::Center),
+                                                    Layout::left_to_right(Align::Center),
                                                     |ui| {
-                                                        if ui
-                                                            .small_button(
-                                                                RichText::new("×").size(10.0),
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&d.host)
+                                                                    .monospace()
+                                                                    .strong()
+                                                                    .size(11.0)
+                                                                    .color(TEXT_PRIMARY),
                                                             )
-                                                            .clicked()
-                                                        {
-                                                            remove_host = Some(d.host.clone());
-                                                        }
-
-                                                        Self::keycap(
-                                                            ui,
-                                                            &format!(
-                                                                "#{:02} {}",
-                                                                d.recipe_id, d.recipe_code
-                                                            ),
-                                                        );
-
-                                                        let (badge_txt, badge_col) = if d.verified {
-                                                            ("32K OK", SEMANTIC_OK)
-                                                        } else {
-                                                            (
-                                                                if is_en {
-                                                                    "Probe"
-                                                                } else {
-                                                                    "Тест"
-                                                                },
-                                                                SEMANTIC_WARN,
-                                                            )
-                                                        };
-                                                        ui.label(
-                                                            RichText::new(badge_txt)
-                                                                .monospace()
-                                                                .size(10.0)
-                                                                .color(badge_col),
-                                                        );
-
-                                                        ui.with_layout(
-                                                            Layout::left_to_right(Align::Center),
-                                                            |ui| {
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        RichText::new(&d.host)
-                                                                            .monospace()
-                                                                            .strong()
-                                                                            .size(11.0)
-                                                                            .color(TEXT_PRIMARY),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            },
-                                                        );
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "{} — {} ({})",
+                                                            d.host, d.recipe_title, d.tier
+                                                        ));
                                                     },
                                                 );
-                                            });
-                                        });
-                                }
-                            });
-                            ui.add_space(2.0);
+                                            },
+                                        );
+                                    });
+                                });
+                            ui.add_space(3.0);
                         }
                     });
 

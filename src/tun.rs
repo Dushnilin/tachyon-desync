@@ -5,8 +5,9 @@
 #[cfg(windows)]
 use crate::desync::WIN_OUTBOUND_IF_INDEX;
 use crate::desync::{
-    RECIPE_TITLES, apply_desync_udp_datagram, bind_outbound_socket, connect_and_apply_desync_auto,
-    connect_outbound_tcp, connect_via_upstream_proxy, extract_hostname, report_transfer_outcome,
+    RECIPE_TITLES, bind_outbound_socket, connect_and_apply_desync_auto, connect_outbound_tcp,
+    connect_via_upstream_proxy, extract_hostname, report_transfer_outcome, report_udp_quic_outcome,
+    send_udp_fakes_same_tuple,
 };
 use crate::lists::{CompiledMatcher, MatchDecision, record_dns_mapping};
 use crate::proxy::{LogCallback, TrafficCounters};
@@ -910,6 +911,7 @@ async fn get_or_create_udp_nat_socket(
                     counters_reader
                         .rx_bytes
                         .fetch_add(n as u64, Ordering::Relaxed);
+                    report_udp_quic_outcome(peer, true);
                     if let Some(ip_pkt) = build_tun_udp_response(peer, src, &rbuf[..n]) {
                         let _ = tun_tx_reader.send(ip_pkt).await;
                     }
@@ -1033,9 +1035,7 @@ async fn handle_tun_udp_datagram(
                             config.udp_repeats, config.udp_fake_ttl
                         ),
                     );
-                    if let Ok(fake_sock) = bind_and_connect_udp(dst.is_ipv6()).await {
-                        let _ = apply_desync_udp_datagram(&fake_sock, dst, &[], &config).await;
-                    }
+                    let _ = send_udp_fakes_same_tuple(&sock, dst, &config).await;
                 }
                 if sock.send_to(&payload, dst).await.is_ok() {
                     counters
