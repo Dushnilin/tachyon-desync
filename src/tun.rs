@@ -849,18 +849,25 @@ async fn handle_tun_tcp_stream(
                 counters.rx_bytes.fetch_add(nr, Ordering::Relaxed);
                 flow.record.add_rx(nr);
             }
-            let relay_res = crate::flows::copy_bidirectional_live(
+            let target_host = resolved_host.as_deref().or(sni_host.as_deref());
+            let relay_res = crate::flows::copy_bidirectional_desync_live(
                 &mut client,
                 &mut remote,
                 &counters,
                 &flow.record,
+                target_host,
+                Some(dst_addr),
+                total_rx,
+                t0,
             )
             .await;
-            if let Ok((_tx, rx)) = relay_res {
-                total_rx += rx;
-            }
+            total_rx += flow
+                .record
+                .rx_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(total_rx);
             report_transfer_outcome(
-                resolved_host.as_deref().or(sni_host.as_deref()),
+                target_host,
                 Some(dst_addr),
                 total_rx,
                 t0.elapsed().as_millis() as u64,

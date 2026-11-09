@@ -1294,7 +1294,7 @@ async fn generate_domain_strategy_with_mask(
     port: u16,
     scan_all: bool,
     timeout_ms: u64,
-    banned_mask: u16,
+    banned_mask: u32,
     pin_verified: bool,
 ) -> io::Result<StrategyGeneratorReport> {
     let clean_domain = sanitize_domain_input(domain);
@@ -1324,7 +1324,7 @@ async fn generate_domain_strategy_with_mask(
             if base.len() >= 10 {
                 break;
             }
-            if !base.contains(&alt) && (banned_mask & (1u16 << alt)) == 0 {
+            if !base.contains(&alt) && (banned_mask & (1u32 << alt)) == 0 {
                 base.push(alt);
             }
         }
@@ -1370,7 +1370,7 @@ async fn generate_domain_strategy_with_mask(
     let best = passed
         .iter()
         .copied()
-        .filter(|r| (banned_mask & (1u16 << r.recipe_id)) == 0)
+        .filter(|r| (banned_mask & (1u32 << r.recipe_id)) == 0)
         .min_by_key(|r| r.rtt_ms)
         .or_else(|| passed.iter().copied().min_by_key(|r| r.rtt_ms));
 
@@ -1765,7 +1765,7 @@ mod tests {
         remove_learned_domain("googlevideo.com");
 
         // Симулируем кандидата от авто-переобучения с сохранённой маской забаненных рецептов (#0 и #1)
-        let initial_mask: u16 = (1 << 0) | (1 << 1);
+        let initial_mask: u32 = (1 << 0) | (1 << 1);
         upstream::engine::gui_set_learned_candidate(host, 3, initial_mask, false);
         assert_eq!(upstream::engine::gui_get_banned_mask(host), initial_mask);
 

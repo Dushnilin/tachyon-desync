@@ -219,3 +219,163 @@ where
 
     tokio::try_join!(a_to_b, b_to_a)
 }
+
+/// Двусторонняя передача данных для десинхронизированного потока с продвижением рецепта на лету
+/// при прохождении порога 32 КиБ и 500-мс сторожем зависаний (в окне 32 КиБ и при mid-stream запросах без ответа).
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_bidirectional_desync_live<A, B>(
+    a: &mut A,
+    b: &mut B,
+    counters: &crate::proxy::TrafficCounters,
+    flow: &LiveFlowRecord,
+    target_host: Option<&str>,
+    peer_addr: Option<SocketAddr>,
+    initial_down_len: u64,
+    started_at: std::time::Instant,
+) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+
+    let up_bytes = AtomicU64::new(0);
+    let down_bytes = AtomicU64::new(0);
+
+    let a_to_b = async {
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = ar.read(&mut buf).await?;
+            if n == 0 {
+                let _ = bw.shutdown().await;
+                break;
+            }
+            bw.write_all(&buf[..n]).await?;
+            let nb = n as u64;
+            up_bytes.fetch_add(nb, Ordering::Relaxed);
+            counters.tx_bytes.fetch_add(nb, Ordering::Relaxed);
+            flow.add_tx(nb);
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let b_to_a = async {
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = br.read(&mut buf).await?;
+            if n == 0 {
+                let _ = aw.shutdown().await;
+                break;
+            }
+            aw.write_all(&buf[..n]).await?;
+            let nb = n as u64;
+            down_bytes.fetch_add(nb, Ordering::Relaxed);
+            counters.rx_bytes.fetch_add(nb, Ordering::Relaxed);
+            flow.add_rx(nb);
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let mut watchdog = tokio::time::interval(Duration::from_millis(500));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    watchdog.tick().await;
+
+    let mut prev_down = initial_down_len;
+    let mut up_at_last_down = 0u64;
+    let mut cap_stall_ticks = 0u8;
+    let mut mid_stall_ticks = 0u8;
+    let mut live_promoted = initial_down_len >= crate::desync::MIN_VERIFIED_TRANSFER_BYTES;
+
+    let mut a_to_b = std::pin::pin!(a_to_b);
+    let mut b_to_a = std::pin::pin!(b_to_a);
+
+    let res: std::io::Result<()> = loop {
+        tokio::select! {
+            res = &mut a_to_b => {
+                if let Err(e) = res {
+                    break Err(e);
+                }
+                let cur_down = initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed));
+                let drain_timeout = if cur_down < crate::desync::MIN_VERIFIED_TRANSFER_BYTES {
+                    Duration::from_millis(1200)
+                } else {
+                    HALF_CLOSE_TIMEOUT
+                };
+                break match tokio::time::timeout(drain_timeout, b_to_a).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) if initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed)) < crate::desync::MIN_VERIFIED_TRANSFER_BYTES => {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "desync: upstream stalled after client close",
+                        ))
+                    }
+                    Err(_) => Ok(()),
+                };
+            }
+            res = &mut b_to_a => {
+                if let Err(e) = res {
+                    break Err(e);
+                }
+                if let Ok(Err(err)) = tokio::time::timeout(HALF_CLOSE_TIMEOUT, a_to_b).await {
+                    break Err(err);
+                }
+                break Ok(());
+            }
+            _ = watchdog.tick() => {
+                let cur_up = up_bytes.load(Ordering::Relaxed);
+                let cur_down = initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed));
+                if !live_promoted
+                    && target_host.is_some_and(|h| !h.is_empty())
+                    && cur_down >= crate::desync::MIN_VERIFIED_TRANSFER_BYTES
+                {
+                    live_promoted = true;
+                    crate::desync::report_transfer_outcome(
+                        target_host,
+                        peer_addr,
+                        cur_down,
+                        started_at.elapsed().as_millis() as u64,
+                        true,
+                    );
+                }
+                if cur_down > prev_down {
+                    prev_down = cur_down;
+                    up_at_last_down = cur_up;
+                    cap_stall_ticks = 0;
+                    mid_stall_ticks = 0;
+                } else if cur_down < crate::desync::MIN_VERIFIED_TRANSFER_BYTES {
+                    if cur_up > 0 {
+                        cap_stall_ticks = cap_stall_ticks.saturating_add(1);
+                        if cap_stall_ticks >= 5 {
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "desync: upstream stalled in cap window",
+                            ));
+                        }
+                    }
+                } else if cur_up.saturating_sub(up_at_last_down) >= 64 {
+                    mid_stall_ticks = mid_stall_ticks.saturating_add(1);
+                    if mid_stall_ticks >= 9 {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "desync: mid-stream request stalled",
+                        ));
+                    }
+                }
+            }
+        }
+    };
+
+    res.map(|()| {
+        (
+            up_bytes.load(Ordering::Relaxed),
+            down_bytes.load(Ordering::Relaxed),
+        )
+    })
+}

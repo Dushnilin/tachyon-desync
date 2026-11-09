@@ -157,7 +157,7 @@ pub struct GuiLearnedDomain {
     pub mode: String,
     pub verified_32k: bool,
     pub consecutive_fails: u8,
-    pub banned_mask: u16,
+    pub banned_mask: u32,
 }
 
 pub fn gui_snapshot_learned_domains() -> Vec<GuiLearnedDomain> {
@@ -206,13 +206,13 @@ pub fn gui_snapshot_l3_scores() -> [u32; ADAPTIVE_RECIPES.len()] {
     std::array::from_fn(|i| b.l3_isp_scores[i].load(Ordering::Relaxed))
 }
 
-pub fn gui_get_banned_mask(host: &str) -> u16 {
+pub fn gui_get_banned_mask(host: &str) -> u32 {
     let host_lc = host.trim().to_ascii_lowercase();
     if host_lc.is_empty() {
         return 0;
     }
     let b = brain();
-    let mut mask = 0u16;
+    let mut mask = 0u32;
     if let Ok(mut g1) = b.l1_host.lock()
         && let Some(e) = g1.get(&host_lc)
     {
@@ -231,7 +231,7 @@ pub fn gui_get_banned_mask(host: &str) -> u16 {
 pub fn gui_set_learned_candidate(
     host: &str,
     recipe_id: u8,
-    banned_mask: u16,
+    banned_mask: u32,
     verified_32k: bool,
 ) {
     let idx = (recipe_id as usize).min(ADAPTIVE_RECIPES.len() - 1);
@@ -264,7 +264,14 @@ pub fn gui_set_learned_candidate(
             g2.put(etld.to_string(), entry);
         }
     }
-    persist_learned_entries(&to_persist, verified_32k);
+    persist_learned_entries(&to_persist);
+    if verified_32k
+        && let Ok(guard) = b.store.lock()
+        && let Some(ref handle) = *guard
+        && let Ok(mut cache) = handle.lock()
+    {
+        let _ = cache.flush();
+    }
 }
 
 pub fn gui_pin_domain_recipe(host: &str, recipe_id: u8) {

@@ -4,11 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  repository_dispatch:
+    types: [core-updated]
+  schedule:
+    # Каждые 3 часа проверяем, не вышло ли обновление движка в закрытом Dushnilin/tachyon-core-src
+    - cron: '20 */3 * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: "Тег релиза (например, v0.0.1)"
-        required: true
+        description: "Тег релиза (оставьте пустым для авто-инкремента версии из свежего tachyon-core-src)"
+        required: false
 
 permissions:
   contents: write
@@ -17,21 +22,145 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-windows:
-    name: windows-amd64
-    runs-on: windows-latest
+  prepare:
+    name: prepare-release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      core_ref: ${{ steps.meta.outputs.core_ref }}
+      core_tag: ${{ steps.meta.outputs.core_tag }}
+      core_sha: ${{ steps.meta.outputs.core_sha }}
+      skip: ${{ steps.meta.outputs.skip }}
     steps:
       - name: Checkout tachyon-desync
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+          fetch-depth: 0
 
       - name: Checkout private desync engine from Dushnilin/tachyon-core-src
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: main
+          ref: ${{ github.event.client_payload.tag || 'main' }}
+          fetch-depth: 30
+          path: _tachyon_core_src
+
+      - name: Resolve version or auto-bump on upstream core update
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_CORE_TAG: ${{ github.event.client_payload.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          cd _tachyon_core_src
+          core_sha=$(git log -n 1 --pretty=format:%H -- crates/core-runtime/src/outbound)
+          core_tag="${DISPATCH_CORE_TAG}"
+          if [ -z "$core_tag" ]; then
+            core_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "main")
+          fi
+          core_ver="${core_tag#v}"
+          cd ..
+
+          echo "core_sha=${core_sha}" >> "$GITHUB_OUTPUT"
+          echo "core_tag=${core_tag}" >> "$GITHUB_OUTPUT"
+          echo "core_ref=${DISPATCH_CORE_TAG:-main}" >> "$GITHUB_OUTPUT"
+
+          # 1. Если запуск по пушу тега v* или явно заданному тегу в workflow_dispatch
+          if [ "${{ github.ref_type }}" = "tag" ] || [ -n "$INPUT_TAG" ]; then
+            target_tag="${INPUT_TAG:-${{ github.ref_name }}}"
+            echo "tag=${target_tag}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. Автоматический режим (repository_dispatch: core-updated, schedule или пустой workflow_dispatch)
+          prev_notes=$(gh release view --json body -q '.body' 2>/dev/null || true)
+          if [ "${{ github.event_name }}" = "schedule" ] && echo "$prev_notes" | grep -q "core-outbound-sha:${core_sha}"; then
+            echo "Движок outbound (${core_sha}) уже собран в последнем релизе tachyon-desync, пропускаем."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cur_ver=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2 | tr -d '\r')
+          IFS='.' read -r maj min pat <<< "$cur_ver"
+          new_pat=$((pat + 1))
+          new_ver="${maj}.${min}.${new_pat}"
+          new_tag="v${new_ver}"
+
+          # Если тег уже существует, сдвигаем патч до свободного
+          while git rev-parse "$new_tag" >/dev/null 2>&1; do
+            new_pat=$((new_pat + 1))
+            new_ver="${maj}.${min}.${new_pat}"
+            new_tag="v${new_ver}"
+          done
+
+          echo "Авто-обновление tachyon-desync: v${cur_ver} -> ${new_tag} (ядро tachyon-core ${core_tag}, outbound ${core_sha:0:8})"
+
+          # Обновляем версию в Cargo.toml, README и SVG-плашках
+          sed -i "s/^version = \"${cur_ver}\"/version = \"${new_ver}\"/" Cargo.toml
+          sed -i "s/release-v${cur_ver}/release-v${new_ver}/g; s/Release v${cur_ver}/Release v${new_ver}/g" README.md README.en.md
+          sed -i "s/v${cur_ver}/v${new_ver}/g" \
+            assets/readme/hero-board.svg \
+            assets/readme/hero-board.en.svg \
+            assets/readme/section-releases.svg \
+            assets/readme/section-releases.en.svg
+
+          # Собираем сводку коммитов апстрима по outbound/desync
+          core_changes=$(git -C _tachyon_core_src log -n 5 --no-merges --pretty=format:"  - %s." -- crates/core-runtime/src/outbound || true)
+          if [ -z "$core_changes" ]; then
+            core_changes="  - Синхронизация модулей пакетной десинхронизации с ядром \`tachyon-core ${core_tag}\`."
+          fi
+
+          {
+            echo "# Changelog"
+            echo ""
+            echo "## ${new_ver}"
+            echo ""
+            echo "### Исправления и улучшения"
+            echo ""
+            echo "- **Автоматическая синхронизация с апстримным движком \`tachyon-core ${core_tag}\` (\`${core_sha:0:8}\`)**:"
+            echo "${core_changes}"
+            echo ""
+            tail -n +3 CHANGELOG.md
+          } > CHANGELOG.new.md
+          mv CHANGELOG.new.md CHANGELOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml CHANGELOG.md README.md README.en.md \
+            assets/readme/hero-board.svg \
+            assets/readme/hero-board.en.svg \
+            assets/readme/section-releases.svg \
+            assets/readme/section-releases.en.svg
+          git commit -m "выпуск tachyon-desync ${new_tag} (tachyon-core ${core_tag})"
+          git tag "${new_tag}"
+          git push origin HEAD:main
+          git push origin "${new_tag}"
+
+          echo "tag=${new_tag}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    name: windows-amd64
+    needs: [prepare]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout tachyon-desync
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Checkout private desync engine from Dushnilin/tachyon-core-src
+        uses: actions/checkout@v4
+        with:
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.core_ref }}
           sparse-checkout: |
             crates/core-runtime/src/outbound
           path: _tachyon_core_src
@@ -65,6 +194,8 @@ jobs:
 
   build-linux:
     name: linux-${{ matrix.arch }}
+    needs: [prepare]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -82,14 +213,14 @@ jobs:
       - name: Checkout tachyon-desync
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Checkout private desync engine from Dushnilin/tachyon-core-src
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: main
+          ref: ${{ needs.prepare.outputs.core_ref }}
           sparse-checkout: |
             crates/core-runtime/src/outbound
           path: _tachyon_core_src
@@ -116,7 +247,7 @@ jobs:
       - name: Package Linux .tar.gz and .deb
         run: |
           mkdir -p artifacts
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ needs.prepare.outputs.tag }}"
           ver="${tag#v}"
           bin="target/${{ matrix.target }}/release/tachyon-desync"
           strip "$bin" || true
@@ -168,19 +299,21 @@ jobs:
 
   build-macos:
     name: macos-universal
+    needs: [prepare]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: macos-latest
     steps:
       - name: Checkout tachyon-desync
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Checkout private desync engine from Dushnilin/tachyon-core-src
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          ref: main
+          ref: ${{ needs.prepare.outputs.core_ref }}
           sparse-checkout: |
             crates/core-runtime/src/outbound
           path: _tachyon_core_src
@@ -201,7 +334,7 @@ jobs:
       - name: Package macOS .tar.gz and Universal .dmg (.app)
         run: |
           mkdir -p artifacts
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ needs.prepare.outputs.tag }}"
           ver="${tag#v}"
 
           tar -czf "artifacts/tachyon-desync-macos-arm64.tar.gz" -C "target/aarch64-apple-darwin/release" tachyon-desync
@@ -252,12 +385,13 @@ jobs:
 
   release:
     name: publish-release
-    needs: [build-windows, build-linux, build-macos]
+    needs: [prepare, build-windows, build-linux, build-macos]
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -269,7 +403,7 @@ jobs:
           cd artifacts
           sha256sum tachyon-desync* > SHA256SUMS
           cd ..
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ needs.prepare.outputs.tag }}"
           ver="${tag#v}"
           awk -v want="## $ver" '
             /^## / { inside = ($0 == want) }
@@ -288,13 +422,15 @@ jobs:
             echo '```text'
             cat artifacts/SHA256SUMS
             echo '```'
+            echo ""
+            echo "<!-- core-outbound-sha:${{ needs.prepare.outputs.core_sha }} core-tag:${{ needs.prepare.outputs.core_tag }} -->"
           } > release_notes.md
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${{ needs.prepare.outputs.tag }}"
           ver="${tag#v}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" artifacts/* --clobber

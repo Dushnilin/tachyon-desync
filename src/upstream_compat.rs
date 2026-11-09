@@ -142,6 +142,7 @@ pub mod cache_file {
     pub struct CacheFile {
         path: Option<PathBuf>,
         data: DiskBuckets,
+        last_flush: std::time::Instant,
     }
 
     impl CacheFile {
@@ -157,6 +158,7 @@ pub mod cache_file {
             Ok(Some(Self {
                 path: Some(path),
                 data,
+                last_flush: std::time::Instant::now(),
             }))
         }
 
@@ -168,11 +170,13 @@ pub mod cache_file {
             Arc::new(Mutex::new(Self {
                 path: Some(path),
                 data,
+                last_flush: std::time::Instant::now(),
             }))
         }
 
         pub fn flush(&mut self) -> std::io::Result<()> {
             self.flush_to_disk();
+            self.last_flush = std::time::Instant::now();
             Ok(())
         }
 
@@ -187,9 +191,28 @@ pub mod cache_file {
             }
         }
 
+        fn maybe_flush_throttled(&mut self) {
+            if self.last_flush.elapsed() >= Duration::from_secs(10) {
+                self.flush_to_disk();
+                self.last_flush = std::time::Instant::now();
+            }
+        }
+
         pub fn get(&self, bucket: &str, key: &[u8]) -> Option<Vec<u8>> {
             let k_str = String::from_utf8_lossy(key);
             self.data.buckets.get(bucket)?.get(k_str.as_ref()).cloned()
+        }
+
+        pub fn contains_key(&self, bucket: &str, key: &[u8]) -> bool {
+            let k_str = String::from_utf8_lossy(key);
+            self.data
+                .buckets
+                .get(bucket)
+                .is_some_and(|b| b.contains_key(k_str.as_ref()))
+        }
+
+        pub fn bucket_len(&self, bucket: &str) -> usize {
+            self.data.buckets.get(bucket).map_or(0, HashMap::len)
         }
 
         pub fn put(&mut self, bucket: &str, key: &[u8], val: Vec<u8>) {
@@ -199,14 +222,14 @@ pub mod cache_file {
                 .entry(bucket.to_string())
                 .or_default()
                 .insert(k_str, val);
-            self.flush_to_disk();
+            self.maybe_flush_throttled();
         }
 
         pub fn delete(&mut self, bucket: &str, key: &[u8]) {
             let k_str = String::from_utf8_lossy(key);
             if let Some(b) = self.data.buckets.get_mut(bucket) {
                 b.remove(k_str.as_ref());
-                self.flush_to_disk();
+                self.maybe_flush_throttled();
             }
         }
 
@@ -269,7 +292,7 @@ pub mod core_tls {
     }
 
     pub mod hello {
-        use super::fingerprints::Template;
+        pub use super::fingerprints::Template;
         use std::io;
 
         #[derive(Debug, Clone)]
@@ -495,6 +518,14 @@ pub mod outbound {
                 4 => ALTPORT_SERVERS,
                 _ => AUTO_SERVERS,
             }
+        }
+
+        pub async fn resolve_for_dial(
+            host: &str,
+            port: u16,
+            _dial: &DialOptions,
+        ) -> io::Result<Vec<SocketAddr>> {
+            resolve(host, port).await
         }
 
         pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
