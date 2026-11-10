@@ -78,8 +78,8 @@ jobs:
 
           # 2. Автоматический режим (repository_dispatch: core-updated, schedule или пустой workflow_dispatch)
           prev_notes=$(gh release view --json body -q '.body' 2>/dev/null || true)
-          if [ "${{ github.event_name }}" = "schedule" ] && echo "$prev_notes" | grep -q "core-outbound-sha:${core_sha}"; then
-            echo "Движок outbound (${core_sha}) уже собран в последнем релизе tachyon-desync, пропускаем."
+          if [ "${{ github.event_name }}" = "schedule" ] && echo "$prev_notes" | grep -q "core-outbound-sha:${core_sha}" && echo "$prev_notes" | grep -q "core-tag:${core_tag}"; then
+            echo "Ядро ${core_tag} (outbound ${core_sha}) уже собрано в последнем релизе tachyon-desync, пропускаем."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
             exit 0

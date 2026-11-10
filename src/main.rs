@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod runtime;
 pub mod tray;
 pub mod tun;
+pub mod updater;
 
 use crate::gui::TachyonGuiApp;
 use crate::runtime::DesyncRuntime;
@@ -118,6 +119,7 @@ fn ensure_single_instance_or_focus(_start_minimized: bool) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    crate::updater::cleanup_old_update_artifacts();
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-V") {

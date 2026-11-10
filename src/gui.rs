@@ -85,6 +85,17 @@ impl Default for ListEditorModal {
     }
 }
 
+#[derive(Debug, Clone)]
+enum GuiUpdateState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available(crate::updater::UpdateCheckResult),
+    Downloading(crate::updater::UpdateCheckResult),
+    ReadyToRestart(std::path::PathBuf),
+    Error(String),
+}
+
 pub struct TachyonGuiApp {
     rt: Arc<DesyncRuntime>,
     tokio_handle: tokio::runtime::Handle,
@@ -142,11 +153,12 @@ pub struct TachyonGuiApp {
     log_category_filter: String,
     show_scoreboard_in_logs: bool,
 
-    // Флаг первого применения темы и окна «О программе»
+    // Флаг первого применения темы, окна «О программе» и автообновления
     theme_configured: bool,
     about_modal_open: bool,
     start_minimized_done: bool,
     start_minimized: bool,
+    update_state: Arc<Mutex<GuiUpdateState>>,
 }
 
 impl TachyonGuiApp {
@@ -171,6 +183,23 @@ impl TachyonGuiApp {
         for _ in 0..HISTORY_LEN {
             telemetry.push_back(TelemetryPoint::default());
         }
+
+        let update_state = Arc::new(Mutex::new(GuiUpdateState::Idle));
+        let update_state_bg = update_state.clone();
+        let initial_proxy_port = if initial_snap.running {
+            Some(initial_snap.config.listen_port)
+        } else {
+            None
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            if let Ok(res) = crate::updater::check_for_updates(initial_proxy_port)
+                && res.update_available
+                && let Ok(mut guard) = update_state_bg.lock()
+            {
+                *guard = GuiUpdateState::Available(res);
+            }
+        });
 
         Self {
             rt,
@@ -220,7 +249,60 @@ impl TachyonGuiApp {
             about_modal_open: false,
             start_minimized_done: false,
             start_minimized,
+            update_state,
         }
+    }
+
+    fn trigger_update_check(&self) {
+        if let Ok(mut guard) = self.update_state.lock() {
+            if matches!(
+                *guard,
+                GuiUpdateState::Checking | GuiUpdateState::Downloading(_)
+            ) {
+                return;
+            }
+            *guard = GuiUpdateState::Checking;
+        }
+        let state = self.update_state.clone();
+        let proxy_port = if self.snap.running {
+            Some(self.snap.config.listen_port)
+        } else {
+            None
+        };
+        std::thread::spawn(move || {
+            let next = match crate::updater::check_for_updates(proxy_port) {
+                Ok(res) if res.update_available => GuiUpdateState::Available(res),
+                Ok(res) => GuiUpdateState::UpToDate(res.latest_version),
+                Err(e) => GuiUpdateState::Error(e),
+            };
+            if let Ok(mut guard) = state.lock() {
+                *guard = next;
+            }
+        });
+    }
+
+    fn trigger_update_install(&self, info: crate::updater::UpdateCheckResult) {
+        if let Ok(mut guard) = self.update_state.lock() {
+            if matches!(*guard, GuiUpdateState::Downloading(_)) {
+                return;
+            }
+            *guard = GuiUpdateState::Downloading(info.clone());
+        }
+        let state = self.update_state.clone();
+        let proxy_port = if self.snap.running {
+            Some(self.snap.config.listen_port)
+        } else {
+            None
+        };
+        std::thread::spawn(move || {
+            let next = match crate::updater::download_and_apply_update(&info, proxy_port) {
+                Ok(exe_path) => GuiUpdateState::ReadyToRestart(exe_path),
+                Err(e) => GuiUpdateState::Error(e),
+            };
+            if let Ok(mut guard) = state.lock() {
+                *guard = next;
+            }
+        });
     }
 
     fn is_en(&self) -> bool {
@@ -700,9 +782,9 @@ impl TachyonGuiApp {
                     "О программе"
                 };
                 let about_tip = if is_en {
-                    "Version info, architecture, and GitHub repository link"
+                    "Version info, software updates, and GitHub repository link"
                 } else {
-                    "Сведения о версии, архитектуре и ссылка на репозиторий GitHub"
+                    "Сведения о версии, обновление программы и ссылка на репозиторий GitHub"
                 };
                 if ui
                     .add(
@@ -715,6 +797,49 @@ impl TachyonGuiApp {
                     .clicked()
                 {
                     self.about_modal_open = true;
+                }
+
+                // Индикатор доступного обновления в заголовке окна
+                let upd_snapshot = self.update_state.lock().ok().map(|g| g.clone());
+                if let Some(GuiUpdateState::Available(ref info)) = upd_snapshot {
+                    let upd_lbl = if is_en {
+                        format!("Update v{}", info.latest_version)
+                    } else {
+                        format!("Обновить v{}", info.latest_version)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(upd_lbl)
+                                    .monospace()
+                                    .strong()
+                                    .size(10.0)
+                                    .color(SEMANTIC_OK),
+                            )
+                            .fill(BG_ELEVATED)
+                            .stroke(Stroke::new(1.0_f32, SEMANTIC_OK)),
+                        )
+                        .on_hover_text(if is_en {
+                            "New version available — click to review and install"
+                        } else {
+                            "Доступна новая версия — нажмите для просмотра изменений и установки"
+                        })
+                        .clicked()
+                    {
+                        self.about_modal_open = true;
+                    }
+                } else if let Some(GuiUpdateState::Downloading(ref info)) = upd_snapshot {
+                    let dl_lbl = if is_en {
+                        format!("Updating v{}...", info.latest_version)
+                    } else {
+                        format!("Загрузка v{}...", info.latest_version)
+                    };
+                    ui.add(
+                        egui::Button::new(
+                            RichText::new(dl_lbl).monospace().size(10.0).color(ACCENT),
+                        )
+                        .fill(BG_ELEVATED),
+                    );
                 }
 
                 // 3. Вся свободная область заголовка между [T] и [О программе] (без перекрытия кнопок):
@@ -4443,6 +4568,195 @@ impl TachyonGuiApp {
 
             ui.add_space(8.0);
 
+            // Карточка самообновления программы (Auto-Update)
+            let upd_snapshot = self
+                .update_state
+                .lock()
+                .ok()
+                .map(|g| g.clone())
+                .unwrap_or(GuiUpdateState::Idle);
+            Self::card_frame(matches!(upd_snapshot, GuiUpdateState::Available(_))).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Software Update"
+                        } else {
+                            "Обновление программы"
+                        })
+                        .strong()
+                        .size(11.0)
+                        .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let check_busy = matches!(
+                            upd_snapshot,
+                            GuiUpdateState::Checking | GuiUpdateState::Downloading(_)
+                        );
+                        let check_lbl = if is_en {
+                            "Check for updates"
+                        } else {
+                            "Проверить обновления"
+                        };
+                        if ui
+                            .add_enabled(
+                                !check_busy,
+                                egui::Button::new(
+                                    RichText::new(check_lbl).size(10.0).color(TEXT_PRIMARY),
+                                )
+                                .fill(BG_PANEL),
+                            )
+                            .clicked()
+                        {
+                            self.trigger_update_check();
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                match upd_snapshot {
+                    GuiUpdateState::Idle => {
+                        ui.label(
+                            RichText::new(if is_en {
+                                format!(
+                                    "Installed version: v{} (automatic background check enabled)",
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                            } else {
+                                format!(
+                                    "Установлена версия v{} (фоновая проверка при запуске включена)",
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                    }
+                    GuiUpdateState::Checking => {
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Checking GitHub Releases for new version..."
+                            } else {
+                                "Проверка наличия новой версии на GitHub Releases..."
+                            })
+                            .size(10.0)
+                            .color(ACCENT),
+                        );
+                    }
+                    GuiUpdateState::UpToDate(ver) => {
+                        ui.label(
+                            RichText::new(if is_en {
+                                format!("You are running the latest version (v{ver}).")
+                            } else {
+                                format!("Установлена самая свежая версия (v{ver}).")
+                            })
+                            .size(10.0)
+                            .color(SEMANTIC_OK),
+                        );
+                    }
+                    GuiUpdateState::Available(info) => {
+                        let size_mb = (info.asset_size as f64) / (1024.0 * 1024.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(if is_en {
+                                    format!("New release available: v{}", info.latest_version)
+                                } else {
+                                    format!("Доступен новый релиз: v{}", info.latest_version)
+                                })
+                                .strong()
+                                .size(11.0)
+                                .color(SEMANTIC_OK),
+                            );
+                            if info.asset_size > 0 {
+                                Self::keycap(ui, &format!("{size_mb:.1} MiB"));
+                            }
+                            if info.sha256sums_url.is_some() {
+                                Self::keycap(ui, "SHA-256");
+                            }
+                        });
+
+                        if !info.release_notes.is_empty() {
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("update_release_notes_scroll")
+                                .max_height(88.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(&info.release_notes)
+                                            .monospace()
+                                            .size(9.5)
+                                            .color(TEXT_SECONDARY),
+                                    );
+                                });
+                        }
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let install_lbl = if is_en {
+                                format!("Download & Install v{}", info.latest_version)
+                            } else {
+                                format!("Скачать и установить v{}", info.latest_version)
+                            };
+                            if ui.add(Self::primary_button(&install_lbl)).clicked() {
+                                self.trigger_update_install(info.clone());
+                            }
+                            let notes_lbl = if is_en {
+                                "Release page"
+                            } else {
+                                "Страница релиза"
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(notes_lbl).size(10.0).color(TEXT_SECONDARY),
+                                    )
+                                    .fill(BG_PANEL),
+                                )
+                                .clicked()
+                            {
+                                crate::tray::open_url_in_browser(&info.release_url);
+                            }
+                        });
+                    }
+                    GuiUpdateState::Downloading(info) => {
+                        ui.label(
+                            RichText::new(if is_en {
+                                format!(
+                                    "Downloading {} and verifying SHA-256...",
+                                    info.asset_name
+                                )
+                            } else {
+                                format!(
+                                    "Скачивание {} и проверка SHA-256 (приложение перезапустится автоматически)...",
+                                    info.asset_name
+                                )
+                            })
+                            .size(10.0)
+                            .color(ACCENT),
+                        );
+                    }
+                    GuiUpdateState::ReadyToRestart(_) => {
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Update verified. Restarting application..."
+                            } else {
+                                "Обновление проверено. Перезапуск приложения..."
+                            })
+                            .size(10.0)
+                            .color(SEMANTIC_OK),
+                        );
+                    }
+                    GuiUpdateState::Error(err) => {
+                        ui.label(
+                            RichText::new(&err)
+                                .size(10.0)
+                                .color(SEMANTIC_ERR),
+                        );
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+
             // Карточка со ссылкой на основной репозиторий GitHub и экосистему Tachyon
             Self::card_frame(true).show(ui, |ui| {
                 ui.label(
@@ -4566,6 +4880,15 @@ impl eframe::App for TachyonGuiApp {
         if self.start_minimized && !self.start_minimized_done {
             self.start_minimized_done = true;
             crate::tray::hide_main_window_to_tray();
+        }
+
+        let restart_exe = self.update_state.lock().ok().and_then(|g| match &*g {
+            GuiUpdateState::ReadyToRestart(p) => Some(p.clone()),
+            _ => None,
+        });
+        if let Some(exe_path) = restart_exe {
+            self.tokio_handle.block_on(self.rt.stop());
+            crate::updater::spawn_updated_binary_and_exit(&exe_path);
         }
 
         if crate::tray::take_show_window_request() {
