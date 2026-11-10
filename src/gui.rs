@@ -40,6 +40,143 @@ const SEMANTIC_OK: Color32 = Color32::from_rgb(76, 195, 138);
 const SEMANTIC_WARN: Color32 = Color32::from_rgb(217, 155, 38);
 const SEMANTIC_ERR: Color32 = Color32::from_rgb(229, 72, 77);
 
+static ACTIVE_THEME_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuiThemePreset {
+    Graphite = 0,
+    AyuDark = 1,
+    TokyoNight = 2,
+    Catppuccin = 3,
+    Gruvbox = 4,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemeTokens {
+    bg_deepest: Color32,
+    bg_canvas: Color32,
+    bg_panel: Color32,
+    bg_elevated: Color32,
+    bg_hover: Color32,
+    border_subtle: Color32,
+    border_strong: Color32,
+    accent: Color32,
+}
+
+impl GpuiThemePreset {
+    pub const ALL: [Self; 5] = [
+        Self::Graphite,
+        Self::AyuDark,
+        Self::TokyoNight,
+        Self::Catppuccin,
+        Self::Gruvbox,
+    ];
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::AyuDark,
+            2 => Self::TokyoNight,
+            3 => Self::Catppuccin,
+            4 => Self::Gruvbox,
+            _ => Self::Graphite,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Graphite => "Graphite",
+            Self::AyuDark => "Ayu Dark",
+            Self::TokyoNight => "TokyoNight",
+            Self::Catppuccin => "Catppuccin",
+            Self::Gruvbox => "Gruvbox",
+        }
+    }
+
+    fn tokens(self) -> ThemeTokens {
+        match self {
+            Self::Graphite => ThemeTokens {
+                bg_deepest: BG_DEEPEST,
+                bg_canvas: BG_CANVAS,
+                bg_panel: BG_PANEL,
+                bg_elevated: BG_ELEVATED,
+                bg_hover: BG_HOVER,
+                border_subtle: BORDER_SUBTLE,
+                border_strong: BORDER_STRONG,
+                accent: ACCENT,
+            },
+            Self::AyuDark => ThemeTokens {
+                bg_deepest: Color32::from_rgb(11, 14, 20),
+                bg_canvas: Color32::from_rgb(15, 19, 26),
+                bg_panel: Color32::from_rgb(19, 23, 33),
+                bg_elevated: Color32::from_rgb(26, 31, 44),
+                bg_hover: Color32::from_rgb(35, 42, 58),
+                border_subtle: Color32::from_rgb(30, 36, 50),
+                border_strong: Color32::from_rgb(52, 62, 82),
+                accent: Color32::from_rgb(57, 186, 230),
+            },
+            Self::TokyoNight => ThemeTokens {
+                bg_deepest: Color32::from_rgb(22, 22, 30),
+                bg_canvas: Color32::from_rgb(26, 27, 38),
+                bg_panel: Color32::from_rgb(31, 35, 53),
+                bg_elevated: Color32::from_rgb(36, 40, 59),
+                bg_hover: Color32::from_rgb(47, 53, 77),
+                border_subtle: Color32::from_rgb(41, 46, 66),
+                border_strong: Color32::from_rgb(65, 72, 104),
+                accent: Color32::from_rgb(122, 162, 247),
+            },
+            Self::Catppuccin => ThemeTokens {
+                bg_deepest: Color32::from_rgb(17, 17, 27),
+                bg_canvas: Color32::from_rgb(24, 24, 37),
+                bg_panel: Color32::from_rgb(30, 30, 46),
+                bg_elevated: Color32::from_rgb(49, 50, 68),
+                bg_hover: Color32::from_rgb(69, 71, 90),
+                border_subtle: Color32::from_rgb(49, 50, 68),
+                border_strong: Color32::from_rgb(88, 91, 112),
+                accent: Color32::from_rgb(137, 180, 250),
+            },
+            Self::Gruvbox => ThemeTokens {
+                bg_deepest: Color32::from_rgb(29, 32, 33),
+                bg_canvas: Color32::from_rgb(40, 40, 40),
+                bg_panel: Color32::from_rgb(50, 48, 47),
+                bg_elevated: Color32::from_rgb(60, 56, 54),
+                bg_hover: Color32::from_rgb(80, 73, 69),
+                border_subtle: Color32::from_rgb(60, 56, 54),
+                border_strong: Color32::from_rgb(102, 92, 84),
+                accent: Color32::from_rgb(131, 165, 152),
+            },
+        }
+    }
+}
+
+fn active_tokens() -> ThemeTokens {
+    GpuiThemePreset::from_u8(ACTIVE_THEME_ID.load(std::sync::atomic::Ordering::Relaxed)).tokens()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowSortColumn {
+    Time,
+    Traffic,
+    App,
+    Host,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct GuiToast {
+    title: String,
+    detail: String,
+    kind: ToastKind,
+    created: Instant,
+    duration: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
     Overview,
@@ -125,9 +262,11 @@ pub struct TachyonGuiApp {
     dns_overrides_input: String,
     dns_overrides_dirty: bool,
 
-    // Вкладка Потоки (Live Flows)
+    // Вкладка Потоки (Live Flows + DataTable сортировка)
     flow_filter: String,
     flows_only_active: bool,
+    flow_sort_col: FlowSortColumn,
+    flow_sort_asc: bool,
 
     // Вкладка Генератор и Конструктор
     probe_domain: String,
@@ -140,6 +279,8 @@ pub struct TachyonGuiApp {
     builder_cfg: DesyncConfig,
     builder_dirty: bool,
     builder_preset_id: u8,
+    builder_profile_name: String,
+    selected_profile_id: Option<String>,
     copied_toast_until: Option<Instant>,
 
     // Вкладка Списки и .exe
@@ -151,11 +292,20 @@ pub struct TachyonGuiApp {
 
     // Вкладка Журнал
     log_category_filter: String,
+    log_search_query: String,
     show_scoreboard_in_logs: bool,
     log_copied_toast_until: Option<Instant>,
 
-    // Флаг первого применения темы, окна «О программе» и автообновления
+    // Компоненты gpui-kit: темы, Command Palette (Ctrl+K), стек Toast-уведомлений
+    theme_preset: GpuiThemePreset,
     theme_configured: bool,
+    cmd_palette_open: bool,
+    cmd_palette_query: String,
+    cmd_palette_selected: usize,
+    cmd_palette_just_opened: bool,
+    toasts: VecDeque<GuiToast>,
+
+    // Окно «О программе» и автообновление
     about_modal_open: bool,
     start_minimized_done: bool,
     start_minimized: bool,
@@ -228,6 +378,8 @@ impl TachyonGuiApp {
             dns_overrides_dirty: false,
             flow_filter: String::new(),
             flows_only_active: false,
+            flow_sort_col: FlowSortColumn::Time,
+            flow_sort_asc: false,
             probe_domain,
             probe_port: 443,
             probe_in_progress: Arc::new(Mutex::new(false)),
@@ -238,6 +390,8 @@ impl TachyonGuiApp {
             builder_cfg,
             builder_dirty: false,
             builder_preset_id: 0,
+            builder_profile_name: String::new(),
+            selected_profile_id: None,
             copied_toast_until: None,
             add_app_input: String::new(),
             upstream_proxy_input,
@@ -245,14 +399,54 @@ impl TachyonGuiApp {
             list_search_filter: String::new(),
             list_modal: ListEditorModal::default(),
             log_category_filter: "all".to_string(),
+            log_search_query: String::new(),
             show_scoreboard_in_logs: true,
             log_copied_toast_until: None,
+            theme_preset: GpuiThemePreset::Graphite,
             theme_configured: false,
+            cmd_palette_open: false,
+            cmd_palette_query: String::new(),
+            cmd_palette_selected: 0,
+            cmd_palette_just_opened: false,
+            toasts: VecDeque::new(),
             about_modal_open: false,
             start_minimized_done: false,
             start_minimized,
             update_state,
         }
+    }
+
+    fn push_toast(&mut self, kind: ToastKind, title: impl Into<String>, detail: impl Into<String>) {
+        if self.toasts.len() >= 4 {
+            self.toasts.pop_front();
+        }
+        self.toasts.push_back(GuiToast {
+            title: title.into(),
+            detail: detail.into(),
+            kind,
+            created: Instant::now(),
+            duration: Duration::from_millis(3200),
+        });
+    }
+
+    fn set_theme_preset(&mut self, preset: GpuiThemePreset) {
+        self.theme_preset = preset;
+        ACTIVE_THEME_ID.store(preset as u8, std::sync::atomic::Ordering::Relaxed);
+        self.theme_configured = false;
+        let is_en = self.is_en();
+        self.push_toast(
+            ToastKind::Info,
+            if is_en {
+                format!("Theme: {}", preset.label())
+            } else {
+                format!("Тема: {}", preset.label())
+            },
+            if is_en {
+                "Applied gpui-kit color tokens"
+            } else {
+                "Применена цветовая палитра gpui-kit"
+            },
+        );
     }
 
     fn trigger_update_check(&self) {
@@ -309,6 +503,48 @@ impl TachyonGuiApp {
 
     fn is_en(&self) -> bool {
         self.snap.config.language.eq_ignore_ascii_case("en")
+    }
+
+    fn all_strategy_options(&self, is_en: bool) -> Vec<(String, String)> {
+        let base = strategy_options(is_en);
+        let mut out = Vec::with_capacity(base.len() + self.snap.config.custom_profiles.len());
+        for (code, lbl) in base {
+            out.push((code.to_string(), lbl.to_string()));
+            if code == "custom" {
+                for p in &self.snap.config.custom_profiles {
+                    let p_code = format!("profile:{}", p.id);
+                    let p_lbl = if is_en {
+                        format!("[Profile] {}", p.name)
+                    } else {
+                        format!("[Профиль] {}", p.name)
+                    };
+                    out.push((p_code, p_lbl));
+                }
+            }
+        }
+        out
+    }
+
+    fn strategy_label(&self, code: &str, is_en: bool) -> String {
+        let trimmed = code.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(pid) = lower.strip_prefix("profile:") {
+            let norm = pid.trim();
+            if let Some(p) = self
+                .snap
+                .config
+                .custom_profiles
+                .iter()
+                .find(|p| p.id.eq_ignore_ascii_case(norm))
+            {
+                return if is_en {
+                    format!("[Profile] {}", p.name)
+                } else {
+                    format!("[Профиль] {}", p.name)
+                };
+            }
+        }
+        strategy_short_label(code, is_en).to_string()
     }
 
     fn dispatch_ipc(&mut self, action: &str, payload: serde_json::Value) {
@@ -402,6 +638,7 @@ impl TachyonGuiApp {
             return;
         }
         self.theme_configured = true;
+        let tk = active_tokens();
 
         // Строгая сетка 4px (Spacing Pass) и чистая 5-ступенчатая типографика (Type Pass)
         let mut style = (*ctx.style()).clone();
@@ -432,39 +669,40 @@ impl TachyonGuiApp {
         );
 
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = BG_CANVAS;
-        visuals.window_fill = BG_PANEL;
-        visuals.extreme_bg_color = BG_DEEPEST;
-        visuals.faint_bg_color = BG_ELEVATED;
-        visuals.code_bg_color = BG_DEEPEST;
+        visuals.panel_fill = tk.bg_canvas;
+        visuals.window_fill = tk.bg_panel;
+        visuals.extreme_bg_color = tk.bg_deepest;
+        visuals.faint_bg_color = tk.bg_elevated;
+        visuals.code_bg_color = tk.bg_deepest;
 
-        visuals.widgets.noninteractive.bg_fill = BG_PANEL;
-        visuals.widgets.noninteractive.weak_bg_fill = BG_PANEL;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
+        visuals.widgets.noninteractive.bg_fill = tk.bg_panel;
+        visuals.widgets.noninteractive.weak_bg_fill = tk.bg_panel;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, tk.border_subtle);
         visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
         visuals.widgets.noninteractive.corner_radius = CornerRadius::same(4);
 
-        visuals.widgets.inactive.bg_fill = BG_ELEVATED;
-        visuals.widgets.inactive.weak_bg_fill = BG_ELEVATED;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
+        visuals.widgets.inactive.bg_fill = tk.bg_elevated;
+        visuals.widgets.inactive.weak_bg_fill = tk.bg_elevated;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, tk.border_strong);
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
         visuals.widgets.inactive.corner_radius = CornerRadius::same(4);
 
         // Спокойный шаг поверхности при наведении без неоновой обводки
-        visuals.widgets.hovered.bg_fill = BG_HOVER;
-        visuals.widgets.hovered.weak_bg_fill = BG_HOVER;
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER_STRONG);
+        visuals.widgets.hovered.bg_fill = tk.bg_hover;
+        visuals.widgets.hovered.weak_bg_fill = tk.bg_hover;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, tk.border_strong);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
         visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
 
-        visuals.widgets.active.bg_fill = BG_HOVER;
-        visuals.widgets.active.weak_bg_fill = BG_HOVER;
+        visuals.widgets.active.bg_fill = tk.bg_hover;
+        visuals.widgets.active.weak_bg_fill = tk.bg_hover;
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, TEXT_SECONDARY);
         visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
         visuals.widgets.active.corner_radius = CornerRadius::same(4);
 
-        visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(56, 189, 248, 44);
-        visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+        visuals.selection.bg_fill =
+            Color32::from_rgba_unmultiplied(tk.accent.r(), tk.accent.g(), tk.accent.b(), 44);
+        visuals.selection.stroke = Stroke::new(1.0_f32, tk.accent);
 
         style.visuals = visuals;
         ctx.set_style(style);
@@ -472,22 +710,24 @@ impl TachyonGuiApp {
 
     // Внешняя панель: радиус 8px, внутренний отступ 8px -> вложенные карточки имеют радиус 4px (8 - 4 = 4)
     fn panel_frame() -> Frame {
+        let tk = active_tokens();
         Frame::new()
-            .fill(BG_PANEL)
-            .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+            .fill(tk.bg_panel)
+            .stroke(Stroke::new(1.0_f32, tk.border_subtle))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(8, 8))
     }
 
     fn card_frame(active_border: bool) -> Frame {
+        let tk = active_tokens();
         Frame::new()
-            .fill(BG_ELEVATED)
+            .fill(tk.bg_elevated)
             .stroke(Stroke::new(
                 1.0_f32,
                 if active_border {
-                    BORDER_STRONG
+                    tk.border_strong
                 } else {
-                    BORDER_SUBTLE
+                    tk.border_subtle
                 },
             ))
             .corner_radius(CornerRadius::same(4))
@@ -496,11 +736,12 @@ impl TachyonGuiApp {
 
     // Основная кнопка на тёмной теме: светлая поверхность из нейтральной шкалы с тёмным текстом
     fn primary_button(label: &str) -> egui::Button<'static> {
+        let tk = active_tokens();
         egui::Button::new(
             RichText::new(label.to_string())
                 .strong()
                 .size(11.0)
-                .color(BG_DEEPEST),
+                .color(tk.bg_deepest),
         )
         .fill(TEXT_PRIMARY)
         .corner_radius(CornerRadius::same(4))
@@ -508,9 +749,10 @@ impl TachyonGuiApp {
 
     // Фирменная деталь (Signature): моноширинный кейкап 4px с тонкой рамкой 1px
     fn keycap(ui: &mut egui::Ui, text: &str) {
+        let tk = active_tokens();
         Frame::new()
-            .fill(BG_DEEPEST)
-            .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+            .fill(tk.bg_deepest)
+            .stroke(Stroke::new(1.0_f32, tk.border_subtle))
             .corner_radius(CornerRadius::same(4))
             .inner_margin(Margin::symmetric(4, 2))
             .show(ui, |ui| {
@@ -521,6 +763,90 @@ impl TachyonGuiApp {
                         .color(TEXT_SECONDARY),
                 );
             });
+    }
+
+    // Компонент `kbd.rs` из gpui-kit: компактная плашка горячей клавиши (Ctrl+K, Esc, Enter)
+    fn kbd_badge(ui: &mut egui::Ui, shortcut: &str) {
+        let tk = active_tokens();
+        Frame::new()
+            .fill(tk.bg_deepest)
+            .stroke(Stroke::new(1.0_f32, tk.border_strong))
+            .corner_radius(CornerRadius::same(3))
+            .inner_margin(Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(shortcut)
+                        .monospace()
+                        .size(9.0)
+                        .color(TEXT_SECONDARY),
+                );
+            });
+    }
+
+    // Компонент `tag.rs` из gpui-kit: семантический тег с приглушённой заливкой и рамкой 1px
+    fn semantic_tag(ui: &mut egui::Ui, text: &str, fg: Color32) {
+        let bg = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 26);
+        let border = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 88);
+        Frame::new()
+            .fill(bg)
+            .stroke(Stroke::new(1.0_f32, border))
+            .corner_radius(CornerRadius::same(3))
+            .inner_margin(Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).monospace().strong().size(9.0).color(fg));
+            });
+    }
+
+    // Компонент `switch.rs` из gpui-kit: капсульный тумблер 26x14px с ползунком
+    fn gpui_switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+        let tk = active_tokens();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (rect, mut switch_resp) =
+                ui.allocate_exact_size(Vec2::new(26.0, 14.0), Sense::click());
+            if switch_resp.clicked() {
+                *on = !*on;
+                switch_resp.mark_changed();
+            }
+            let bg = if *on {
+                tk.accent
+            } else if switch_resp.hovered() {
+                tk.bg_hover
+            } else {
+                tk.bg_deepest
+            };
+            let stroke_col = if *on { tk.accent } else { tk.border_strong };
+            ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(7),
+                Stroke::new(1.0_f32, stroke_col),
+                StrokeKind::Inside,
+            );
+            let knob_x = if *on {
+                rect.max.x - 7.0
+            } else {
+                rect.min.x + 7.0
+            };
+            let knob_col = if *on { tk.bg_deepest } else { TEXT_SECONDARY };
+            ui.painter()
+                .circle_filled(Pos2::new(knob_x, rect.center().y), 4.5, knob_col);
+
+            let lbl_resp = ui.add(
+                egui::Label::new(RichText::new(label).size(10.0).color(if *on {
+                    TEXT_PRIMARY
+                } else {
+                    TEXT_SECONDARY
+                }))
+                .sense(Sense::click()),
+            );
+            if lbl_resp.clicked() {
+                *on = !*on;
+                switch_resp.mark_changed();
+            }
+            switch_resp | lbl_resp
+        })
+        .inner
     }
 
     fn handle_custom_window_resize(ctx: &egui::Context) {
@@ -754,6 +1080,7 @@ impl TachyonGuiApp {
                 );
 
                 // Переключатель языка RU / EN
+                let tk = active_tokens();
                 let lang_label = if is_en { "EN" } else { "RU" };
                 let lang_tip = if is_en {
                     "Switch interface language to Russian (RU)"
@@ -768,13 +1095,61 @@ impl TachyonGuiApp {
                                 .size(10.0)
                                 .color(TEXT_PRIMARY),
                         )
-                        .fill(BG_ELEVATED),
+                        .fill(tk.bg_elevated),
                     )
                     .on_hover_text(lang_tip)
                     .clicked()
                 {
                     let next_lang = if is_en { "ru" } else { "en" };
                     self.dispatch_ipc("set_language", serde_json::json!({ "language": next_lang }));
+                }
+
+                // Селектор темы оформления gpui-kit (Graphite / Ayu Dark / TokyoNight / Catppuccin / Gruvbox)
+                let theme_tip = if is_en {
+                    "Cycle gpui-kit theme preset (Graphite / Ayu Dark / TokyoNight / Catppuccin / Gruvbox)"
+                } else {
+                    "Сменить цветовую тему gpui-kit (Graphite / Ayu Dark / TokyoNight / Catppuccin / Gruvbox)"
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(self.theme_preset.label())
+                                .monospace()
+                                .size(10.0)
+                                .color(tk.accent),
+                        )
+                        .fill(tk.bg_elevated),
+                    )
+                    .on_hover_text(theme_tip)
+                    .clicked()
+                {
+                    let next_idx = ((self.theme_preset as u8) + 1) % 5;
+                    self.set_theme_preset(GpuiThemePreset::from_u8(next_idx));
+                }
+
+                // Кнопка вызова Command Palette (Ctrl+K) из gpui-kit
+                let cmd_tip = if is_en {
+                    "Open Command Palette (Ctrl+K / F1)"
+                } else {
+                    "Открыть палитру быстрых команд и рецептов (Ctrl+K / F1)"
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Ctrl+K")
+                                .monospace()
+                                .size(10.0)
+                                .color(TEXT_PRIMARY),
+                        )
+                        .fill(tk.bg_elevated)
+                        .stroke(Stroke::new(1.0_f32, tk.border_strong)),
+                    )
+                    .on_hover_text(cmd_tip)
+                    .clicked()
+                {
+                    self.cmd_palette_open = true;
+                    self.cmd_palette_just_opened = true;
+                    self.cmd_palette_selected = 0;
                 }
 
                 // Кнопка «О программе» / «About»
@@ -793,7 +1168,7 @@ impl TachyonGuiApp {
                         egui::Button::new(
                             RichText::new(about_lbl).size(10.0).color(TEXT_SECONDARY),
                         )
-                        .fill(BG_ELEVATED),
+                        .fill(tk.bg_elevated),
                     )
                     .on_hover_text(about_tip)
                     .clicked()
@@ -1005,11 +1380,7 @@ impl TachyonGuiApp {
                     } else {
                         "При нажатии на крестик [X] сворачивать окно в системный трей без остановки десинка"
                     };
-                    if ui
-                        .checkbox(
-                            &mut min_tray,
-                            RichText::new(tray_lbl).size(10.0).color(TEXT_SECONDARY),
-                        )
+                    if Self::gpui_switch(ui, &mut min_tray, tray_lbl)
                         .on_hover_text(tray_tip)
                         .changed()
                     {
@@ -1026,11 +1397,7 @@ impl TachyonGuiApp {
                     } else {
                         "Запускать Tachyon Desync автоматически при старте ОС (в трее)"
                     };
-                    if ui
-                        .checkbox(
-                            &mut auto_on,
-                            RichText::new(auto_lbl).size(10.0).color(TEXT_SECONDARY),
-                        )
+                    if Self::gpui_switch(ui, &mut auto_on, auto_lbl)
                         .on_hover_text(auto_tip)
                         .changed()
                     {
@@ -1060,7 +1427,48 @@ impl TachyonGuiApp {
             let cur_mode = self.snap.config.capture_mode;
             let cur_strat = self.snap.config.default_strategy.as_code();
             let mut next_capture_mode: Option<&'static str> = None;
-            let mut next_def_strat: Option<&'static str> = None;
+            let mut next_def_strat: Option<String> = None;
+            let header_custom_profiles: Vec<(String, String)> = self
+                .snap
+                .config
+                .custom_profiles
+                .iter()
+                .map(|p| {
+                    (
+                        format!("profile:{}", p.id),
+                        if is_en {
+                            format!("[Profile] {}", p.name)
+                        } else {
+                            format!("[Профиль] {}", p.name)
+                        },
+                    )
+                })
+                .collect();
+            let cur_strat_display = match cur_strat.as_str() {
+                "auto" => {
+                    if is_en {
+                        "Auto (16 recipes)".to_string()
+                    } else {
+                        "Авто (16 рецептов)".to_string()
+                    }
+                }
+                "direct" => {
+                    if is_en {
+                        "Direct (lists only)".to_string()
+                    } else {
+                        "Только списки".to_string()
+                    }
+                }
+                "tlsrec" => "TlsRec Split".to_string(),
+                "custom" => {
+                    if is_en {
+                        "Generator Profile".to_string()
+                    } else {
+                        "Профиль Генератора".to_string()
+                    }
+                }
+                other => self.strategy_label(other, is_en),
+            };
 
             ui.columns(2, |cols| {
                 cols[0].horizontal(|ui| {
@@ -1146,35 +1554,10 @@ impl TachyonGuiApp {
                             .size(10.0)
                             .color(TEXT_SECONDARY),
                     );
-                    let strat_text = match cur_strat.as_str() {
-                        "auto" => {
-                            if is_en {
-                                "Auto (16 recipes)"
-                            } else {
-                                "Авто (16 рецептов)"
-                            }
-                        }
-                        "direct" => {
-                            if is_en {
-                                "Direct (lists only)"
-                            } else {
-                                "Только списки"
-                            }
-                        }
-                        "tlsrec" => "TlsRec Split",
-                        "custom" => {
-                            if is_en {
-                                "Generator Profile"
-                            } else {
-                                "Профиль Генератора"
-                            }
-                        }
-                        other => other,
-                    };
                     let w = (ui.available_width() - 4.0).max(88.0);
                     egui::ComboBox::from_id_salt("combo_default_strategy")
                         .width(w)
-                        .selected_text(RichText::new(strat_text).size(10.0))
+                        .selected_text(RichText::new(cur_strat_display).size(10.0))
                         .show_ui(ui, |ui| {
                             let opts = [
                                 (
@@ -1205,7 +1588,12 @@ impl TachyonGuiApp {
                             ];
                             for (code, label) in opts {
                                 if ui.selectable_label(cur_strat == code, label).clicked() {
-                                    next_def_strat = Some(code);
+                                    next_def_strat = Some(code.to_string());
+                                }
+                            }
+                            for (p_code, p_lbl) in &header_custom_profiles {
+                                if ui.selectable_label(&cur_strat == p_code, p_lbl).clicked() {
+                                    next_def_strat = Some(p_code.clone());
                                 }
                             }
                         });
@@ -1269,34 +1657,52 @@ impl TachyonGuiApp {
                 ),
             ];
 
-            ui.columns(5, |cols| {
-                for (i, (tab_id, label)) in tabs.into_iter().enumerate() {
-                    let is_active = self.active_tab == tab_id;
-                    let fill = if is_active { BG_HOVER } else { BG_DEEPEST };
-                    let stroke = if is_active {
-                        Stroke::new(1.0_f32, BORDER_STRONG)
-                    } else {
-                        Stroke::new(1.0_f32, BORDER_SUBTLE)
-                    };
-                    let text_col = if is_active {
-                        TEXT_PRIMARY
-                    } else {
-                        TEXT_SECONDARY
-                    };
-                    let col_w = cols[i].available_width();
-                    if cols[i]
-                        .add_sized(
-                            Vec2::new(col_w, 24.0),
-                            egui::Button::new(RichText::new(label).size(10.0).color(text_col))
-                                .fill(fill)
-                                .stroke(stroke),
-                        )
-                        .clicked()
-                    {
-                        self.active_tab = tab_id;
-                    }
-                }
-            });
+            let tk = active_tokens();
+            Frame::new()
+                .fill(tk.bg_deepest)
+                .stroke(Stroke::new(1.0_f32, tk.border_subtle))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(2))
+                .show(ui, |ui| {
+                    ui.columns(5, |cols| {
+                        for (i, (tab_id, label)) in tabs.into_iter().enumerate() {
+                            let is_active = self.active_tab == tab_id;
+                            let fill = if is_active {
+                                tk.bg_elevated
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            let stroke = if is_active {
+                                Stroke::new(1.0_f32, tk.border_strong)
+                            } else {
+                                Stroke::NONE
+                            };
+                            let text_col = if is_active {
+                                TEXT_PRIMARY
+                            } else {
+                                TEXT_SECONDARY
+                            };
+                            let col_w = cols[i].available_width();
+                            if cols[i]
+                                .add_sized(
+                                    Vec2::new(col_w, 22.0),
+                                    egui::Button::new(
+                                        RichText::new(label)
+                                            .strong()
+                                            .size(10.0)
+                                            .color(text_col),
+                                    )
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .corner_radius(CornerRadius::same(4)),
+                                )
+                                .clicked()
+                            {
+                                self.active_tab = tab_id;
+                            }
+                        }
+                    });
+                });
         });
     }
 
@@ -1587,8 +1993,7 @@ impl TachyonGuiApp {
                 } else {
                     "Авто-переобучение при сбоях (RST)"
                 };
-                if ui
-                    .checkbox(&mut auto_rel, RichText::new(rel_lbl).size(10.0))
+                if Self::gpui_switch(ui, &mut auto_rel, rel_lbl)
                     .on_hover_text(if is_en {
                         "Automatically re-probe 8 recipes in the background when a domain suffers consecutive TCP RST / timeouts"
                     } else {
@@ -1842,6 +2247,7 @@ impl TachyonGuiApp {
             if self.show_services_on_overview {
                 ui.add_space(4.0);
                 let lists_snapshot = self.snap.config.lists.clone();
+                let all_strat_opts = self.all_strategy_options(is_en);
                 let mut toggle_action: Option<(String, bool)> = None;
                 let mut strat_action: Option<(String, String)> = None;
                 let mut edit_action: Option<String> = None;
@@ -1877,15 +2283,21 @@ impl TachyonGuiApp {
                                     egui::ComboBox::from_id_salt(format!("q_strat_{}", item.id))
                                         .width(combo_w)
                                         .selected_text(
-                                            RichText::new(strategy_short_label(&cur_s, is_en))
-                                                .size(10.0),
+                                            RichText::new(resolve_strategy_label(
+                                                &cur_s,
+                                                &all_strat_opts,
+                                                is_en,
+                                            ))
+                                            .size(10.0),
                                         )
                                         .show_ui(ui, |ui| {
-                                            for (code, lbl) in strategy_options(is_en) {
-                                                if ui.selectable_label(cur_s == code, lbl).clicked()
+                                            for (code, lbl) in &all_strat_opts {
+                                                if ui
+                                                    .selectable_label(&cur_s == code, lbl)
+                                                    .clicked()
                                                 {
                                                     strat_action =
-                                                        Some((item.id.clone(), code.to_string()));
+                                                        Some((item.id.clone(), code.clone()));
                                                 }
                                             }
                                         });
@@ -2273,23 +2685,65 @@ impl TachyonGuiApp {
                     } else {
                         "Только активные"
                     };
-                    ui.checkbox(
-                        &mut self.flows_only_active,
-                        RichText::new(act_lbl).size(10.0),
-                    );
+                    Self::gpui_switch(ui, &mut self.flows_only_active, act_lbl);
                 });
             });
 
-            let hint = if is_en {
-                "Filter by .exe, domain or IP"
-            } else {
-                "Поиск по .exe, домену или IP"
-            };
-            ui.add(
-                TextEdit::singleline(&mut self.flow_filter)
-                    .hint_text(hint)
-                    .desired_width(ui.available_width()),
-            );
+            // Шапка сортировки колонок DataTable (из gpui-kit/src/table/data_table.rs) + поиск
+            ui.horizontal(|ui| {
+                let hint = if is_en {
+                    "Filter by .exe, domain or IP"
+                } else {
+                    "Поиск по .exe, домену или IP"
+                };
+                let search_w = (ui.available_width() - 252.0).max(96.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.flow_filter)
+                        .hint_text(hint)
+                        .desired_width(search_w),
+                );
+
+                let sort_cols = [
+                    (FlowSortColumn::Time, if is_en { "Time" } else { "Время" }),
+                    (
+                        FlowSortColumn::Traffic,
+                        if is_en { "Traffic" } else { "Трафик" },
+                    ),
+                    (FlowSortColumn::App, ".exe"),
+                    (FlowSortColumn::Host, if is_en { "Host" } else { "Хост" }),
+                ];
+                let tk = active_tokens();
+                for (col, title) in sort_cols {
+                    let is_cur = self.flow_sort_col == col;
+                    let arrow = if is_cur {
+                        if self.flow_sort_asc { " ▲" } else { " ▼" }
+                    } else {
+                        ""
+                    };
+                    let txt = format!("{title}{arrow}");
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(txt).monospace().size(9.5).color(if is_cur {
+                                    tk.accent
+                                } else {
+                                    TEXT_SECONDARY
+                                }),
+                            )
+                            .fill(if is_cur { tk.bg_elevated } else { tk.bg_deepest })
+                            .small(),
+                        )
+                        .clicked()
+                    {
+                        if is_cur {
+                            self.flow_sort_asc = !self.flow_sort_asc;
+                        } else {
+                            self.flow_sort_col = col;
+                            self.flow_sort_asc = false;
+                        }
+                    }
+                }
+            });
 
             let query = self.flow_filter.trim().to_ascii_lowercase();
             let selected_apps_set: Vec<String> = self
@@ -2300,7 +2754,7 @@ impl TachyonGuiApp {
                 .map(|s| s.to_ascii_lowercase())
                 .collect();
 
-            let filtered: Vec<_> = self
+            let mut filtered: Vec<_> = self
                 .snap
                 .live_flows
                 .iter()
@@ -2318,6 +2772,28 @@ impl TachyonGuiApp {
                 })
                 .cloned()
                 .collect();
+
+            filtered.sort_by(|a, b| {
+                let ord = match self.flow_sort_col {
+                    FlowSortColumn::Time => a.started_ms.cmp(&b.started_ms),
+                    FlowSortColumn::Traffic => {
+                        (a.rx_bytes + a.tx_bytes).cmp(&(b.rx_bytes + b.tx_bytes))
+                    }
+                    FlowSortColumn::App => a
+                        .app_name
+                        .to_ascii_lowercase()
+                        .cmp(&b.app_name.to_ascii_lowercase()),
+                    FlowSortColumn::Host => a
+                        .host
+                        .to_ascii_lowercase()
+                        .cmp(&b.host.to_ascii_lowercase()),
+                };
+                if self.flow_sort_asc {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            });
 
             if filtered.is_empty() {
                 ui.add_space(16.0);
@@ -2877,6 +3353,69 @@ impl TachyonGuiApp {
                         if ui.small_button(to_b_lbl).clicked() {
                             self.builder_cfg = rep.recommended_config.clone();
                             self.builder_dirty = true;
+                            self.selected_profile_id = None;
+                            if self.builder_profile_name.trim().is_empty() {
+                                self.builder_profile_name = if let Some(id) = rep.best_recipe_id {
+                                    format!("{} #{:02}", rep.domain, id)
+                                } else {
+                                    rep.domain.clone()
+                                };
+                            }
+                        }
+                        let save_prof_lbl = if is_en {
+                            "+ Save as Profile"
+                        } else {
+                            "+ В мои профили"
+                        };
+                        let save_prof_tip = if is_en {
+                            "Save synthesized strategy as a named profile assignable to any domain list or .exe"
+                        } else {
+                            "Сохранить синтезированную стратегию как отдельный именованный профиль для списков доменов и .exe"
+                        };
+                        if ui
+                            .small_button(RichText::new(save_prof_lbl).color(ACCENT))
+                            .on_hover_text(save_prof_tip)
+                            .clicked()
+                        {
+                            let prof_name = if !self.builder_profile_name.trim().is_empty() {
+                                self.builder_profile_name.trim().to_string()
+                            } else if let Some(id) = rep.best_recipe_id {
+                                format!("{} #{:02}", rep.domain, id)
+                            } else {
+                                rep.domain.clone()
+                            };
+                            self.builder_cfg = rep.recommended_config.clone();
+                            self.builder_profile_name = prof_name.clone();
+                            self.builder_dirty = false;
+                            self.dispatch_ipc(
+                                "save_custom_profile",
+                                serde_json::json!({
+                                    "name": prof_name,
+                                    "config": rep.recommended_config
+                                }),
+                            );
+                            if let Some(saved) = self
+                                .snap
+                                .config
+                                .custom_profiles
+                                .iter()
+                                .find(|p| p.name.eq_ignore_ascii_case(&prof_name))
+                            {
+                                self.selected_profile_id = Some(saved.id.clone());
+                            }
+                            self.push_toast(
+                                ToastKind::Success,
+                                if is_en {
+                                    format!("Profile saved: {prof_name}")
+                                } else {
+                                    format!("Профиль сохранён: {prof_name}")
+                                },
+                                if is_en {
+                                    "Available in all Lists and .exe dropdowns"
+                                } else {
+                                    "Доступен в выпадающих списках доменов и .exe"
+                                },
+                            );
                         }
                         let toast_active = self
                             .copied_toast_until
@@ -2960,6 +3499,11 @@ impl TachyonGuiApp {
                                         if ui.small_button(use_lbl).clicked() {
                                             self.builder_cfg = r.config.clone();
                                             self.builder_dirty = true;
+                                            self.selected_profile_id = None;
+                                            if self.builder_profile_name.trim().is_empty() {
+                                                self.builder_profile_name =
+                                                    format!("{} #{:02}", rep.domain, r.recipe_id);
+                                            }
                                         }
                                         let loc_title = localize_recipe_title(
                                             r.recipe_id,
@@ -2990,24 +3534,50 @@ impl TachyonGuiApp {
             self.draw_packet_slicer(ui);
         });
 
-        // 2. Конструктор стратегии (Глобальный профиль)
+        // 2. Конструктор стратегий (основной профиль + неограниченные именованные профили)
         Self::panel_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(if is_en {
-                        "Strategy Builder (Global Profile)"
+                        "Strategy & Profile Builder"
                     } else {
-                        "Конструктор стратегии (Глобальный)"
+                        "Конструктор стратегий и профилей"
                     })
                     .strong()
                     .size(12.0),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let save_lbl = if is_en { "Save" } else { "Сохранить" };
-                    if ui.add(Self::primary_button(save_lbl)).clicked() {
+                    let save_lbl = if is_en {
+                        "Save Global"
+                    } else {
+                        "Сохранить основной"
+                    };
+                    if ui
+                        .add(Self::primary_button(save_lbl))
+                        .on_hover_text(if is_en {
+                            "Save into the global 'Generator Profile' slot"
+                        } else {
+                            "Сохранить параметры в основной слот «Профиль Генератора»"
+                        })
+                        .clicked()
+                    {
                         self.builder_dirty = false;
                         if let Ok(val) = serde_json::to_value(&self.builder_cfg) {
                             self.dispatch_ipc("update_global_desync", val);
+                            self.push_toast(
+                                ToastKind::Success,
+                                if is_en {
+                                    "Global profile updated"
+                                } else {
+                                    "Основной профиль сохранён"
+                                },
+                                format!(
+                                    "{} + {}, TTL={}",
+                                    self.builder_cfg.mode,
+                                    self.builder_cfg.fooling,
+                                    self.builder_cfg.fake_ttl
+                                ),
+                            );
                         }
                     }
 
@@ -3039,6 +3609,226 @@ impl TachyonGuiApp {
                     }
                 });
             });
+
+            // Управление именованными пользовательскими профилями (для назначения разным спискам и .exe)
+            let saved_profiles = self.snap.config.custom_profiles.clone();
+            let mut save_named_clicked = false;
+            let mut load_profile_id: Option<String> = None;
+            let mut delete_profile_id: Option<(String, String)> = None;
+
+            Self::card_frame(!saved_profiles.is_empty()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            format!("Saved Profiles ({}):", saved_profiles.len())
+                        } else {
+                            format!("Мои профили ({}):", saved_profiles.len())
+                        })
+                        .strong()
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                    let has_sel = self.selected_profile_id.is_some();
+                    let right_reserve = if has_sel { 184.0 } else { 132.0 };
+                    let inp_w = (ui.available_width() - right_reserve).max(96.0);
+                    let resp = ui.add(
+                        TextEdit::singleline(&mut self.builder_profile_name)
+                            .hint_text(if is_en {
+                                "Profile name (e.g. YouTube CDN, Discord TTL4)..."
+                            } else {
+                                "Имя профиля (напр. YouTube CDN, Discord TTL4)..."
+                            })
+                            .desired_width(inp_w),
+                    );
+                    let enter_save = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
+                    let save_p_lbl = if has_sel {
+                        if is_en {
+                            "Update Profile"
+                        } else {
+                            "Обновить профиль"
+                        }
+                    } else if is_en {
+                        "+ Save Profile"
+                    } else {
+                        "+ Сохранить профиль"
+                    };
+                    if ui.button(RichText::new(save_p_lbl).size(10.0)).clicked() || enter_save {
+                        save_named_clicked = true;
+                    }
+                    if has_sel
+                        && ui
+                            .small_button(if is_en { "New" } else { "Новый" })
+                            .on_hover_text(if is_en {
+                                "Unlink from selected profile to save as a new separate profile"
+                            } else {
+                                "Снять выбор текущего профиля, чтобы сохранить настройки как новый"
+                            })
+                            .clicked()
+                    {
+                        self.selected_profile_id = None;
+                        self.builder_profile_name.clear();
+                    }
+                });
+
+                if saved_profiles.is_empty() {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Save multiple custom strategies here and assign each one independently in Lists or .exe filter"
+                        } else {
+                            "Сохраняйте любое число своих стратегий и назначайте каждую отдельно в «Списках» или для нужных .exe"
+                        })
+                        .size(9.5)
+                        .color(TEXT_MUTED),
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                        let tk = active_tokens();
+                        for p in &saved_profiles {
+                            let is_sel = self
+                                .selected_profile_id
+                                .as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(&p.id));
+                            let chip_lbl = format!("{} ({})", p.name, p.config.mode);
+                            let btn = egui::Button::new(
+                                RichText::new(chip_lbl).monospace().size(9.5).color(if is_sel {
+                                    TEXT_PRIMARY
+                                } else {
+                                    TEXT_SECONDARY
+                                }),
+                            )
+                            .fill(if is_sel { tk.bg_hover } else { tk.bg_deepest })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if is_sel { tk.accent } else { tk.border_subtle },
+                            ));
+                            if ui
+                                .add(btn)
+                                .on_hover_text(format!(
+                                    "{} + {} | split={} | SNI={} | TTL={}",
+                                    p.config.mode,
+                                    p.config.fooling,
+                                    p.config.split_pos,
+                                    p.config.fake_sni,
+                                    p.config.fake_ttl
+                                ))
+                                .clicked()
+                            {
+                                load_profile_id = Some(p.id.clone());
+                            }
+                            if ui
+                                .small_button(RichText::new("×").size(9.5).color(SEMANTIC_ERR))
+                                .on_hover_text(if is_en {
+                                    "Delete profile"
+                                } else {
+                                    "Удалить профиль"
+                                })
+                                .clicked()
+                            {
+                                delete_profile_id = Some((p.id.clone(), p.name.clone()));
+                            }
+                        }
+                    });
+                }
+            });
+
+            if save_named_clicked {
+                let next_idx = self.snap.config.custom_profiles.len() + 1;
+                let final_name = if self.builder_profile_name.trim().is_empty() {
+                    if is_en {
+                        format!("Profile #{next_idx} ({})", self.builder_cfg.mode)
+                    } else {
+                        format!("Профиль #{next_idx} ({})", self.builder_cfg.mode)
+                    }
+                } else {
+                    self.builder_profile_name.trim().to_string()
+                };
+                self.builder_profile_name = final_name.clone();
+                self.builder_dirty = false;
+                let payload = if let Some(ref pid) = self.selected_profile_id {
+                    serde_json::json!({
+                        "id": pid,
+                        "name": final_name,
+                        "config": self.builder_cfg
+                    })
+                } else {
+                    serde_json::json!({
+                        "name": final_name,
+                        "config": self.builder_cfg
+                    })
+                };
+                self.dispatch_ipc("save_custom_profile", payload);
+                if let Some(saved) = self
+                    .snap
+                    .config
+                    .custom_profiles
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&final_name))
+                {
+                    self.selected_profile_id = Some(saved.id.clone());
+                }
+                self.push_toast(
+                    ToastKind::Success,
+                    if is_en {
+                        format!("Saved profile: {final_name}")
+                    } else {
+                        format!("Сохранён профиль: {final_name}")
+                    },
+                    if is_en {
+                        "Select it in Domain Lists, .exe Filter or Default route"
+                    } else {
+                        "Выберите его во вкладке «Списки», для .exe или «Вне списков»"
+                    },
+                );
+            }
+
+            if let Some(pid) = load_profile_id
+                && let Some(found) = saved_profiles
+                    .iter()
+                    .find(|p| p.id.eq_ignore_ascii_case(&pid))
+            {
+                self.builder_cfg = found.config.clone();
+                self.builder_profile_name = found.name.clone();
+                self.selected_profile_id = Some(found.id.clone());
+                self.builder_dirty = true;
+                self.push_toast(
+                    ToastKind::Info,
+                    if is_en {
+                        format!("Loaded: {}", found.name)
+                    } else {
+                        format!("Загружен: {}", found.name)
+                    },
+                    format!(
+                        "{} + {}, TTL={}",
+                        found.config.mode, found.config.fooling, found.config.fake_ttl
+                    ),
+                );
+            }
+
+            if let Some((pid, pname)) = delete_profile_id {
+                if self
+                    .selected_profile_id
+                    .as_deref()
+                    .is_some_and(|cur| cur.eq_ignore_ascii_case(&pid))
+                {
+                    self.selected_profile_id = None;
+                }
+                self.dispatch_ipc("delete_custom_profile", serde_json::json!({ "id": pid }));
+                self.push_toast(
+                    ToastKind::Warn,
+                    if is_en {
+                        format!("Deleted profile: {pname}")
+                    } else {
+                        format!("Профиль удалён: {pname}")
+                    },
+                    if is_en {
+                        "Linked lists reverted to Auto (16 recipes)"
+                    } else {
+                        "Привязанные списки переключены обратно на Авто"
+                    },
+                );
+            }
 
             // Выбор шаблона из 16 рецептов
             ui.horizontal(|ui| {
@@ -3260,67 +4050,67 @@ impl TachyonGuiApp {
             });
 
             ui.columns(2, |cols| {
-                if cols[0]
-                    .checkbox(
-                        &mut self.builder_cfg.tlsrec_first,
-                        RichText::new("tlsrec_first (TLS Split)").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[0],
+                    &mut self.builder_cfg.tlsrec_first,
+                    "tlsrec_first (TLS Split)",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
-                if cols[0]
-                    .checkbox(
-                        &mut self.builder_cfg.multi_seven_point,
-                        RichText::new("7-Point MultiSplit").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[0],
+                    &mut self.builder_cfg.multi_seven_point,
+                    "7-Point MultiSplit",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
-                if cols[0]
-                    .checkbox(
-                        &mut self.builder_cfg.host_fake,
-                        RichText::new("HostFakeSplit").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[0],
+                    &mut self.builder_cfg.host_fake,
+                    "HostFakeSplit",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
-                if cols[0]
-                    .checkbox(
-                        &mut self.builder_cfg.syndata,
-                        RichText::new("SYN Data (syndata)").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[0],
+                    &mut self.builder_cfg.syndata,
+                    "SYN Data (syndata)",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
 
-                if cols[1]
-                    .checkbox(
-                        &mut self.builder_cfg.ipfrag,
-                        RichText::new("L3 IP Fragmentation").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[1],
+                    &mut self.builder_cfg.ipfrag,
+                    "L3 IP Fragmentation",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
-                if cols[1]
-                    .checkbox(
-                        &mut self.builder_cfg.udp_fake,
-                        RichText::new("UDP Fakes (QUIC/Voice)").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[1],
+                    &mut self.builder_cfg.udp_fake,
+                    "UDP Fakes (QUIC/Voice)",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
-                if cols[1]
-                    .checkbox(
-                        &mut self.builder_cfg.block_quic,
-                        RichText::new("Block QUIC UDP/443 -> TCP").size(10.0),
-                    )
-                    .changed()
+                if Self::gpui_switch(
+                    &mut cols[1],
+                    &mut self.builder_cfg.block_quic,
+                    "Block QUIC UDP/443 -> TCP",
+                )
+                .changed()
                 {
                     self.builder_dirty = true;
                 }
@@ -3541,6 +4331,7 @@ impl TachyonGuiApp {
 
             let selected_apps = self.snap.config.selected_apps.clone();
             let app_strats_map = self.snap.config.app_strategies.clone();
+            let all_app_strat_opts = self.all_strategy_options(is_en);
             let mut app_to_toggle: Option<(String, bool)> = None;
             let mut upd_app_strat: Option<(String, String)> = None;
 
@@ -3565,12 +4356,12 @@ impl TachyonGuiApp {
                         .unwrap_or("default");
                     let cur_s_lbl = if cur_s == "default" {
                         if is_en {
-                            "Use Lists / Mode"
+                            "Use Lists / Mode".to_string()
                         } else {
-                            "По спискам / Режиму"
+                            "По спискам / Режиму".to_string()
                         }
                     } else {
-                        strategy_short_label(cur_s, is_en)
+                        resolve_strategy_label(cur_s, &all_app_strat_opts, is_en)
                     };
                     ui.horizontal(|ui| {
                         if ui
@@ -3601,9 +4392,9 @@ impl TachyonGuiApp {
                                 if ui.selectable_label(cur_s == "default", def_lbl).clicked() {
                                     upd_app_strat = Some((app.clone(), "default".to_string()));
                                 }
-                                for (code, lbl) in strategy_options(is_en) {
+                                for (code, lbl) in &all_app_strat_opts {
                                     if ui.selectable_label(cur_s == code, lbl).clicked() {
-                                        upd_app_strat = Some((app.clone(), code.to_string()));
+                                        upd_app_strat = Some((app.clone(), code.clone()));
                                     }
                                 }
                             });
@@ -3825,6 +4616,7 @@ impl TachyonGuiApp {
 
             let q = self.list_search_filter.trim().to_ascii_lowercase();
             let lists_snap = self.snap.config.lists.clone();
+            let all_list_strat_opts = self.all_strategy_options(is_en);
 
             let mut upd_enable: Option<(String, bool)> = None;
             let mut upd_strat: Option<(String, String)> = None;
@@ -3898,14 +4690,17 @@ impl TachyonGuiApp {
                                 egui::ComboBox::from_id_salt(format!("lst_s_{}", item.id))
                                     .width(156.0)
                                     .selected_text(
-                                        RichText::new(strategy_short_label(&cur_s, is_en))
-                                            .size(10.0),
+                                        RichText::new(resolve_strategy_label(
+                                            &cur_s,
+                                            &all_list_strat_opts,
+                                            is_en,
+                                        ))
+                                        .size(10.0),
                                     )
                                     .show_ui(ui, |ui| {
-                                        for (code, lbl) in strategy_options(is_en) {
-                                            if ui.selectable_label(cur_s == code, lbl).clicked() {
-                                                upd_strat =
-                                                    Some((item.id.clone(), code.to_string()));
+                                        for (code, lbl) in &all_list_strat_opts {
+                                            if ui.selectable_label(&cur_s == code, lbl).clicked() {
+                                                upd_strat = Some((item.id.clone(), code.clone()));
                                             }
                                         }
                                     });
@@ -3989,6 +4784,7 @@ impl TachyonGuiApp {
             return;
         }
         let is_en = self.is_en();
+        let all_modal_strat_opts = self.all_strategy_options(is_en);
         let mut open = self.list_modal.open;
         let mut save_clicked = false;
         let mut close_clicked = false;
@@ -4019,16 +4815,20 @@ impl TachyonGuiApp {
                     egui::ComboBox::from_id_salt("modal_strat_combo")
                         .width(132.0)
                         .selected_text(
-                            RichText::new(strategy_short_label(&self.list_modal.strategy, is_en))
-                                .size(10.0),
+                            RichText::new(resolve_strategy_label(
+                                &self.list_modal.strategy,
+                                &all_modal_strat_opts,
+                                is_en,
+                            ))
+                            .size(10.0),
                         )
                         .show_ui(ui, |ui| {
-                            for (code, lbl) in strategy_options(is_en) {
+                            for (code, lbl) in &all_modal_strat_opts {
                                 if ui
-                                    .selectable_label(self.list_modal.strategy == code, lbl)
+                                    .selectable_label(&self.list_modal.strategy == code, lbl)
                                     .clicked()
                                 {
-                                    self.list_modal.strategy = code.to_string();
+                                    self.list_modal.strategy = code.clone();
                                 }
                             }
                         });
@@ -4269,13 +5069,23 @@ impl TachyonGuiApp {
 
         // 2. Журнал событий
         Self::panel_frame().show(ui, |ui| {
+            let log_q = self.log_search_query.trim().to_ascii_lowercase();
             let filtered: Vec<_> = self
                 .snap
                 .logs
                 .iter()
                 .rev()
                 .filter(|l| {
-                    self.log_category_filter == "all" || l.category == self.log_category_filter
+                    let cat_ok =
+                        self.log_category_filter == "all" || l.category == self.log_category_filter;
+                    if !cat_ok {
+                        return false;
+                    }
+                    if log_q.is_empty() {
+                        return true;
+                    }
+                    l.message.to_ascii_lowercase().contains(&log_q)
+                        || l.category.to_ascii_lowercase().contains(&log_q)
                 })
                 .cloned()
                 .collect();
@@ -4339,7 +5149,7 @@ impl TachyonGuiApp {
                             "Копировать лог"
                         })
                         .size(10.0)
-                        .color(ACCENT)
+                        .color(active_tokens().accent)
                     };
                     if ui
                         .add_enabled(
@@ -4356,6 +5166,19 @@ impl TachyonGuiApp {
                         ui.ctx().copy_text(full_log_text.clone());
                         self.log_copied_toast_until =
                             Some(Instant::now() + Duration::from_millis(1600));
+                        self.push_toast(
+                            ToastKind::Success,
+                            if is_en {
+                                "Event log copied"
+                            } else {
+                                "Журнал скопирован"
+                            },
+                            if is_en {
+                                format!("{} lines copied to clipboard", filtered.len())
+                            } else {
+                                format!("Скопировано записей в буфер: {}", filtered.len())
+                            },
+                        );
                     }
 
                     egui::ComboBox::from_id_salt("combo_log_cat")
@@ -4386,6 +5209,17 @@ impl TachyonGuiApp {
                         });
                 });
             });
+
+            let search_hint = if is_en {
+                "Filter log lines by domain, recipe or text..."
+            } else {
+                "Поиск по тексту события, домену или рецепту..."
+            };
+            ui.add(
+                TextEdit::singleline(&mut self.log_search_query)
+                    .hint_text(search_hint)
+                    .desired_width(ui.available_width()),
+            );
 
             if filtered.is_empty() {
                 ui.label(
@@ -5009,6 +5843,845 @@ impl TachyonGuiApp {
             self.about_modal_open = false;
         }
     }
+
+    // Нижняя приборная панель StatusBar (left / center / right из gpui-kit/src/status_bar.rs)
+    fn render_gpui_status_bar(&mut self, ctx: &egui::Context) {
+        let tk = active_tokens();
+        let is_en = self.is_en();
+
+        egui::TopBottomPanel::bottom("gpui_status_bar")
+            .exact_height(22.0)
+            .frame(
+                Frame::new()
+                    .fill(tk.bg_deepest)
+                    .stroke(Stroke::new(1.0_f32, tk.border_subtle))
+                    .inner_margin(Margin::symmetric(8, 2)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    // LEFT REGION: Статус контура + DNS + Кэш L1/L2
+                    let dot_col = if self.snap.running {
+                        SEMANTIC_OK
+                    } else {
+                        TEXT_MUTED
+                    };
+                    let (dot_r, _) = ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
+                    ui.painter().circle_filled(dot_r.center(), 3.0, dot_col);
+
+                    let cap_short = match self.snap.config.capture_mode {
+                        CaptureMode::Tun => "TUN L3",
+                        CaptureMode::SystemProxy => "SysProxy",
+                        CaptureMode::LocalProxy => "SOCKS5",
+                    };
+                    ui.label(
+                        RichText::new(cap_short)
+                            .monospace()
+                            .strong()
+                            .size(9.5)
+                            .color(if self.snap.running {
+                                TEXT_PRIMARY
+                            } else {
+                                TEXT_MUTED
+                            }),
+                    );
+                    ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+
+                    let dns_short = match self.snap.config.dns_mode.as_str() {
+                        "cloudflare" => "DNS: 1.1.1.1",
+                        "google" => "DNS: 8.8.8.8",
+                        "port1253" => "DNS: :1253",
+                        "system" => "DNS: OS",
+                        _ => "DNS: AutoClean",
+                    };
+                    ui.label(
+                        RichText::new(dns_short)
+                            .monospace()
+                            .size(9.5)
+                            .color(TEXT_SECONDARY),
+                    );
+                    ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+
+                    let verified_cnt = self
+                        .snap
+                        .learned_domains
+                        .iter()
+                        .filter(|d| d.verified)
+                        .count();
+                    ui.label(
+                        RichText::new(format!(
+                            "32K: {}/{}",
+                            verified_cnt,
+                            self.snap.learned_domains.len()
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(tk.accent),
+                    );
+
+                    // RIGHT REGION (закреплён справа): Трафик ↓RX ↑TX + Аптайм + Ctrl+K
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Ctrl+K")
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(TEXT_SECONDARY),
+                                )
+                                .fill(tk.bg_elevated)
+                                .small(),
+                            )
+                            .on_hover_text(if is_en {
+                                "Open Command Palette (Ctrl+K)"
+                            } else {
+                                "Палитра быстрых команд (Ctrl+K)"
+                            })
+                            .clicked()
+                        {
+                            self.cmd_palette_open = true;
+                            self.cmd_palette_just_opened = true;
+                            self.cmd_palette_selected = 0;
+                        }
+
+                        ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+                        ui.label(
+                            RichText::new(format_uptime(self.snap.uptime_sec))
+                                .monospace()
+                                .size(9.5)
+                                .color(TEXT_MUTED),
+                        );
+                        ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+                        ui.label(
+                            RichText::new(format!(
+                                "↓{} ↑{}",
+                                format_rate_bps(self.cur_rx_bps, is_en),
+                                format_rate_bps(self.cur_tx_bps, is_en)
+                            ))
+                            .monospace()
+                            .size(9.5)
+                            .color(TEXT_PRIMARY),
+                        );
+
+                        // CENTER REGION: последняя строка живого журнала событий
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            if let Some(last_log) = self.snap.logs.last() {
+                                ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+                                let msg = localize_runtime_text(&last_log.message, is_en);
+                                let line = format!("[{}] {}", last_log.category, msg);
+                                let resp = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(line).monospace().size(9.5).color(TEXT_MUTED),
+                                    )
+                                    .truncate()
+                                    .sense(Sense::click()),
+                                );
+                                if resp
+                                    .on_hover_text(if is_en {
+                                        "Click to open Event Log tab"
+                                    } else {
+                                        "Нажмите, чтобы перейти во вкладку Журнал"
+                                    })
+                                    .clicked()
+                                {
+                                    self.active_tab = ActiveTab::Logs;
+                                }
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    // Стек неблокирующих уведомлений Toast / Notification (из gpui-kit/src/notification.rs)
+    fn render_toast_stack(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.toasts
+            .retain(|t| now.duration_since(t.created) < t.duration);
+        if self.toasts.is_empty() {
+            return;
+        }
+
+        let tk = active_tokens();
+        let screen = ctx.screen_rect();
+        let anchor_pos = Pos2::new(screen.max.x - 12.0, screen.max.y - 32.0);
+        let mut dismiss_idx: Option<usize> = None;
+
+        egui::Area::new(Id::new("gpui_toast_stack_area"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .fixed_pos(anchor_pos)
+            .show(ctx, |ui| {
+                ui.set_width(284.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    for (idx, toast) in self.toasts.iter().enumerate() {
+                        let accent_col = match toast.kind {
+                            ToastKind::Info => tk.accent,
+                            ToastKind::Success => SEMANTIC_OK,
+                            ToastKind::Warn => SEMANTIC_WARN,
+                            ToastKind::Error => SEMANTIC_ERR,
+                        };
+                        let elapsed = now.duration_since(toast.created).as_secs_f32();
+                        let total = toast.duration.as_secs_f32().max(0.1);
+                        let rem_frac = (1.0 - (elapsed / total)).clamp(0.0, 1.0);
+
+                        let frame_resp = Frame::new()
+                            .fill(tk.bg_elevated)
+                            .stroke(Stroke::new(1.0_f32, tk.border_strong))
+                            .corner_radius(CornerRadius::same(6))
+                            .inner_margin(Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(264.0);
+                                ui.horizontal(|ui| {
+                                    let (bar_r, _) = ui
+                                        .allocate_exact_size(Vec2::new(3.0, 26.0), Sense::hover());
+                                    ui.painter().rect_filled(
+                                        bar_r,
+                                        CornerRadius::same(1),
+                                        accent_col,
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(&toast.title)
+                                                    .strong()
+                                                    .size(10.5)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .small_button(
+                                                            RichText::new("×")
+                                                                .size(10.0)
+                                                                .color(TEXT_MUTED),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        dismiss_idx = Some(idx);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if !toast.detail.is_empty() {
+                                            ui.label(
+                                                RichText::new(&toast.detail)
+                                                    .size(9.5)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+                                        }
+                                    });
+                                });
+                            });
+
+                        // Тонкая полоска таймера авто-скрытия внизу карточки
+                        let r = frame_resp.response.rect;
+                        let prog_w = (r.width() - 4.0) * rem_frac;
+                        if prog_w > 1.0 {
+                            let prog_rect = Rect::from_min_size(
+                                Pos2::new(r.min.x + 2.0, r.max.y - 2.0),
+                                Vec2::new(prog_w, 1.5),
+                            );
+                            ui.painter()
+                                .rect_filled(prog_rect, CornerRadius::same(1), accent_col);
+                        }
+                    }
+                });
+            });
+
+        if let Some(i) = dismiss_idx {
+            self.toasts.remove(i);
+        }
+        ctx.request_repaint_after(Duration::from_millis(80));
+    }
+
+    // Модальная палитра быстрых команд Command Palette (Ctrl+K / F1 из gpui-kit/src/command/)
+    fn render_command_palette(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(Key::K))
+            || ctx.input(|i| i.key_pressed(Key::F1))
+        {
+            self.cmd_palette_open = !self.cmd_palette_open;
+            if self.cmd_palette_open {
+                self.cmd_palette_just_opened = true;
+                self.cmd_palette_selected = 0;
+            }
+        }
+
+        if !self.cmd_palette_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.cmd_palette_open = false;
+            return;
+        }
+
+        let is_en = self.is_en();
+        let tk = active_tokens();
+
+        // Формируем список команд: (код, категория, заголовок, бейдж справа)
+        let mut items: Vec<(String, &'static str, String, &'static str)> = vec![
+            (
+                "toggle_run".to_string(),
+                if is_en {
+                    "Control"
+                } else {
+                    "Управление"
+                },
+                if self.snap.running {
+                    if is_en {
+                        "Stop Packet Desynchronization Capture".to_string()
+                    } else {
+                        "Остановить перехват и десинхронизацию".to_string()
+                    }
+                } else if is_en {
+                    "Start Packet Desynchronization Capture".to_string()
+                } else {
+                    "Запустить перехват и десинхронизацию".to_string()
+                },
+                "Run",
+            ),
+            (
+                "mode_tun".to_string(),
+                if is_en { "Capture" } else { "Перехват" },
+                if is_en {
+                    "Switch Capture to TUN Adapter (Wintun L3)".to_string()
+                } else {
+                    "Режим перехвата: Адаптер TUN (Wintun L3)".to_string()
+                },
+                "TUN L3",
+            ),
+            (
+                "mode_sysproxy".to_string(),
+                if is_en { "Capture" } else { "Перехват" },
+                if is_en {
+                    "Switch Capture to System Proxy (:7897)".to_string()
+                } else {
+                    "Режим перехвата: Системный прокси (:7897)".to_string()
+                },
+                ":7897",
+            ),
+            (
+                "health_check".to_string(),
+                if is_en {
+                    "Probe"
+                } else {
+                    "Диагностика"
+                },
+                if is_en {
+                    "Check Availability of 6 Key Services".to_string()
+                } else {
+                    "Проверить доступность 6 ключевых узлов".to_string()
+                },
+                "6 Nodes",
+            ),
+            (
+                "probe_16".to_string(),
+                if is_en {
+                    "Generator"
+                } else {
+                    "Генератор"
+                },
+                if is_en {
+                    "Generate Strategy: Full Scan (16 Recipes)".to_string()
+                } else {
+                    "Подобрать стратегию: Полный скан (16 рецептов)".to_string()
+                },
+                "16 Rec",
+            ),
+            (
+                "probe_8".to_string(),
+                if is_en {
+                    "Generator"
+                } else {
+                    "Генератор"
+                },
+                if is_en {
+                    "Generate Strategy: Quick Scan (8 Recipes)".to_string()
+                } else {
+                    "Подобрать стратегию: Быстрый скан (8 рецептов)".to_string()
+                },
+                "8 Rec",
+            ),
+            (
+                "calib_ttl".to_string(),
+                if is_en {
+                    "Generator"
+                } else {
+                    "Генератор"
+                },
+                if is_en {
+                    "Calibrate Optimal Auto-TTL Distance (Hops 2..10)".to_string()
+                } else {
+                    "Авто-калибровка оптимального Auto-TTL (2..10 хопов)".to_string()
+                },
+                "Auto-TTL",
+            ),
+            (
+                "copy_logs".to_string(),
+                if is_en { "Logs" } else { "Журнал" },
+                if is_en {
+                    "Copy Full Event Log to Clipboard".to_string()
+                } else {
+                    "Скопировать весь журнал событий в буфер обмена".to_string()
+                },
+                "Ctrl+C",
+            ),
+            (
+                "clear_logs".to_string(),
+                if is_en { "Logs" } else { "Журнал" },
+                if is_en {
+                    "Clear Event Log".to_string()
+                } else {
+                    "Очистить журнал событий".to_string()
+                },
+                "Clear",
+            ),
+            (
+                "check_updates".to_string(),
+                if is_en { "System" } else { "Система" },
+                if is_en {
+                    "Check for Tachyon Desync Updates on GitHub".to_string()
+                } else {
+                    "Проверить наличие обновлений программы на GitHub".to_string()
+                },
+                "Update",
+            ),
+            (
+                "tab_overview".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: Auto & Telemetry".to_string()
+                } else {
+                    "Перейти: Авто и телеметрия".to_string()
+                },
+                "Tab 1",
+            ),
+            (
+                "tab_flows".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: Live Connections".to_string()
+                } else {
+                    "Перейти: Потоки (Активные соединения)".to_string()
+                },
+                "Tab 2",
+            ),
+            (
+                "tab_generator".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: Strategy Generator & Builder".to_string()
+                } else {
+                    "Перейти: Генератор и конструктор стратегий".to_string()
+                },
+                "Tab 3",
+            ),
+            (
+                "tab_lists".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: Domain Lists & .exe Filter".to_string()
+                } else {
+                    "Перейти: Списки доменов и фильтр .exe".to_string()
+                },
+                "Tab 4",
+            ),
+            (
+                "tab_logs".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: Scoreboard & Event Log".to_string()
+                } else {
+                    "Перейти: Рейтинг L3 и Журнал событий".to_string()
+                },
+                "Tab 5",
+            ),
+        ];
+
+        for preset in GpuiThemePreset::ALL {
+            items.push((
+                format!("theme_{}", preset as u8),
+                if is_en { "Theme" } else { "Тема" },
+                if is_en {
+                    format!("Apply Theme: {}", preset.label())
+                } else {
+                    format!("Применить тему: {}", preset.label())
+                },
+                preset.label(),
+            ));
+        }
+
+        for p in &self.snap.config.custom_profiles {
+            items.push((
+                format!("profile_{}", p.id),
+                if is_en { "Profile" } else { "Профиль" },
+                format!(
+                    "{} ({} + {}, TTL={})",
+                    p.name, p.config.mode, p.config.fooling, p.config.fake_ttl
+                ),
+                "Custom",
+            ));
+        }
+
+        for r in &self.snap.recipes_catalog {
+            let loc_t = localize_recipe_title(r.id, &r.title, is_en);
+            items.push((
+                format!("recipe_{}", r.id),
+                if is_en { "Recipe" } else { "Рецепт" },
+                format!("#{:02} {}", r.id, loc_t),
+                "Apply",
+            ));
+        }
+
+        let q = self.cmd_palette_query.trim().to_ascii_lowercase();
+        let filtered: Vec<_> = items
+            .into_iter()
+            .filter(|(_, cat, title, badge)| {
+                if q.is_empty() {
+                    return true;
+                }
+                cat.to_ascii_lowercase().contains(&q)
+                    || title.to_ascii_lowercase().contains(&q)
+                    || badge.to_ascii_lowercase().contains(&q)
+            })
+            .collect();
+
+        if !filtered.is_empty() {
+            if self.cmd_palette_selected >= filtered.len() {
+                self.cmd_palette_selected = filtered.len() - 1;
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+                self.cmd_palette_selected = (self.cmd_palette_selected + 1) % filtered.len();
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+                self.cmd_palette_selected = if self.cmd_palette_selected == 0 {
+                    filtered.len() - 1
+                } else {
+                    self.cmd_palette_selected - 1
+                };
+            }
+        } else {
+            self.cmd_palette_selected = 0;
+        }
+
+        let mut triggered_code: Option<String> = None;
+        if ctx.input(|i| i.key_pressed(Key::Enter))
+            && let Some((code, _, _, _)) = filtered.get(self.cmd_palette_selected)
+        {
+            triggered_code = Some(code.clone());
+        }
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(Id::new("gpui_command_palette_modal"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(screen.center().x, screen.top() + 52.0))
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(tk.bg_panel)
+                    .stroke(Stroke::new(1.0_f32, tk.border_strong))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width((screen.width() - 48.0).clamp(320.0, 480.0));
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("⌘")
+                                    .monospace()
+                                    .strong()
+                                    .size(12.0)
+                                    .color(tk.accent),
+                            );
+                            let inp_w = (ui.available_width() - 44.0).max(160.0);
+                            let resp = ui.add(
+                                TextEdit::singleline(&mut self.cmd_palette_query)
+                                    .hint_text(if is_en {
+                                        "Type a command, recipe #00..#15, or theme..."
+                                    } else {
+                                        "Введите команду, номер рецепта #00..#15 или тему..."
+                                    })
+                                    .desired_width(inp_w),
+                            );
+                            if self.cmd_palette_just_opened {
+                                resp.request_focus();
+                                self.cmd_palette_just_opened = false;
+                            }
+                            if resp.changed() {
+                                self.cmd_palette_selected = 0;
+                            }
+                            Self::kbd_badge(ui, "Esc");
+                        });
+
+                        ui.add_space(4.0);
+
+                        ScrollArea::vertical()
+                            .id_salt("scroll_cmd_palette")
+                            .max_height(260.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if filtered.is_empty() {
+                                    ui.label(
+                                        RichText::new(if is_en {
+                                            "No matching commands"
+                                        } else {
+                                            "Команды не найдены"
+                                        })
+                                        .size(10.0)
+                                        .color(TEXT_MUTED),
+                                    );
+                                    return;
+                                }
+                                for (idx, (code, cat, title, badge)) in filtered.iter().enumerate()
+                                {
+                                    let is_sel = idx == self.cmd_palette_selected;
+                                    let row_fill = if is_sel {
+                                        tk.bg_hover
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    let row_stroke = if is_sel {
+                                        Stroke::new(1.0_f32, tk.border_strong)
+                                    } else {
+                                        Stroke::NONE
+                                    };
+                                    let row_resp = Frame::new()
+                                        .fill(row_fill)
+                                        .stroke(row_stroke)
+                                        .corner_radius(CornerRadius::same(4))
+                                        .inner_margin(Margin::symmetric(6, 4))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                Self::semantic_tag(ui, cat, tk.accent);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(title)
+                                                            .size(10.5)
+                                                            .color(TEXT_PRIMARY),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        Self::kbd_badge(ui, badge);
+                                                    },
+                                                );
+                                            });
+                                        })
+                                        .response
+                                        .interact(Sense::click());
+
+                                    if row_resp.hovered() {
+                                        self.cmd_palette_selected = idx;
+                                    }
+                                    if row_resp.clicked() {
+                                        triggered_code = Some(code.clone());
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        if let Some(code) = triggered_code {
+            self.cmd_palette_open = false;
+            self.cmd_palette_query.clear();
+            match code.as_str() {
+                "toggle_run" => {
+                    let was_running = self.snap.running;
+                    self.dispatch_ipc("toggle_running", serde_json::json!({}));
+                    let mode_str = self.snap.active_mode.clone();
+                    if was_running && !self.snap.running {
+                        self.push_toast(
+                            ToastKind::Warn,
+                            if is_en {
+                                "Capture stopped"
+                            } else {
+                                "Перехват остановлен"
+                            },
+                            mode_str,
+                        );
+                    } else if self.snap.running {
+                        self.push_toast(
+                            ToastKind::Success,
+                            if is_en {
+                                "Capture active"
+                            } else {
+                                "Перехват запущен"
+                            },
+                            mode_str,
+                        );
+                    } else {
+                        self.push_toast(
+                            ToastKind::Error,
+                            if is_en {
+                                "Failed to start capture"
+                            } else {
+                                "Не удалось запустить перехват"
+                            },
+                            mode_str,
+                        );
+                    }
+                }
+                "mode_tun" => {
+                    self.dispatch_ipc(
+                        "set_capture_mode",
+                        serde_json::json!({ "capture_mode": "tun" }),
+                    );
+                    self.push_toast(
+                        ToastKind::Info,
+                        "TUN L3 (Wintun)",
+                        if is_en {
+                            "Capture mode switched to TUN"
+                        } else {
+                            "Режим перехвата переключён на Адаптер TUN"
+                        },
+                    );
+                }
+                "mode_sysproxy" => {
+                    self.dispatch_ipc(
+                        "set_capture_mode",
+                        serde_json::json!({ "capture_mode": "system_proxy" }),
+                    );
+                    self.push_toast(
+                        ToastKind::Info,
+                        "System Proxy (:7897)",
+                        if is_en {
+                            "Capture mode switched to System Proxy"
+                        } else {
+                            "Режим перехвата переключён на Системный прокси"
+                        },
+                    );
+                }
+                "health_check" => {
+                    self.active_tab = ActiveTab::Overview;
+                    self.start_health_check();
+                    self.push_toast(
+                        ToastKind::Info,
+                        if is_en {
+                            "Checking 6 services..."
+                        } else {
+                            "Проверка 6 узлов..."
+                        },
+                        "TLS 1.3 + 32 KiB Gate",
+                    );
+                }
+                "probe_16" => {
+                    self.active_tab = ActiveTab::Generator;
+                    self.start_probe_scan(true);
+                }
+                "probe_8" => {
+                    self.active_tab = ActiveTab::Generator;
+                    self.start_probe_scan(false);
+                }
+                "calib_ttl" => {
+                    self.active_tab = ActiveTab::Generator;
+                    self.start_ttl_calibration();
+                }
+                "copy_logs" => {
+                    let mut lines = Vec::with_capacity(self.snap.logs.len() + 1);
+                    lines.push(format!(
+                        "# Tachyon Desync v{} | mode={}",
+                        env!("CARGO_PKG_VERSION"),
+                        self.snap.active_mode
+                    ));
+                    for l in &self.snap.logs {
+                        lines.push(format!(
+                            "{} [{}] {}",
+                            format_hms(l.ts_ms),
+                            l.category,
+                            localize_runtime_text(&l.message, is_en)
+                        ));
+                    }
+                    ctx.copy_text(lines.join("\n"));
+                    self.push_toast(
+                        ToastKind::Success,
+                        if is_en {
+                            "Event log copied"
+                        } else {
+                            "Журнал скопирован"
+                        },
+                        format!("{} lines", self.snap.logs.len()),
+                    );
+                }
+                "clear_logs" => {
+                    self.dispatch_ipc("clear_logs", serde_json::json!({}));
+                }
+                "check_updates" => {
+                    self.about_modal_open = true;
+                    self.trigger_update_check();
+                }
+                "tab_overview" => self.active_tab = ActiveTab::Overview,
+                "tab_flows" => self.active_tab = ActiveTab::Flows,
+                "tab_generator" => self.active_tab = ActiveTab::Generator,
+                "tab_lists" => self.active_tab = ActiveTab::Lists,
+                "tab_logs" => self.active_tab = ActiveTab::Logs,
+                other if other.starts_with("theme_") => {
+                    if let Ok(idx) = other.trim_start_matches("theme_").parse::<u8>() {
+                        self.set_theme_preset(GpuiThemePreset::from_u8(idx));
+                    }
+                }
+                other if other.starts_with("profile_") => {
+                    let pid = other.trim_start_matches("profile_");
+                    if let Some(found) = self
+                        .snap
+                        .config
+                        .custom_profiles
+                        .iter()
+                        .find(|p| p.id.eq_ignore_ascii_case(pid))
+                        .cloned()
+                    {
+                        self.builder_cfg = found.config.clone();
+                        self.builder_profile_name = found.name.clone();
+                        self.selected_profile_id = Some(found.id.clone());
+                        self.builder_dirty = true;
+                        self.active_tab = ActiveTab::Generator;
+                        self.push_toast(
+                            ToastKind::Info,
+                            if is_en {
+                                format!("Profile loaded: {}", found.name)
+                            } else {
+                                format!("Профиль загружен: {}", found.name)
+                            },
+                            format!(
+                                "{} + {}, TTL={}",
+                                found.config.mode, found.config.fooling, found.config.fake_ttl
+                            ),
+                        );
+                    }
+                }
+                other if other.starts_with("recipe_") => {
+                    if let Ok(rid) = other.trim_start_matches("recipe_").parse::<u8>()
+                        && let Some(item) = self
+                            .snap
+                            .recipes_catalog
+                            .iter()
+                            .find(|r| r.id == rid)
+                            .cloned()
+                    {
+                        self.builder_cfg = item.config.clone();
+                        self.builder_dirty = false;
+                        if let Ok(val) = serde_json::to_value(&self.builder_cfg) {
+                            self.dispatch_ipc("update_global_desync", val);
+                        }
+                        self.active_tab = ActiveTab::Generator;
+                        self.push_toast(
+                            ToastKind::Success,
+                            format!("Recipe #{:02} applied", rid),
+                            localize_recipe_title(rid, &item.title, is_en),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl eframe::App for TachyonGuiApp {
@@ -5046,20 +6719,27 @@ impl eframe::App for TachyonGuiApp {
         }
 
         self.poll_snapshot_if_due();
+        let tk = active_tokens();
 
         egui::TopBottomPanel::top("custom_window_titlebar")
             .frame(
                 Frame::new()
-                    .fill(BG_DEEPEST)
-                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .fill(tk.bg_deepest)
+                    .stroke(Stroke::new(1.0_f32, tk.border_subtle))
                     .inner_margin(Margin::symmetric(8, 4)),
             )
             .show(ctx, |ui| {
                 self.render_custom_titlebar(ctx, ui);
             });
 
+        self.render_gpui_status_bar(ctx);
+
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG_CANVAS).inner_margin(Margin::same(8)))
+            .frame(
+                Frame::new()
+                    .fill(tk.bg_canvas)
+                    .inner_margin(Margin::same(8)),
+            )
             .show(ctx, |ui| {
                 self.render_top_header(ui);
                 ui.add_space(8.0);
@@ -5078,6 +6758,8 @@ impl eframe::App for TachyonGuiApp {
 
         self.render_list_modal(ctx);
         self.render_about_modal(ctx);
+        self.render_command_palette(ctx);
+        self.render_toast_stack(ctx);
 
         // Тонкая внешняя рамка 1px вокруг безрамочного окна (когда окно не развёрнуто на весь экран)
         if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
@@ -5088,7 +6770,7 @@ impl eframe::App for TachyonGuiApp {
             fg_painter.rect_stroke(
                 ctx.screen_rect(),
                 CornerRadius::ZERO,
-                Stroke::new(1.0_f32, BORDER_STRONG),
+                Stroke::new(1.0_f32, tk.border_strong),
                 StrokeKind::Inside,
             );
         }
@@ -5138,6 +6820,16 @@ fn strategy_short_label(code: &str, en: bool) -> &'static str {
         }
     }
     if en { "Auto" } else { "Авто" }
+}
+
+fn resolve_strategy_label(code: &str, opts: &[(String, String)], en: bool) -> String {
+    let trimmed = code.trim();
+    for (c, lbl) in opts {
+        if c.eq_ignore_ascii_case(trimmed) {
+            return lbl.clone();
+        }
+    }
+    strategy_short_label(trimmed, en).to_string()
 }
 
 fn format_bytes(bytes: u64, en: bool) -> String {

@@ -9,8 +9,8 @@ use crate::desync::{
     inspect_client_hello_slices, pin_domain_recipe, probe_custom_strategy, remove_learned_domain,
 };
 use crate::lists::{
-    AppFilterMode, CompiledMatcher, ListProfile, ListStrategy, default_builtin_lists,
-    enrich_from_local_tachyon_lists,
+    AppFilterMode, CompiledMatcher, ListProfile, ListStrategy, NamedCustomProfile,
+    default_builtin_lists, enrich_from_local_tachyon_lists,
 };
 use crate::proxy::{LogCallback, TrafficCounters, run_local_proxy_server, set_os_system_proxy};
 use crate::tun::run_tun_capture;
@@ -25,6 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 const MAX_LOG_ENTRIES: usize = 300;
+const MAX_CUSTOM_PROFILES: usize = 64;
 
 /// Режим перехвата сетевого трафика.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -55,6 +56,7 @@ pub struct AppStateConfig {
     pub tun_interface_name: String,
     pub default_strategy: ListStrategy,
     pub custom_global_config: DesyncConfig,
+    pub custom_profiles: Vec<NamedCustomProfile>,
     pub app_filter_mode: AppFilterMode,
     pub selected_apps: Vec<String>,
     pub force_desync_selected_apps: bool,
@@ -76,6 +78,7 @@ impl Default for AppStateConfig {
             tun_interface_name: "TachyonDesync".to_string(),
             default_strategy: ListStrategy::Auto,
             custom_global_config: DesyncConfig::from_preset(DesyncPreset::Auto),
+            custom_profiles: Vec::new(),
             app_filter_mode: AppFilterMode::All,
             selected_apps: Vec::new(),
             force_desync_selected_apps: true,
@@ -190,17 +193,20 @@ impl DesyncRuntime {
         crate::upstream_compat::set_clean_dns_mode_from_str(&cfg.dns_mode);
         crate::desync::AUTO_RELEARN_ENABLED.store(cfg.auto_relearn, Ordering::Relaxed);
 
-        let compiled = Arc::new(CompiledMatcher::build_full(
-            &cfg.lists,
-            cfg.default_strategy.clone(),
-            cfg.custom_global_config.clone(),
-            cfg.app_filter_mode,
-            cfg.selected_apps.clone(),
-            cfg.force_desync_selected_apps,
-            cfg.upstream_proxy.clone(),
-            &cfg.app_strategies,
-            &cfg.dns_overrides,
-        ));
+        let compiled = Arc::new(
+            CompiledMatcher::build_full(
+                &cfg.lists,
+                cfg.default_strategy.clone(),
+                cfg.custom_global_config.clone(),
+                cfg.app_filter_mode,
+                cfg.selected_apps.clone(),
+                cfg.force_desync_selected_apps,
+                cfg.upstream_proxy.clone(),
+                &cfg.app_strategies,
+                &cfg.dns_overrides,
+            )
+            .with_custom_profiles(&cfg.custom_profiles),
+        );
 
         let initial_apps = if use_persistent_files {
             list_running_apps()
@@ -284,17 +290,20 @@ impl DesyncRuntime {
         crate::upstream_compat::set_clean_dns_mode_from_str(&cfg.dns_mode);
         crate::desync::AUTO_RELEARN_ENABLED.store(cfg.auto_relearn, Ordering::Relaxed);
 
-        let compiled = Arc::new(CompiledMatcher::build_full(
-            &cfg.lists,
-            cfg.default_strategy.clone(),
-            cfg.custom_global_config.clone(),
-            cfg.app_filter_mode,
-            cfg.selected_apps.clone(),
-            cfg.force_desync_selected_apps,
-            cfg.upstream_proxy.clone(),
-            &cfg.app_strategies,
-            &cfg.dns_overrides,
-        ));
+        let compiled = Arc::new(
+            CompiledMatcher::build_full(
+                &cfg.lists,
+                cfg.default_strategy.clone(),
+                cfg.custom_global_config.clone(),
+                cfg.app_filter_mode,
+                cfg.selected_apps.clone(),
+                cfg.force_desync_selected_apps,
+                cfg.upstream_proxy.clone(),
+                &cfg.app_strategies,
+                &cfg.dns_overrides,
+            )
+            .with_custom_profiles(&cfg.custom_profiles),
+        );
         *self.matcher.write().await = compiled;
 
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
@@ -997,6 +1006,129 @@ impl DesyncRuntime {
                 }
                 serde_json::to_value(self.snapshot().await).unwrap_or_default()
             }
+            "save_custom_profile" => {
+                let custom_cfg = payload
+                    .get("config")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<DesyncConfig>(v).ok());
+                if let Some(config) = custom_cfg {
+                    let mut cfg = self.config.write().await;
+                    let req_id = payload
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_lowercase())
+                        .unwrap_or_default();
+                    let raw_name = payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let next_num = cfg.custom_profiles.len() + 1;
+                    let name = if raw_name.is_empty() {
+                        format!("Профиль #{next_num}")
+                    } else {
+                        raw_name.chars().take(48).collect::<String>()
+                    };
+
+                    let existing_idx = cfg.custom_profiles.iter().position(|p| {
+                        (!req_id.is_empty() && p.id.eq_ignore_ascii_case(&req_id))
+                            || p.name.to_lowercase() == name.to_lowercase()
+                    });
+
+                    let mut saved_ok = true;
+                    if let Some(idx) = existing_idx {
+                        cfg.custom_profiles[idx].name = name.clone();
+                        cfg.custom_profiles[idx].config = config;
+                    } else if cfg.custom_profiles.len() >= MAX_CUSTOM_PROFILES {
+                        saved_ok = false;
+                    } else {
+                        let base_ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(1);
+                        let mut id = if !req_id.is_empty() {
+                            req_id
+                        } else {
+                            format!("p_{base_ts}")
+                        };
+                        while cfg
+                            .custom_profiles
+                            .iter()
+                            .any(|p| p.id.eq_ignore_ascii_case(&id))
+                        {
+                            id.push('x');
+                        }
+                        cfg.custom_profiles.push(NamedCustomProfile {
+                            id,
+                            name: name.clone(),
+                            config,
+                        });
+                    }
+                    drop(cfg);
+                    if saved_ok {
+                        self.persist_and_recompile().await;
+                        self.push_log(
+                            "info",
+                            "config",
+                            &format!("Сохранён профиль стратегии «{name}»"),
+                        );
+                    } else {
+                        self.push_log(
+                            "warn",
+                            "config",
+                            "Достигнут предел сохранённых профилей (64)",
+                        );
+                    }
+                }
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
+            "delete_custom_profile" => {
+                if let Some(raw_id) = payload.get("id").and_then(|v| v.as_str()) {
+                    let norm_id = raw_id.trim().to_lowercase();
+                    if !norm_id.is_empty() {
+                        let mut cfg = self.config.write().await;
+                        let mut removed_name = None;
+                        cfg.custom_profiles.retain(|p| {
+                            if p.id.to_lowercase() == norm_id {
+                                removed_name = Some(p.name.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if let ListStrategy::CustomProfile(ref pid) = cfg.default_strategy
+                            && pid == &norm_id
+                        {
+                            cfg.default_strategy = ListStrategy::Auto;
+                        }
+                        for list in &mut cfg.lists {
+                            if let ListStrategy::CustomProfile(ref pid) = list.strategy
+                                && pid == &norm_id
+                            {
+                                list.strategy = ListStrategy::Auto;
+                            }
+                        }
+                        for strat_val in cfg.app_strategies.values_mut() {
+                            if let ListStrategy::CustomProfile(pid) =
+                                ListStrategy::from_code(strat_val)
+                                && pid == norm_id
+                            {
+                                *strat_val = "auto".to_string();
+                            }
+                        }
+                        drop(cfg);
+                        if let Some(name) = removed_name {
+                            self.persist_and_recompile().await;
+                            self.push_log(
+                                "info",
+                                "config",
+                                &format!("Удалён профиль стратегии «{name}»"),
+                            );
+                        }
+                    }
+                }
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
             "pin_domain_recipe" => {
                 if let (Some(host), Some(rid)) = (
                     payload.get("host").and_then(|v| v.as_str()),
@@ -1234,6 +1366,75 @@ mod tests {
                     serde_json::json!({ "mode": "system_proxy", "listen_port": 7897 }),
                 )
                 .await;
+        });
+    }
+
+    #[test]
+    fn test_ipc_save_and_delete_custom_profiles_with_fallback() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = DesyncRuntime::new_for_test();
+            let mut c1 = DesyncConfig::from_preset(DesyncPreset::FakeSplit);
+            c1.fake_ttl = 5;
+            let mut c2 = DesyncConfig::from_preset(DesyncPreset::FakeDisorder);
+            c2.fake_ttl = 4;
+
+            let _ = app
+                .handle_ipc_action(
+                    "save_custom_profile",
+                    serde_json::json!({ "id": "p_yt", "name": "YT Custom", "config": c1 }),
+                )
+                .await;
+            let s = app
+                .handle_ipc_action(
+                    "save_custom_profile",
+                    serde_json::json!({ "id": "p_dc", "name": "Discord TTL4", "config": c2 }),
+                )
+                .await;
+            assert_eq!(
+                s.pointer("/config/custom_profiles")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len()),
+                Some(2)
+            );
+
+            // Назначаем p_yt списку youtube и p_dc маршруту по умолчанию
+            let _ = app
+                .handle_ipc_action(
+                    "update_list",
+                    serde_json::json!({ "id": "youtube", "strategy": "profile:p_yt" }),
+                )
+                .await;
+            let _ = app
+                .handle_ipc_action(
+                    "set_default_strategy",
+                    serde_json::json!({ "strategy": "profile:p_dc" }),
+                )
+                .await;
+
+            // Удаляем p_dc -> default_strategy сбрасывается обратно на auto, а p_yt остаётся
+            let s_del = app
+                .handle_ipc_action("delete_custom_profile", serde_json::json!({ "id": "p_dc" }))
+                .await;
+            assert_eq!(
+                s_del
+                    .pointer("/config/default_strategy")
+                    .and_then(|v| v.as_str()),
+                Some("auto")
+            );
+            let yt_strat = s_del
+                .pointer("/config/lists")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|x| x.get("id").and_then(|i| i.as_str()) == Some("youtube"))
+                })
+                .and_then(|x| x.get("strategy"))
+                .and_then(|v| v.as_str());
+            assert_eq!(yt_strat, Some("profile:p_yt"));
         });
     }
 }

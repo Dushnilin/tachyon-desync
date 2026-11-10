@@ -19,6 +19,8 @@ pub enum ListStrategy {
     Preset(String),
     /// Глобальные пользовательские параметры из вкладки «Параметры десинка».
     CustomGlobal,
+    /// Именованный пользовательский профиль из Генератора/Конструктора (`profile:<id>`).
+    CustomProfile(String),
     /// Перенаправление через внешний прокси (`SOCKS5` / `HTTP CONNECT`, например для списков с гео-ограничениями).
     UpstreamProxy,
     /// Прямое соединение без модификаций пакетов (исключение).
@@ -60,6 +62,7 @@ impl ListStrategy {
             Self::Auto => "auto".to_string(),
             Self::Preset(p) => p.clone(),
             Self::CustomGlobal => "custom".to_string(),
+            Self::CustomProfile(id) => format!("profile:{id}"),
             Self::UpstreamProxy => "upstream".to_string(),
             Self::Direct => "direct".to_string(),
             Self::Block => "block".to_string(),
@@ -67,7 +70,14 @@ impl ListStrategy {
     }
 
     pub fn from_code(code: &str) -> Self {
-        let c = code.trim().to_ascii_lowercase();
+        let trimmed = code.trim();
+        let c = trimmed.to_ascii_lowercase();
+        if let Some(rest) = c.strip_prefix("profile:") {
+            let norm_id = rest.trim().to_lowercase();
+            if !norm_id.is_empty() {
+                return Self::CustomProfile(norm_id);
+            }
+        }
         match c.as_str() {
             "auto" | "adaptive" => Self::Auto,
             "direct" | "none" | "bypass" => Self::Direct,
@@ -77,6 +87,15 @@ impl ListStrategy {
             other => Self::Preset(other.to_string()),
         }
     }
+}
+
+/// Именованный пользовательский профиль параметров десинхронизации,
+/// сохранённый в Генераторе или Конструкторе стратегий.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedCustomProfile {
+    pub id: String,
+    pub name: String,
+    pub config: DesyncConfig,
 }
 
 /// Профиль категории или пользовательского списка.
@@ -261,6 +280,7 @@ pub struct CompiledMatcher {
     pub rules: Vec<CompiledListRule>,
     pub default_strategy: ListStrategy,
     pub custom_global_config: DesyncConfig,
+    pub custom_profiles: std::collections::BTreeMap<String, DesyncConfig>,
     pub app_filter_mode: AppFilterMode,
     pub selected_apps: Vec<String>,
     pub force_desync_selected_apps: bool,
@@ -350,12 +370,30 @@ impl CompiledMatcher {
             rules,
             default_strategy,
             custom_global_config,
+            custom_profiles: std::collections::BTreeMap::new(),
             app_filter_mode,
             selected_apps: normalized_apps,
             force_desync_selected_apps,
             upstream_proxy: upstream_proxy.trim().to_string(),
             app_strategies,
         }
+    }
+
+    /// Подключить именованные пользовательские профили стратегий (`profile:<id>`).
+    pub fn with_custom_profiles(mut self, profiles: &[NamedCustomProfile]) -> Self {
+        self.custom_profiles = profiles
+            .iter()
+            .map(|p| (p.id.trim().to_lowercase(), p.config.clone()))
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
+        self
+    }
+
+    fn lookup_custom_profile(&self, profile_id: &str) -> &DesyncConfig {
+        self.custom_profiles
+            .get(profile_id)
+            .or_else(|| self.custom_profiles.get(&profile_id.to_lowercase()))
+            .unwrap_or(&self.custom_global_config)
     }
 
     fn find_app_strategy<'a>(
@@ -409,9 +447,13 @@ impl CompiledMatcher {
 
         // 1. Индивидуальная стратегия для конкретного .exe (Per-App Strategy Override)
         if let Some((app_label, app_strat)) = self.find_app_strategy(app_name) {
+            let app_block_quic = match app_strat {
+                ListStrategy::CustomProfile(pid) => self.lookup_custom_profile(pid).block_quic,
+                _ => self.custom_global_config.block_quic,
+            };
             return self.strategy_to_decision(
                 app_strat,
-                self.custom_global_config.block_quic,
+                app_block_quic,
                 true, // для выделенных .exe (Discord.exe, игры) включаем UDP Fake по умолчанию
                 &format!("Профиль .exe ({app_label})"),
                 dst_port,
@@ -500,8 +542,13 @@ impl CompiledMatcher {
 
         // Для произвольных UDP-портов вне списков (например, игровые UDP-порты 3074, 27015..27050, STUN)
         // никогда не инжектируем фейковые UDP-пакеты по умолчанию, если пакет не попал в целевой список
-        // (Discord / YouTube) и пользователь явно не выбрал CustomGlobal.
-        if is_udp && dst_port != 443 && !matches!(self.default_strategy, ListStrategy::CustomGlobal)
+        // (Discord / YouTube) и пользователь явно не выбрал CustomGlobal / CustomProfile.
+        if is_udp
+            && dst_port != 443
+            && !matches!(
+                self.default_strategy,
+                ListStrategy::CustomGlobal | ListStrategy::CustomProfile(_)
+            )
         {
             return MatchDecision::Direct {
                 matched_list: Some("UDP вне списков (Прямое)".to_string()),
@@ -509,8 +556,16 @@ impl CompiledMatcher {
         }
 
         // Правило по умолчанию для трафика вне списков
-        let default_block_quic = self.custom_global_config.block_quic;
-        let default_udp_fake = self.custom_global_config.udp_fake;
+        let (default_block_quic, default_udp_fake) = match &self.default_strategy {
+            ListStrategy::CustomProfile(pid) => {
+                let prof = self.lookup_custom_profile(pid);
+                (prof.block_quic, prof.udp_fake)
+            }
+            _ => (
+                self.custom_global_config.block_quic,
+                self.custom_global_config.udp_fake,
+            ),
+        };
         self.strategy_to_decision(
             &self.default_strategy,
             default_block_quic,
@@ -614,6 +669,23 @@ impl CompiledMatcher {
                     };
                 }
                 let mut cfg = self.custom_global_config.clone();
+                cfg.enabled = true;
+                cfg.block_quic = block_quic;
+                cfg.udp_fake = udp_fake;
+                MatchDecision::Desync {
+                    config: cfg,
+                    matched_list: list_name.to_string(),
+                }
+            }
+            ListStrategy::CustomProfile(profile_id) => {
+                if is_udp && block_quic && dst_port == 443 {
+                    return MatchDecision::Block {
+                        reason: format!(
+                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
+                        ),
+                    };
+                }
+                let mut cfg = self.lookup_custom_profile(profile_id).clone();
                 cfg.enabled = true;
                 cfg.block_quic = block_quic;
                 cfg.udp_fake = udp_fake;
@@ -1593,5 +1665,91 @@ mod tests {
         let d_game_udp =
             matcher.evaluate_with_app(None, "155.133.248.34".parse().unwrap(), 27015, true, None);
         assert!(matches!(d_game_udp, MatchDecision::Direct { .. }));
+    }
+
+    #[test]
+    fn test_multiple_named_custom_profiles_per_list_and_app() {
+        let s = ListStrategy::from_code("Profile:YT_Split");
+        assert_eq!(s, ListStrategy::CustomProfile("yt_split".to_string()));
+        assert_eq!(s.as_code(), "profile:yt_split");
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, "\"profile:yt_split\"");
+        let parsed: ListStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ListStrategy::CustomProfile("yt_split".to_string()));
+
+        let mut cfg_yt = DesyncConfig::from_preset(DesyncPreset::FakeSplit);
+        cfg_yt.fake_sni = "dl.google.com".to_string();
+        cfg_yt.fake_ttl = 5;
+
+        let mut cfg_disc = DesyncConfig::from_preset(DesyncPreset::FakeDisorder);
+        cfg_disc.fake_sni = "vk.com".to_string();
+        cfg_disc.fake_ttl = 4;
+        cfg_disc.repeats = 3;
+
+        let profiles = vec![
+            NamedCustomProfile {
+                id: "yt_split".to_string(),
+                name: "YouTube Custom".to_string(),
+                config: cfg_yt,
+            },
+            NamedCustomProfile {
+                id: "disc_ttl4".to_string(),
+                name: "Discord TTL=4".to_string(),
+                config: cfg_disc,
+            },
+        ];
+
+        let mut lists = default_builtin_lists();
+        if let Some(yt) = lists.iter_mut().find(|l| l.id == "youtube") {
+            yt.strategy = ListStrategy::CustomProfile("yt_split".to_string());
+        }
+
+        let mut app_strats = std::collections::BTreeMap::new();
+        app_strats.insert("discord.exe".to_string(), "profile:disc_ttl4".to_string());
+
+        let matcher = CompiledMatcher::build_full(
+            &lists,
+            ListStrategy::Auto,
+            DesyncConfig::default(),
+            AppFilterMode::All,
+            Vec::new(),
+            true,
+            String::new(),
+            &app_strats,
+            &std::collections::BTreeMap::new(),
+        )
+        .with_custom_profiles(&profiles);
+
+        let d_yt = matcher.evaluate(
+            Some("www.youtube.com"),
+            "142.250.74.110".parse().unwrap(),
+            443,
+            false,
+        );
+        match d_yt {
+            MatchDecision::Desync { config, .. } => {
+                assert_eq!(config.mode, "fake_split");
+                assert_eq!(config.fake_sni, "dl.google.com");
+                assert_eq!(config.fake_ttl, 5);
+            }
+            other => panic!("Expected Desync with yt_split profile, got {other:?}"),
+        }
+
+        let d_disc = matcher.evaluate_with_app(
+            Some("gateway.discord.gg"),
+            "162.159.135.234".parse().unwrap(),
+            443,
+            false,
+            Some("Discord.exe"),
+        );
+        match d_disc {
+            MatchDecision::Desync { config, .. } => {
+                assert_eq!(config.mode, "fake_disorder");
+                assert_eq!(config.fake_sni, "vk.com");
+                assert_eq!(config.fake_ttl, 4);
+                assert_eq!(config.repeats, 3);
+            }
+            other => panic!("Expected Desync with disc_ttl4 profile, got {other:?}"),
+        }
     }
 }
