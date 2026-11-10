@@ -170,7 +170,7 @@ pub fn gui_snapshot_learned_domains() -> Vec<GuiLearnedDomain> {
                 e.inserted = now;
             }
             out.push(GuiLearnedDomain {
-                host: h.clone(),
+                host: h.as_str().to_string(),
                 tier: "L1 (Точный хост)".to_string(),
                 recipe_id: e.recipe_id.unwrap_or(0),
                 mode: format!("{:?}", e.mode),
@@ -185,9 +185,10 @@ pub fn gui_snapshot_learned_domains() -> Vec<GuiLearnedDomain> {
             if e.verified_32k {
                 e.inserted = now;
             }
-            if !out.iter().any(|x| x.host == *h) {
+            let h_str = h.as_str();
+            if !out.iter().any(|x| x.host == h_str) {
                 out.push(GuiLearnedDomain {
-                    host: h.clone(),
+                    host: h_str.to_string(),
                     tier: "L2 (Домен / Подсеть)".to_string(),
                     recipe_id: e.recipe_id.unwrap_or(0),
                     mode: format!("{:?}", e.mode),
@@ -207,18 +208,18 @@ pub fn gui_snapshot_l3_scores() -> [u32; ADAPTIVE_RECIPES.len()] {
 }
 
 pub fn gui_get_banned_mask(host: &str) -> u32 {
-    let host_lc = host.trim().to_ascii_lowercase();
+    let host_lc = InlineKey::<96>::from_ascii_lowercase(host.trim());
     if host_lc.is_empty() {
         return 0;
     }
     let b = brain();
     let mut mask = 0u32;
     if let Ok(mut g1) = b.l1_host.lock()
-        && let Some(e) = g1.get(&host_lc)
+        && let Some(e) = g1.get(host_lc.as_str())
     {
         mask |= e.banned_mask;
     }
-    let etld = extract_etld_plus_one(&host_lc);
+    let etld = extract_etld_plus_one(host_lc.as_str());
     if !etld.is_empty()
         && let Ok(mut g2) = b.l2_domain.lock()
         && let Some(e) = g2.get(etld)
@@ -236,13 +237,14 @@ pub fn gui_set_learned_candidate(
 ) {
     let idx = (recipe_id as usize).min(ADAPTIVE_RECIPES.len() - 1);
     let recipe = ADAPTIVE_RECIPES[idx];
-    let host_lc = host.trim().to_ascii_lowercase();
+    let host_lc = InlineKey::<96>::from_ascii_lowercase(host.trim());
     if host_lc.is_empty() {
         return;
     }
     let entry = LearnedEntry {
         mode: recipe.mode,
         recipe_id: Some(recipe.id),
+        backup_recipe_id: None,
         verified_32k,
         consecutive_fails: 0,
         banned_mask,
@@ -250,18 +252,20 @@ pub fn gui_set_learned_candidate(
     };
     let b = brain();
     if let Ok(mut g1) = b.l1_host.lock() {
-        g1.put(host_lc.clone(), entry);
+        g1.put(host_lc, entry);
     }
-    let mut to_persist = vec![(host_lc.clone(), entry)];
-    let etld = extract_etld_plus_one(&host_lc);
-    if !etld.is_empty() && etld != host_lc {
+    let mut to_persist = vec![(host_lc, entry)];
+    let etld = extract_etld_plus_one(host_lc.as_str());
+    if !etld.is_empty() && etld != host_lc.as_str() {
+        let etld_key = InlineKey::<96>::from_str_trunc(etld);
         if let Ok(mut g2) = b.l2_domain.lock() {
-            g2.put(etld.to_string(), entry);
+            g2.put(etld_key, entry);
         }
-        to_persist.push((etld.to_string(), entry));
+        to_persist.push((etld_key, entry));
     } else if !etld.is_empty() {
+        let etld_key = InlineKey::<96>::from_str_trunc(etld);
         if let Ok(mut g2) = b.l2_domain.lock() {
-            g2.put(etld.to_string(), entry);
+            g2.put(etld_key, entry);
         }
     }
     persist_learned_entries(&to_persist);
@@ -279,13 +283,13 @@ pub fn gui_pin_domain_recipe(host: &str, recipe_id: u8) {
 }
 
 pub fn gui_remove_learned_domain(host: &str) {
-    let host_lc = host.trim().to_ascii_lowercase();
+    let host_lc = InlineKey::<96>::from_ascii_lowercase(host.trim());
     let b = brain();
     if let Ok(mut g1) = b.l1_host.lock() {
-        g1.pop(&host_lc);
+        g1.pop(host_lc.as_str());
     }
     if let Ok(mut g2) = b.l2_domain.lock() {
-        g2.pop(&host_lc);
+        g2.pop(host_lc.as_str());
     }
     if let Ok(guard) = b.store.lock()
         && let Some(ref handle) = *guard

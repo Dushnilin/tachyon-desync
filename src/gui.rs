@@ -152,6 +152,7 @@ pub struct TachyonGuiApp {
     // Вкладка Журнал
     log_category_filter: String,
     show_scoreboard_in_logs: bool,
+    log_copied_toast_until: Option<Instant>,
 
     // Флаг первого применения темы, окна «О программе» и автообновления
     theme_configured: bool,
@@ -245,6 +246,7 @@ impl TachyonGuiApp {
             list_modal: ListEditorModal::default(),
             log_category_filter: "all".to_string(),
             show_scoreboard_in_logs: true,
+            log_copied_toast_until: None,
             theme_configured: false,
             about_modal_open: false,
             start_minimized_done: false,
@@ -2876,7 +2878,13 @@ impl TachyonGuiApp {
                             self.builder_cfg = rep.recommended_config.clone();
                             self.builder_dirty = true;
                         }
-                        let cp_lbl = if is_en {
+                        let toast_active = self
+                            .copied_toast_until
+                            .map(|t| Instant::now() < t)
+                            .unwrap_or(false);
+                        let cp_lbl = if toast_active {
+                            if is_en { "Copied ✓" } else { "Скопировано ✓" }
+                        } else if is_en {
                             "Copy JSON"
                         } else {
                             "Копировать JSON"
@@ -2884,6 +2892,37 @@ impl TachyonGuiApp {
                         if ui.small_button(cp_lbl).clicked() {
                             let json_str = build_outbound_json_string(&rep.recommended_config);
                             ui.ctx().copy_text(json_str);
+                            self.copied_toast_until =
+                                Some(Instant::now() + Duration::from_millis(1500));
+                        }
+                        let rep_lbl = if is_en {
+                            "Copy Report"
+                        } else {
+                            "Копировать отчёт"
+                        };
+                        if ui.small_button(rep_lbl).clicked() {
+                            let mut lines = Vec::new();
+                            lines.push(format!(
+                                "Tachyon Desync v{} — {} ({})",
+                                env!("CARGO_PKG_VERSION"),
+                                rep.domain,
+                                rep.resolved_ip
+                            ));
+                            lines.push(localize_runtime_text(&rep.diagnosis, is_en));
+                            for r in &rep.results {
+                                let st = if r.ok { "OK" } else { r.block_reason.as_str() };
+                                let title =
+                                    localize_recipe_title(r.recipe_id, &r.recipe_title, is_en);
+                                lines.push(format!(
+                                    "#{:02} [{}] {} ms — {} ({})",
+                                    r.recipe_id,
+                                    st,
+                                    r.rtt_ms,
+                                    title,
+                                    localize_runtime_text(&r.detail, is_en)
+                                ));
+                            }
+                            ui.ctx().copy_text(lines.join("\n"));
                             self.copied_toast_until =
                                 Some(Instant::now() + Duration::from_millis(1500));
                         }
@@ -4230,6 +4269,43 @@ impl TachyonGuiApp {
 
         // 2. Журнал событий
         Self::panel_frame().show(ui, |ui| {
+            let filtered: Vec<_> = self
+                .snap
+                .logs
+                .iter()
+                .rev()
+                .filter(|l| {
+                    self.log_category_filter == "all" || l.category == self.log_category_filter
+                })
+                .cloned()
+                .collect();
+
+            let full_log_text = {
+                let mut lines = Vec::with_capacity(filtered.len() + 2);
+                lines.push(format!(
+                    "# Tachyon Desync v{} | mode={} | active={} | desynced={}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.snap.active_mode,
+                    self.snap.active_connections,
+                    self.snap.desynced_connections
+                ));
+                for l in filtered.iter().rev() {
+                    let loc_msg = localize_runtime_text(&l.message, is_en);
+                    lines.push(format!(
+                        "{} [{}] {}",
+                        format_hms(l.ts_ms),
+                        l.category,
+                        loc_msg
+                    ));
+                }
+                lines.join("\n")
+            };
+
+            let log_toast_active = self
+                .log_copied_toast_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(if is_en {
@@ -4246,6 +4322,40 @@ impl TachyonGuiApp {
                         .clicked()
                     {
                         self.dispatch_ipc("clear_logs", serde_json::json!({}));
+                    }
+
+                    let copy_all_lbl = if log_toast_active {
+                        RichText::new(if is_en {
+                            "Copied ✓"
+                        } else {
+                            "Скопировано ✓"
+                        })
+                        .size(10.0)
+                        .color(SEMANTIC_OK)
+                    } else {
+                        RichText::new(if is_en {
+                            "Copy Log"
+                        } else {
+                            "Копировать лог"
+                        })
+                        .size(10.0)
+                        .color(ACCENT)
+                    };
+                    if ui
+                        .add_enabled(
+                            !filtered.is_empty(),
+                            egui::Button::new(copy_all_lbl).small(),
+                        )
+                        .on_hover_text(if is_en {
+                            "Copy all visible log entries to clipboard"
+                        } else {
+                            "Скопировать весь отображаемый журнал событий в буфер обмена"
+                        })
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(full_log_text.clone());
+                        self.log_copied_toast_until =
+                            Some(Instant::now() + Duration::from_millis(1600));
                     }
 
                     egui::ComboBox::from_id_salt("combo_log_cat")
@@ -4277,17 +4387,6 @@ impl TachyonGuiApp {
                 });
             });
 
-            let filtered: Vec<_> = self
-                .snap
-                .logs
-                .iter()
-                .rev()
-                .filter(|l| {
-                    self.log_category_filter == "all" || l.category == self.log_category_filter
-                })
-                .cloned()
-                .collect();
-
             if filtered.is_empty() {
                 ui.label(
                     RichText::new(if is_en {
@@ -4306,69 +4405,109 @@ impl TachyonGuiApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let max_row_w = (ui.available_width() - 8.0).max(160.0);
-                        let inner_text_w = (max_row_w - 16.0).max(140.0);
+                        let inner_text_w = (max_row_w - 52.0).max(120.0);
                         for l in &filtered {
                             Self::card_frame(false).show(ui, |ui| {
-                                ui.set_width(inner_text_w);
-                                ui.set_max_width(inner_text_w);
+                                ui.set_width(max_row_w - 16.0);
                                 let cat_col = match l.level.as_str() {
                                     "error" => SEMANTIC_ERR,
                                     "warn" => SEMANTIC_WARN,
                                     _ => TEXT_SECONDARY,
                                 };
                                 let loc_msg = localize_runtime_text(&l.message, is_en);
-                                let mut job = egui::text::LayoutJob {
-                                    wrap: egui::text::TextWrapping {
-                                        max_width: inner_text_w,
-                                        break_anywhere: true,
+                                let line_plain =
+                                    format!("{} [{}] {}", format_hms(l.ts_ms), l.category, loc_msg);
+                                ui.horizontal_top(|ui| {
+                                    let mut job = egui::text::LayoutJob {
+                                        wrap: egui::text::TextWrapping {
+                                            max_width: inner_text_w,
+                                            break_anywhere: true,
+                                            ..Default::default()
+                                        },
                                         ..Default::default()
-                                    },
-                                    ..Default::default()
-                                };
-                                job.append(
-                                    &format!("{} ", format_hms(l.ts_ms)),
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: FontId::new(10.0, FontFamily::Monospace),
-                                        color: TEXT_MUTED,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(
-                                    &format!("[{}] ", l.category),
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: FontId::new(10.0, FontFamily::Monospace),
-                                        color: cat_col,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(
-                                    &loc_msg,
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: FontId::new(10.0, FontFamily::Monospace),
-                                        color: TEXT_PRIMARY,
-                                        ..Default::default()
-                                    },
-                                );
-                                let resp =
-                                    ui.add(egui::Label::new(job).wrap().sense(Sense::click()));
-                                if resp
-                                    .on_hover_text(if is_en {
-                                        "Click to copy log line"
-                                    } else {
-                                        "Клик — скопировать строку журнала"
-                                    })
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(format!(
-                                        "{} [{}] {}",
-                                        format_hms(l.ts_ms),
-                                        l.category,
-                                        loc_msg
-                                    ));
-                                }
+                                    };
+                                    job.append(
+                                        &format!("{} ", format_hms(l.ts_ms)),
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: FontId::new(10.0, FontFamily::Monospace),
+                                            color: TEXT_MUTED,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    job.append(
+                                        &format!("[{}] ", l.category),
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: FontId::new(10.0, FontFamily::Monospace),
+                                            color: cat_col,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    job.append(
+                                        &loc_msg,
+                                        0.0,
+                                        egui::TextFormat {
+                                            font_id: FontId::new(10.0, FontFamily::Monospace),
+                                            color: TEXT_PRIMARY,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    let resp =
+                                        ui.add(egui::Label::new(job).wrap().selectable(true));
+                                    resp.context_menu(|ui| {
+                                        if ui
+                                            .button(if is_en {
+                                                "Copy line"
+                                            } else {
+                                                "Копировать строку"
+                                            })
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(line_plain.clone());
+                                            self.log_copied_toast_until =
+                                                Some(Instant::now() + Duration::from_millis(1600));
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .button(if is_en {
+                                                "Copy entire log"
+                                            } else {
+                                                "Копировать весь лог"
+                                            })
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(full_log_text.clone());
+                                            self.log_copied_toast_until =
+                                                Some(Instant::now() + Duration::from_millis(1600));
+                                            ui.close_menu();
+                                        }
+                                    });
+
+                                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                                        if ui
+                                            .small_button(
+                                                RichText::new(if is_en {
+                                                    "Copy"
+                                                } else {
+                                                    "Копир."
+                                                })
+                                                .size(9.0)
+                                                .color(TEXT_MUTED),
+                                            )
+                                            .on_hover_text(if is_en {
+                                                "Copy this log line"
+                                            } else {
+                                                "Скопировать эту строку журнала"
+                                            })
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(line_plain);
+                                            self.log_copied_toast_until =
+                                                Some(Instant::now() + Duration::from_millis(1600));
+                                        }
+                                    });
+                                });
                             });
                         }
                     });
