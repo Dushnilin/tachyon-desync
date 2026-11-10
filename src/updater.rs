@@ -112,6 +112,18 @@ pub fn is_newer_version(current: &str, remote: &str) -> bool {
     }
 }
 
+/// Создать подпроцесс без появления консольного окна на Windows (`CREATE_NO_WINDOW`).
+fn hidden_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Выполнить HTTP GET (сначала через локальный SOCKS5-прокси десинка, если он активен, затем напрямую).
 fn fetch_url_bytes(
     url: &str,
@@ -124,7 +136,7 @@ fn fetch_url_bytes(
     // 1. Попытка через curl с локальным SOCKS5-прокси (если запущен), чтобы запрос шёл через десинк
     if let Some(port) = proxy_port.filter(|&p| p > 0) {
         let proxy_arg = format!("127.0.0.1:{port}");
-        if let Ok(out) = Command::new("curl")
+        if let Ok(out) = hidden_command("curl")
             .args([
                 "-fsSL",
                 "--connect-timeout",
@@ -148,7 +160,7 @@ fn fetch_url_bytes(
     }
 
     // 2. Прямой запрос через системный curl
-    if let Ok(out) = Command::new("curl")
+    if let Ok(out) = hidden_command("curl")
         .args([
             "-fsSL",
             "--connect-timeout",
@@ -193,7 +205,7 @@ fn download_url_to_file(
 
     if let Some(port) = proxy_port.filter(|&p| p > 0) {
         let proxy_arg = format!("127.0.0.1:{port}");
-        if let Ok(status) = Command::new("curl")
+        if let Ok(status) = hidden_command("curl")
             .args([
                 "-fSL",
                 "--connect-timeout",
@@ -216,7 +228,7 @@ fn download_url_to_file(
         }
     }
 
-    if let Ok(status) = Command::new("curl")
+    if let Ok(status) = hidden_command("curl")
         .args([
             "-fSL",
             "--connect-timeout",
@@ -381,7 +393,7 @@ pub fn download_and_apply_update(
         std::fs::create_dir_all(&extract_dir)
             .map_err(|e| format!("Не удалось создать временный каталог распаковки: {e}"))?;
 
-        let status = Command::new("tar")
+        let status = hidden_command("tar")
             .args([
                 "-xzf",
                 &tmp_download.to_string_lossy(),
