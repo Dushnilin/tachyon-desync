@@ -8,7 +8,7 @@
 <img src="assets/readme/hero-board.en.svg" width="100%" alt="Tachyon Desync — Cross-Platform Desktop L3/L4/L7 Adaptive Packet Desynchronizer">
 
 <p>
-  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.0.5-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.0.5"></a>
+  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.0.6-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.0.6"></a>
   <img src="https://img.shields.io/badge/Rust-2024_Edition-f97316?style=flat-square&logo=rust&logoColor=white&labelColor=0f172a" alt="Rust 2024">
   <img src="https://img.shields.io/badge/UI-Native_OpenGL_(egui)-38bdf8?style=flat-square&labelColor=0f172a" alt="Native OpenGL UI">
   <img src="https://img.shields.io/badge/Capture-Wintun_%7C_utun_%7C_tun_L3_%2B_SOCKS5-10b981?style=flat-square&labelColor=0f172a" alt="Wintun + utun + tun L3 + SOCKS5">

@@ -44,7 +44,8 @@ jobs:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           ref: ${{ github.event.client_payload.tag || 'main' }}
-          fetch-depth: 30
+          fetch-depth: 50
+          fetch-tags: true
           path: _tachyon_core_src
 
       - name: Resolve version or auto-bump on upstream core update
@@ -78,7 +79,7 @@ jobs:
 
           # 2. Автоматический режим (repository_dispatch: core-updated, schedule или пустой workflow_dispatch)
           prev_notes=$(gh release view --json body -q '.body' 2>/dev/null || true)
-          if [ "${{ github.event_name }}" = "schedule" ] && echo "$prev_notes" | grep -q "core-outbound-sha:${core_sha}" && echo "$prev_notes" | grep -q "core-tag:${core_tag}"; then
+          if [ "${{ github.event_name }}" = "schedule" ] && echo "$prev_notes" | grep -q "core-outbound-sha:${core_sha}"; then
             echo "Ядро ${core_tag} (outbound ${core_sha}) уже собрано в последнем релизе tachyon-desync, пропускаем."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
@@ -410,7 +411,19 @@ jobs:
             inside
           ' CHANGELOG.md > section.md
           if ! grep -q '^## ' section.md; then
-            cp CHANGELOG.md section.md
+            prev_tag=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+            {
+              echo "## ${ver}"
+              echo ""
+              echo "### Исправления и улучшения"
+              echo ""
+              if [ -n "$prev_tag" ]; then
+                git log "${prev_tag}..${tag}" --no-merges --pretty=format:"- %s"
+              else
+                git log -n 5 --no-merges --pretty=format:"- %s"
+              fi
+              echo ""
+            } > section.md
           fi
           {
             echo "## tachyon-desync v${ver}"
