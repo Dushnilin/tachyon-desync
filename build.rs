@@ -120,11 +120,14 @@ fn stage_upstream_desync(manifest_dir: &Path, out_dir: &Path) {
             let _ = fs::write(&cache_target, &content);
         }
 
-        // В Rust 2024 вызовы `core_tls::...` внутри подмодуля перенаправляем на наш `crate::core_tls::...`
+        // Нормализуем переводы строк и перенаправляем апстримные зависимости на совместимый слой крейта
+        content = content.replace("\r\n", "\n");
         content = content.replace("core_tls::", "crate::core_tls::");
         content = content.replace("crate::crate::core_tls::", "crate::core_tls::");
+        content = content.replace("portable_atomic::", "std::sync::atomic::");
 
-        // Для engine.rs добавляем публичные хуки инспекции и управления AdaptiveBrain для GUI
+        // Для engine.rs добавляем только read-only хуки инспекции AdaptiveBrain для GUI;
+        // вся адаптивная логика (включая платформенные POST_HS_CAP_BREAKER_IDS) живёт в tachyon-core.
         if out_name == "engine.rs" {
             content.push_str(GUI_ENGINE_EXTENSION);
         }
@@ -204,7 +207,12 @@ pub fn gui_snapshot_learned_domains() -> Vec<GuiLearnedDomain> {
 
 pub fn gui_snapshot_l3_scores() -> [u32; ADAPTIVE_RECIPES.len()] {
     let b = brain();
-    std::array::from_fn(|i| b.l3_isp_scores[i].load(Ordering::Relaxed))
+    std::array::from_fn(|i| {
+        let l3 = b.l3_isp_scores[i].load(Ordering::Relaxed);
+        let vw = u32::from(b.recipe_stats[i].verified_wins.load(Ordering::Relaxed));
+        let hw = u32::from(b.recipe_stats[i].hs_wins.load(Ordering::Relaxed));
+        l3.saturating_add(vw.saturating_mul(3)).saturating_add(hw)
+    })
 }
 
 pub fn gui_get_banned_mask(host: &str) -> u32 {
@@ -247,6 +255,7 @@ pub fn gui_set_learned_candidate(
         backup_recipe_id: None,
         verified_32k,
         consecutive_fails: 0,
+        last_fail_at: None,
         banned_mask,
         inserted: Instant::now(),
     };
@@ -284,18 +293,152 @@ pub fn gui_pin_domain_recipe(host: &str, recipe_id: u8) {
 
 pub fn gui_remove_learned_domain(host: &str) {
     let host_lc = InlineKey::<96>::from_ascii_lowercase(host.trim());
+    if host_lc.is_empty() {
+        return;
+    }
+    let etld = extract_etld_plus_one(host_lc.as_str());
+    let etld_prefix = if !etld.is_empty() {
+        Some(format!("{etld}|"))
+    } else {
+        None
+    };
     let b = brain();
     if let Ok(mut g1) = b.l1_host.lock() {
         g1.pop(host_lc.as_str());
     }
+    let mut evicted_l2: Vec<InlineKey<96>> = Vec::new();
     if let Ok(mut g2) = b.l2_domain.lock() {
         g2.pop(host_lc.as_str());
+        if !etld.is_empty() {
+            g2.pop(etld);
+        }
+        if let Some(ref pfx) = etld_prefix {
+            let sub_keys: Vec<InlineKey<96>> = g2
+                .iter()
+                .filter_map(|(k, _)| k.as_str().starts_with(pfx).then_some(*k))
+                .collect();
+            for k in sub_keys {
+                g2.pop(&k);
+                evicted_l2.push(k);
+            }
+        }
     }
     if let Ok(guard) = b.store.lock()
         && let Some(ref handle) = *guard
         && let Ok(mut cache) = handle.lock()
     {
         cache.delete(BUCKET_DESYNC, host_lc.as_bytes());
+        if !etld.is_empty() {
+            cache.delete(BUCKET_DESYNC, etld.as_bytes());
+        }
+        for k in &evicted_l2 {
+            cache.delete(BUCKET_DESYNC, k.as_bytes());
+        }
+        if let Some(ref pfx) = etld_prefix {
+            for k in cache.keys(BUCKET_DESYNC) {
+                if k.starts_with(pfx) {
+                    cache.delete(BUCKET_DESYNC, k.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+pub fn gui_refresh_clean_short_transfer(host: &str, peer: Option<SocketAddr>) {
+    if host.is_empty() {
+        return;
+    }
+    let b = brain();
+    let now = Instant::now();
+    let host_k = InlineKey::<96>::from_ascii_lowercase(host.trim());
+    if let Ok(mut g1) = b.l1_host.lock()
+        && let Some(entry) = g1.get_mut(&host_k)
+    {
+        entry.consecutive_fails = 0;
+        entry.last_fail_at = None;
+        entry.inserted = now;
+    }
+    let etld = extract_etld_plus_one(host_k.as_str());
+    if !etld.is_empty()
+        && let Ok(mut g2) = b.l2_domain.lock()
+    {
+        for key in l2_keys(etld, peer).into_iter().flatten() {
+            if let Some(entry) = g2.get_mut(&key) {
+                entry.consecutive_fails = 0;
+                entry.last_fail_at = None;
+                entry.inserted = now;
+            }
+        }
+    }
+}
+
+pub fn gui_sanitize_poisoned_cap_entries() {
+    const MIGRATION_KEY: &[u8] = b"__gui_cap_sanitized_v009";
+    let b = brain();
+    let already_migrated = if let Ok(guard) = b.store.lock()
+        && let Some(ref handle) = *guard
+        && let Ok(cache) = handle.lock()
+    {
+        cache.contains_key(BUCKET_DESYNC, MIGRATION_KEY)
+    } else {
+        false
+    };
+    if already_migrated {
+        return;
+    }
+
+    let mut to_delete: Vec<InlineKey<96>> = Vec::new();
+    let mut to_persist: Vec<(InlineKey<96>, LearnedEntry)> = Vec::new();
+
+    if let Ok(mut g1) = b.l1_host.lock() {
+        let keys: Vec<InlineKey<96>> = g1.iter().map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(e) = g1.get_mut(&k) {
+                if !e.verified_32k
+                    && (e.mode == DesyncMode::None || (e.banned_mask & POST_HS_CAP_DETECTED_BIT) != 0)
+                {
+                    g1.pop(&k);
+                    to_delete.push(k);
+                } else if (e.banned_mask & POST_HS_CAP_DETECTED_BIT) != 0 {
+                    e.banned_mask &= !POST_HS_CAP_DETECTED_BIT;
+                    e.consecutive_fails = 0;
+                    to_persist.push((k, *e));
+                }
+            }
+        }
+    }
+
+    if let Ok(mut g2) = b.l2_domain.lock() {
+        let keys: Vec<InlineKey<96>> = g2.iter().map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(e) = g2.get_mut(&k) {
+                if !e.verified_32k
+                    && (e.mode == DesyncMode::None || (e.banned_mask & POST_HS_CAP_DETECTED_BIT) != 0)
+                {
+                    g2.pop(&k);
+                    to_delete.push(k);
+                } else if (e.banned_mask & POST_HS_CAP_DETECTED_BIT) != 0 {
+                    e.banned_mask &= !POST_HS_CAP_DETECTED_BIT;
+                    e.consecutive_fails = 0;
+                    to_persist.push((k, *e));
+                }
+            }
+        }
+    }
+
+    if !to_persist.is_empty() {
+        persist_learned_entries(&to_persist);
+    }
+
+    if let Ok(guard) = b.store.lock()
+        && let Some(ref handle) = *guard
+        && let Ok(mut cache) = handle.lock()
+    {
+        for k in &to_delete {
+            cache.delete(BUCKET_DESYNC, k.as_bytes());
+        }
+        cache.put(BUCKET_DESYNC, MIGRATION_KEY, vec![1]);
+        let _ = cache.flush();
     }
 }
 "#;

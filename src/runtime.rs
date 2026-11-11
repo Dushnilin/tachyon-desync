@@ -1181,8 +1181,12 @@ impl DesyncRuntime {
                     "info",
                     "probe",
                     &format!(
-                        "Запущена генерация стратегии ({} рецептов) для {domain}:{port}...",
-                        if scan_all { 16 } else { 8 }
+                        "Запущена генерация стратегии ({}) для {domain}:{port}...",
+                        if scan_all {
+                            "24 рецепта"
+                        } else {
+                            "12 рецептов"
+                        }
                     ),
                 );
                 match generate_domain_strategy(domain, port, scan_all, 1800).await {

@@ -489,7 +489,7 @@ pub async fn relay_with_desync_policy(
                 };
 
             let strategy_label = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(15)].0
+                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].0
             } else {
                 "custom"
             };
@@ -508,7 +508,7 @@ pub async fn relay_with_desync_policy(
             flow.record.add_tx(first_n);
 
             let strategy_title = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(15)].1
+                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].1
             } else {
                 "Профиль"
             };
@@ -539,22 +539,38 @@ pub async fn relay_with_desync_policy(
                 target_host,
                 Some(dst_addr),
                 total_rx,
+                !first_pkt.is_empty(),
+                config.auto,
                 t0,
             )
             .await;
-            total_rx += flow
-                .record
-                .rx_bytes
-                .load(Ordering::Relaxed)
-                .saturating_sub(total_rx);
+            let (relayed_up, relayed_down, report_elapsed_ms) = match &relay_res {
+                Ok((u, d, act_ms)) => (*u, *d, *act_ms),
+                Err(_) => (
+                    flow.record
+                        .tx_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(first_n),
+                    flow.record
+                        .rx_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(total_rx),
+                    t0.elapsed().as_millis() as u64,
+                ),
+            };
+            total_rx = total_rx.saturating_add(relayed_down);
 
-            report_transfer_outcome(
-                target_host,
-                Some(dst_addr),
-                total_rx,
-                t0.elapsed().as_millis() as u64,
-                relay_res.is_ok(),
-            );
+            if config.auto {
+                report_transfer_outcome(
+                    target_host,
+                    Some(dst_addr),
+                    total_rx,
+                    relayed_up,
+                    relayed_down,
+                    report_elapsed_ms,
+                    relay_res.is_ok(),
+                );
+            }
             relay_res.map(|_| ())
         }
     };

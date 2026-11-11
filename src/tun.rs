@@ -810,7 +810,7 @@ async fn handle_tun_tcp_stream(
                 connect_and_apply_desync_auto(dst_addr, &first_pkt, &config, sni_host.as_deref())
                     .await?;
             let strategy_code = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(15)].0
+                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].0
             } else {
                 "custom"
             };
@@ -828,7 +828,7 @@ async fn handle_tun_tcp_stream(
             flow.record.add_tx(first_n);
 
             let strategy_label = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(15)].1
+                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].1
             } else {
                 "Профиль"
             };
@@ -858,21 +858,37 @@ async fn handle_tun_tcp_stream(
                 target_host,
                 Some(dst_addr),
                 total_rx,
+                !first_pkt.is_empty(),
+                config.auto,
                 t0,
             )
             .await;
-            total_rx += flow
-                .record
-                .rx_bytes
-                .load(Ordering::Relaxed)
-                .saturating_sub(total_rx);
-            report_transfer_outcome(
-                target_host,
-                Some(dst_addr),
-                total_rx,
-                t0.elapsed().as_millis() as u64,
-                relay_res.is_ok(),
-            );
+            let (relayed_up, relayed_down, report_elapsed_ms) = match &relay_res {
+                Ok((u, d, act_ms)) => (*u, *d, *act_ms),
+                Err(_) => (
+                    flow.record
+                        .tx_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(first_n),
+                    flow.record
+                        .rx_bytes
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(total_rx),
+                    t0.elapsed().as_millis() as u64,
+                ),
+            };
+            total_rx = total_rx.saturating_add(relayed_down);
+            if config.auto {
+                report_transfer_outcome(
+                    target_host,
+                    Some(dst_addr),
+                    total_rx,
+                    relayed_up,
+                    relayed_down,
+                    report_elapsed_ms,
+                    relay_res.is_ok(),
+                );
+            }
             relay_res.map(|_| ())
         }
     };
@@ -881,11 +897,33 @@ async fn handle_tun_tcp_stream(
     res
 }
 
-type TunUdpNatTable = Arc<std::sync::Mutex<HashMap<(SocketAddr, bool), Arc<UdpSocket>>>>;
+#[derive(Clone)]
+struct TunUdpNatEntry {
+    sock: Arc<UdpSocket>,
+    /// Отслеживаемые адаптивные UDP-узлы: `peer -> (rx_bytes, reported_ok)`
+    adaptive_peers: Arc<std::sync::Mutex<HashMap<SocketAddr, (u64, bool)>>>,
+}
+
+type TunUdpNatTable = Arc<std::sync::Mutex<HashMap<(SocketAddr, bool), TunUdpNatEntry>>>;
+
+#[inline]
+fn emit_tun_icmp_port_unreachable(
+    tun_tx: &mpsc::Sender<Vec<u8>>,
+    remote: SocketAddr,
+    client: SocketAddr,
+    udp_payload: &[u8],
+) {
+    if let Some((pkt, len)) =
+        crate::outbound::tlsspoof::build_icmp_port_unreachable_buf(remote, client, udp_payload)
+    {
+        let _ = tun_tx.try_send(pkt[..len].to_vec());
+    }
+}
 
 async fn get_or_create_udp_nat_socket(
     src: SocketAddr,
     is_ipv6: bool,
+    track_adaptive_dst: Option<SocketAddr>,
     udp_nat: &TunUdpNatTable,
     tun_tx: &mpsc::Sender<Vec<u8>>,
     counters: &Arc<TrafficCounters>,
@@ -893,37 +931,96 @@ async fn get_or_create_udp_nat_socket(
     if let Ok(guard) = udp_nat.lock()
         && let Some(existing) = guard.get(&(src, is_ipv6))
     {
-        return Ok(existing.clone());
+        if let Some(dst) = track_adaptive_dst
+            && let Ok(mut peers) = existing.adaptive_peers.lock()
+            && peers.len() < 32
+        {
+            peers.entry(dst).or_insert((0, false));
+        }
+        return Ok(existing.sock.clone());
     }
 
     let sock = Arc::new(bind_and_connect_udp(is_ipv6).await?);
+    let adaptive_peers = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    if let Some(dst) = track_adaptive_dst
+        && let Ok(mut peers) = adaptive_peers.lock()
+    {
+        peers.insert(dst, (0, false));
+    }
+
     if let Ok(mut guard) = udp_nat.lock() {
         if let Some(existing) = guard.get(&(src, is_ipv6)) {
-            return Ok(existing.clone());
+            if let Some(dst) = track_adaptive_dst
+                && let Ok(mut peers) = existing.adaptive_peers.lock()
+                && peers.len() < 32
+            {
+                peers.entry(dst).or_insert((0, false));
+            }
+            return Ok(existing.sock.clone());
         }
-        guard.insert((src, is_ipv6), sock.clone());
+        if guard.len() < 1024 {
+            guard.insert(
+                (src, is_ipv6),
+                TunUdpNatEntry {
+                    sock: sock.clone(),
+                    adaptive_peers: adaptive_peers.clone(),
+                },
+            );
+        }
     }
 
     let sock_reader = sock.clone();
     let nat_reader = udp_nat.clone();
+    let peers_reader = adaptive_peers;
     let tun_tx_reader = tun_tx.clone();
     let counters_reader = counters.clone();
     tokio::spawn(async move {
         let mut rbuf = vec![0u8; 65535];
         loop {
-            match tokio::time::timeout(Duration::from_secs(60), sock_reader.recv_from(&mut rbuf))
-                .await
-            {
-                Ok(Ok((n, peer))) if n > 0 => {
-                    counters_reader
-                        .rx_bytes
-                        .fetch_add(n as u64, Ordering::Relaxed);
-                    report_udp_quic_outcome(peer, true);
-                    if let Some(ip_pkt) = build_tun_udp_response(peer, src, &rbuf[..n]) {
-                        let _ = tun_tx_reader.send(ip_pkt).await;
+            tokio::select! {
+                _ = tun_tx_reader.closed() => break,
+                recv_res = tokio::time::timeout(Duration::from_secs(60), sock_reader.recv_from(&mut rbuf)) => {
+                    match recv_res {
+                        Ok(Ok((n, peer))) if n > 0 => {
+                            counters_reader
+                                .rx_bytes
+                                .fetch_add(n as u64, Ordering::Relaxed);
+                            let mut should_promote = false;
+                            if let Ok(mut peers) = peers_reader.lock()
+                                && let Some((rx_sum, reported)) = peers.get_mut(&peer)
+                            {
+                                *rx_sum = rx_sum.saturating_add(n as u64);
+                                // Для UDP 443 (QUIC) закрепляем рецепт только после 256 КиБ (DESYNC_LIVE_PROMOTE_BYTES),
+                                // как в tachyon-core 0.5.0, чтобы 16 KB QUIC cap не фиксировал мёртвый QUIC-узел как живой.
+                                let promote_gate = if peer.port() == 443 {
+                                    crate::desync::DESYNC_LIVE_PROMOTE_BYTES
+                                } else {
+                                    1
+                                };
+                                if !*reported && *rx_sum >= promote_gate {
+                                    *reported = true;
+                                    should_promote = true;
+                                }
+                            }
+                            if should_promote {
+                                report_udp_quic_outcome(peer, true);
+                            }
+                            if let Some(ip_pkt) = build_tun_udp_response(peer, src, &rbuf[..n]) {
+                                let _ = tun_tx_reader.send(ip_pkt).await;
+                            }
+                        }
+                        _ => break,
                     }
                 }
-                _ => break,
+            }
+        }
+        if !tun_tx_reader.is_closed()
+            && let Ok(peers) = peers_reader.lock()
+        {
+            for (&peer, &(rx_sum, reported)) in peers.iter() {
+                if !reported && rx_sum == 0 {
+                    report_udp_quic_outcome(peer, false);
+                }
             }
         }
         if let Ok(mut guard) = nat_reader.lock() {
@@ -974,6 +1071,7 @@ async fn handle_tun_udp_datagram(
     );
     match decision {
         MatchDecision::Block { reason } => {
+            emit_tun_icmp_port_unreachable(&tun_tx, dst, src, &payload);
             if is_first {
                 let _flow = crate::flows::register_flow(
                     "UDP",
@@ -989,7 +1087,8 @@ async fn handle_tun_udp_datagram(
         }
         MatchDecision::Direct { .. } | MatchDecision::UpstreamProxy { .. } => {
             if let Ok(sock) =
-                get_or_create_udp_nat_socket(src, dst.is_ipv6(), &udp_nat, &tun_tx, &counters).await
+                get_or_create_udp_nat_socket(src, dst.is_ipv6(), None, &udp_nat, &tun_tx, &counters)
+                    .await
                 && sock.send_to(&payload, dst).await.is_ok()
             {
                 if is_first {
@@ -1013,15 +1112,23 @@ async fn handle_tun_udp_datagram(
             config,
             matched_list,
         } => {
-            if config.block_quic
-                && dst.port() == 443
-                && payload.len() >= 120
-                && (payload[0] & 0x80) != 0
+            if dst.port() == 443
+                && ((config.block_quic && payload.len() >= 120 && (payload[0] & 0x80) != 0)
+                    || (config.auto && crate::desync::is_quic_endpoint_dead(dst)))
             {
+                emit_tun_icmp_port_unreachable(&tun_tx, dst, src, &payload);
                 return;
             }
-            if let Ok(sock) =
-                get_or_create_udp_nat_socket(src, dst.is_ipv6(), &udp_nat, &tun_tx, &counters).await
+            let track_dst = config.auto.then_some(dst);
+            if let Ok(sock) = get_or_create_udp_nat_socket(
+                src,
+                dst.is_ipv6(),
+                track_dst,
+                &udp_nat,
+                &tun_tx,
+                &counters,
+            )
+            .await
             {
                 if is_first {
                     let fg = crate::flows::register_flow(

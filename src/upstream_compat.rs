@@ -119,6 +119,18 @@ pub mod logging {
     pub fn warn(_args: std::fmt::Arguments<'_>) {}
 }
 
+/// Вспомогательные монотонные часы, ожидаемые апстримным `tlsspoof.rs` (`crate::util::mono_now_ms`).
+pub mod util {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[inline]
+    pub fn mono_now_ms() -> u64 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+}
+
 /// Модуль постоянного хранилища `cache.db`, ожидаемый апстримным `engine.rs` (`crate::cache_file`).
 pub mod cache_file {
     use super::*;

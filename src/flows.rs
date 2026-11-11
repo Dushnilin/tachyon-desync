@@ -220,8 +220,11 @@ where
     tokio::try_join!(a_to_b, b_to_a)
 }
 
-/// Двусторонняя передача данных для десинхронизированного потока с продвижением рецепта на лету
-/// при прохождении порога 32 КиБ и 500-мс сторожем зависаний (в окне 32 КиБ и при mid-stream запросах без ответа).
+/// Двусторонняя передача данных для десинхронизированного потока на базе единого
+/// апстримного сторожа `DesyncWatchdog` из `tachyon-core` (продвижение рецепта на лету при
+/// 256 КиБ, контроль зависаний до `ServerHello` / в окне 32 КиБ / mid-stream и исключение
+/// пауз HTTP/2 keep-alive и простаивающих WebSocket из расчёта скорости передачи).
+/// Возвращает `(передано_клиентом, принято_от_сервера, активное_время_мс)`.
 #[allow(clippy::too_many_arguments)]
 pub async fn copy_bidirectional_desync_live<A, B>(
     a: &mut A,
@@ -231,8 +234,10 @@ pub async fn copy_bidirectional_desync_live<A, B>(
     target_host: Option<&str>,
     peer_addr: Option<SocketAddr>,
     initial_down_len: u64,
+    had_initial_up: bool,
+    report_adaptive: bool,
     started_at: std::time::Instant,
-) -> std::io::Result<(u64, u64)>
+) -> std::io::Result<(u64, u64, u64)>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -247,6 +252,7 @@ where
 
     let up_bytes = AtomicU64::new(0);
     let down_bytes = AtomicU64::new(0);
+    let post_req_down = AtomicU64::new(0);
 
     let a_to_b = async {
         let mut buf = [0u8; 16384];
@@ -276,6 +282,9 @@ where
             aw.write_all(&buf[..n]).await?;
             let nb = n as u64;
             down_bytes.fetch_add(nb, Ordering::Relaxed);
+            if up_bytes.load(Ordering::Relaxed) > 0 {
+                post_req_down.fetch_add(nb, Ordering::Relaxed);
+            }
             counters.rx_bytes.fetch_add(nb, Ordering::Relaxed);
             flow.add_rx(nb);
         }
@@ -286,11 +295,15 @@ where
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     watchdog.tick().await;
 
-    let mut prev_down = initial_down_len;
+    let mut guard =
+        crate::desync::DesyncWatchdog::new_at(started_at, initial_down_len, had_initial_up);
+    let target_key = if report_adaptive {
+        target_host.unwrap_or("")
+    } else {
+        ""
+    };
     let mut up_at_last_down = 0u64;
-    let mut cap_stall_ticks = 0u8;
-    let mut mid_stall_ticks = 0u8;
-    let mut live_promoted = initial_down_len >= crate::desync::MIN_VERIFIED_TRANSFER_BYTES;
+    let mut prev_down_seen = initial_down_len;
 
     let mut a_to_b = std::pin::pin!(a_to_b);
     let mut b_to_a = std::pin::pin!(b_to_a);
@@ -302,21 +315,30 @@ where
                     break Err(e);
                 }
                 let cur_down = initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed));
-                let drain_timeout = if cur_down < crate::desync::MIN_VERIFIED_TRANSFER_BYTES {
-                    Duration::from_millis(1200)
-                } else {
-                    HALF_CLOSE_TIMEOUT
-                };
+                let drain_timeout = crate::desync::DesyncWatchdog::client_eof_drain_timeout(
+                    cur_down,
+                    HALF_CLOSE_TIMEOUT,
+                );
                 break match tokio::time::timeout(drain_timeout, b_to_a).await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(err)) => Err(err),
-                    Err(_) if initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed)) < crate::desync::MIN_VERIFIED_TRANSFER_BYTES => {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "desync: upstream stalled after client close",
-                        ))
+                    Err(_) => {
+                        let fin_relayed_up = up_bytes.load(Ordering::Relaxed);
+                        let fin_relayed_down = down_bytes.load(Ordering::Relaxed);
+                        let fin_post_req = post_req_down.load(Ordering::Relaxed);
+                        let fin_down = initial_down_len.saturating_add(fin_relayed_down);
+                        let stalled_unanswered = fin_down == 0
+                            || (fin_post_req < 96 && (had_initial_up || fin_relayed_up > 0))
+                            || fin_relayed_up.saturating_sub(up_at_last_down) >= 38;
+                        if fin_down < crate::desync::DESYNC_LIVE_PROMOTE_BYTES && stalled_unanswered {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "desync: upstream stalled after client close",
+                            ))
+                        } else {
+                            Ok(())
+                        }
                     }
-                    Err(_) => Ok(()),
                 };
             }
             res = &mut b_to_a => {
@@ -329,53 +351,145 @@ where
                 break Ok(());
             }
             _ = watchdog.tick() => {
-                let cur_up = up_bytes.load(Ordering::Relaxed);
-                let cur_down = initial_down_len.saturating_add(down_bytes.load(Ordering::Relaxed));
-                if !live_promoted
-                    && target_host.is_some_and(|h| !h.is_empty())
-                    && cur_down >= crate::desync::MIN_VERIFIED_TRANSFER_BYTES
-                {
-                    live_promoted = true;
-                    crate::desync::report_transfer_outcome(
-                        target_host,
-                        peer_addr,
-                        cur_down,
-                        started_at.elapsed().as_millis() as u64,
-                        true,
-                    );
+                let relayed_up = up_bytes.load(Ordering::Relaxed);
+                let relayed_down = down_bytes.load(Ordering::Relaxed);
+                let cur_post = post_req_down.load(Ordering::Relaxed);
+                let cur_down = initial_down_len.saturating_add(relayed_down);
+                if cur_down > prev_down_seen {
+                    prev_down_seen = cur_down;
+                    up_at_last_down = relayed_up;
                 }
-                if cur_down > prev_down {
-                    prev_down = cur_down;
-                    up_at_last_down = cur_up;
-                    cap_stall_ticks = 0;
-                    mid_stall_ticks = 0;
-                } else if cur_down < crate::desync::MIN_VERIFIED_TRANSFER_BYTES {
-                    if cur_up > 0 {
-                        cap_stall_ticks = cap_stall_ticks.saturating_add(1);
-                        if cap_stall_ticks >= 5 {
-                            break Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "desync: upstream stalled in cap window",
-                            ));
-                        }
-                    }
-                } else if cur_up.saturating_sub(up_at_last_down) >= 64 {
-                    mid_stall_ticks = mid_stall_ticks.saturating_add(1);
-                    if mid_stall_ticks >= 9 {
-                        break Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "desync: mid-stream request stalled",
-                        ));
-                    }
+                if let Err(err) = guard.on_tick_with_reply(
+                    target_key,
+                    peer_addr,
+                    relayed_up,
+                    relayed_down,
+                    cur_post,
+                ) {
+                    break Err(err);
                 }
             }
         }
     };
 
+    let active_ms = (guard.active_elapsed(started_at.elapsed()).as_millis() as u64).max(1);
     res.map(|()| {
         (
             up_bytes.load(Ordering::Relaxed),
             down_bytes.load(Ordering::Relaxed),
+            active_ms,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn idle_websocket_under_32k_stays_alive_past_cap_watchdog() {
+        let (mut client_app, mut proxy_client) = tokio::io::duplex(32768);
+        let (mut proxy_remote, mut server_app) = tokio::io::duplex(32768);
+
+        let srv = tokio::spawn(async move {
+            let mut up = [0u8; 2048];
+            let n = server_app.read(&mut up).await.unwrap();
+            assert_eq!(n, 900);
+            // Сервер отвечает 22 КиБ (101 Switching Protocols + Discord Gateway READY в окне 14..32 КиБ)
+            server_app.write_all(&vec![0x42u8; 22_528]).await.unwrap();
+            // Затем WebSocket штатно простаивает > 3.1 с без новых сообщений (превышая старый порог 2.5 с!)
+            tokio::time::sleep(Duration::from_millis(3100)).await;
+            let _ = server_app.shutdown().await;
+        });
+
+        let cli = tokio::spawn(async move {
+            client_app.write_all(&vec![0x11u8; 900]).await.unwrap();
+            let mut down = Vec::new();
+            client_app.read_to_end(&mut down).await.unwrap();
+            assert_eq!(down.len(), 22_528);
+            let _ = client_app.shutdown().await;
+        });
+
+        let counters = crate::proxy::TrafficCounters::default();
+        let fg = register_flow(
+            "TCP",
+            Some("Discord.exe"),
+            Some("gateway.discord.gg"),
+            "162.159.135.234:443".parse().unwrap(),
+            "Desync".to_string(),
+            true,
+            true,
+        );
+        let res = copy_bidirectional_desync_live(
+            &mut proxy_client,
+            &mut proxy_remote,
+            &counters,
+            &fg.record,
+            Some("gateway.discord.gg"),
+            None,
+            2400,
+            true,
+            false,
+            Instant::now(),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "idle Discord WebSocket after server reply must not be killed by cap watchdog: {res:?}"
+        );
+        let (u, d, act_ms) = res.unwrap();
+        assert_eq!((u, d), (900, 22_528));
+        assert!(
+            act_ms < 800,
+            "trailing idle ticks must be excluded from active_ms, got {act_ms}ms"
+        );
+        let _ = tokio::join!(srv, cli);
+    }
+
+    #[tokio::test]
+    async fn unanswered_post_server_hello_freeze_aborts_in_cap_window() {
+        let (mut client_app, mut proxy_client) = tokio::io::duplex(32768);
+        let (mut proxy_remote, _server_blackhole) = tokio::io::duplex(32768);
+
+        let cli = tokio::spawn(async move {
+            client_app.write_all(&vec![0x22u8; 640]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let counters = crate::proxy::TrafficCounters::default();
+        let fg = register_flow(
+            "TCP",
+            None,
+            Some("frozen.example.org"),
+            "198.51.100.10:443".parse().unwrap(),
+            "Desync".to_string(),
+            true,
+            true,
+        );
+        let t0 = Instant::now();
+        let res = copy_bidirectional_desync_live(
+            &mut proxy_client,
+            &mut proxy_remote,
+            &counters,
+            &fg.record,
+            Some("frozen.example.org"),
+            None,
+            3200,
+            true,
+            false,
+            t0,
+        )
+        .await;
+
+        assert!(
+            res.is_err(),
+            "post-ServerHello 0-byte freeze must be aborted by cap watchdog"
+        );
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(t0.elapsed() < Duration::from_secs(4));
+        cli.abort();
+    }
 }

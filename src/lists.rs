@@ -13,9 +13,9 @@ use std::sync::{Mutex, OnceLock};
 /// Действие, назначаемое списку доменов/подсетей.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListStrategy {
-    /// Адаптивный автоподбор из 16 рецептов (`AdaptiveBrain`).
+    /// Адаптивный автоподбор из 24 рецептов (`AdaptiveBrain`).
     Auto,
-    /// Конкретный именованный пресет (`fake_split`, `fake_disorder`, `tlsrec`, `multi_disorder`, `seven_point_disorder`, `host_fake_split`, `pad_encap`, `multi_split`, `split`, `disorder`, `oob`).
+    /// Конкретный именованный пресет (`fake_split`, `fake_disorder`, `tlsrec`, `multi_disorder`, `seven_point_disorder`, `host_fake_split`, `pad_encap`, `multi_split`, `split`, `disorder`, `oob`, `disoob`).
     Preset(String),
     /// Глобальные пользовательские параметры из вкладки «Параметры десинка».
     CustomGlobal,

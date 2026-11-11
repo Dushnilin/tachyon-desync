@@ -1447,9 +1447,9 @@ impl TachyonGuiApp {
             let cur_strat_display = match cur_strat.as_str() {
                 "auto" => {
                     if is_en {
-                        "Auto (16 recipes)".to_string()
+                        "Auto (24 recipes)".to_string()
                     } else {
-                        "Авто (16 рецептов)".to_string()
+                        "Авто (24 рецепта)".to_string()
                     }
                 }
                 "direct" => {
@@ -1563,9 +1563,9 @@ impl TachyonGuiApp {
                                 (
                                     "auto",
                                     if is_en {
-                                        "Auto (16 recipes)"
+                                        "Auto (24 recipes)"
                                     } else {
-                                        "Авто (16 рецептов)"
+                                        "Авто (24 рецепта)"
                                     },
                                 ),
                                 (
@@ -3149,13 +3149,13 @@ impl TachyonGuiApp {
             .map(|g| *g)
             .unwrap_or(false);
 
-        // 1. Панель генератора стратегий (16 рецептов)
+        // 1. Панель генератора стратегий (24 рецепта)
         Self::panel_frame().show(ui, |ui| {
             ui.label(
                 RichText::new(if is_en {
-                    "Strategy Generator (16 recipes)"
+                    "Strategy Generator (24 recipes)"
                 } else {
-                    "Генератор стратегий (16 рецептов)"
+                    "Генератор стратегий (24 рецепта)"
                 })
                 .strong()
                 .size(12.0),
@@ -3194,15 +3194,15 @@ impl TachyonGuiApp {
                     let full_lbl = if is_probing {
                         if is_en { "Scan..." } else { "Скан..." }
                     } else if is_en {
-                        "Generate (16)"
+                        "Generate (24)"
                     } else {
-                        "Подобрать (16)"
+                        "Подобрать (24)"
                     };
                     if ui.add(Self::primary_button(full_lbl)).clicked() {
                         self.start_probe_scan(true);
                     }
 
-                    let quick_lbl = if is_en { "Quick (8)" } else { "Быстрый (8)" };
+                    let quick_lbl = if is_en { "Quick (12)" } else { "Быстрый (12)" };
                     if ui.button(quick_lbl).clicked() {
                         self.start_probe_scan(false);
                     }
@@ -3823,14 +3823,14 @@ impl TachyonGuiApp {
                         format!("Профиль удалён: {pname}")
                     },
                     if is_en {
-                        "Linked lists reverted to Auto (16 recipes)"
+                        "Linked lists reverted to Auto (24 recipes)"
                     } else {
                         "Привязанные списки переключены обратно на Авто"
                     },
                 );
             }
 
-            // Выбор шаблона из 16 рецептов
+            // Выбор шаблона из 24 рецептов
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(if is_en { "Template:" } else { "Шаблон:" })
@@ -3891,6 +3891,7 @@ impl TachyonGuiApp {
                                 "pad_encap",
                                 "tlsrec",
                                 "oob",
+                                "disoob",
                                 "disorder",
                                 "split",
                                 "fake",
@@ -3920,8 +3921,12 @@ impl TachyonGuiApp {
                                 "badsum",
                                 "ts",
                                 "ttl",
+                                "autottl",
                                 "datanoack",
-                                "md5+badseq",
+                                "badack",
+                                "md5_badack",
+                                "badseq_badack_badsum",
+                                "hopbyhop",
                             ] {
                                 if ui
                                     .selectable_label(self.builder_cfg.fooling == f, f)
@@ -3988,6 +3993,9 @@ impl TachyonGuiApp {
                     "vk.com",
                     "rnd",
                     "orig",
+                    "padencap",
+                    "sni_del",
+                    "bin_noise",
                 ] {
                     if ui
                         .small_button(RichText::new(sni).monospace().size(10.0))
@@ -6180,32 +6188,32 @@ impl TachyonGuiApp {
                 "6 Nodes",
             ),
             (
-                "probe_16".to_string(),
+                "probe_24".to_string(),
                 if is_en {
                     "Generator"
                 } else {
                     "Генератор"
                 },
                 if is_en {
-                    "Generate Strategy: Full Scan (16 Recipes)".to_string()
+                    "Generate Strategy: Full Scan (24 Recipes)".to_string()
                 } else {
-                    "Подобрать стратегию: Полный скан (16 рецептов)".to_string()
+                    "Подобрать стратегию: Полный скан (24 рецепта)".to_string()
                 },
-                "16 Rec",
+                "24 Rec",
             ),
             (
-                "probe_8".to_string(),
+                "probe_12".to_string(),
                 if is_en {
                     "Generator"
                 } else {
                     "Генератор"
                 },
                 if is_en {
-                    "Generate Strategy: Quick Scan (8 Recipes)".to_string()
+                    "Generate Strategy: Quick Scan (12 Recipes)".to_string()
                 } else {
-                    "Подобрать стратегию: Быстрый скан (8 рецептов)".to_string()
+                    "Подобрать стратегию: Быстрый скан (12 рецептов)".to_string()
                 },
-                "8 Rec",
+                "12 Rec",
             ),
             (
                 "calib_ttl".to_string(),
@@ -6572,11 +6580,11 @@ impl TachyonGuiApp {
                         "TLS 1.3 + 32 KiB Gate",
                     );
                 }
-                "probe_16" => {
+                "probe_24" => {
                     self.active_tab = ActiveTab::Generator;
                     self.start_probe_scan(true);
                 }
-                "probe_8" => {
+                "probe_12" => {
                     self.active_tab = ActiveTab::Generator;
                     self.start_probe_scan(false);
                 }
@@ -6782,7 +6790,7 @@ impl eframe::App for TachyonGuiApp {
 fn strategy_options(en: bool) -> [(&'static str, &'static str); 12] {
     if en {
         [
-            ("auto", "Auto (16 recipes)"),
+            ("auto", "Auto (24 recipes)"),
             ("custom", "Generator Profile"),
             ("fake_split", "FakeSplit (midsld)"),
             ("fake_disorder", "FakeDisorder (midsld)"),
@@ -6797,7 +6805,7 @@ fn strategy_options(en: bool) -> [(&'static str, &'static str); 12] {
         ]
     } else {
         [
-            ("auto", "Авто (16 рецептов)"),
+            ("auto", "Авто (24 рецепта)"),
             ("custom", "Профиль Генератора"),
             ("fake_split", "FakeSplit (midsld)"),
             ("fake_disorder", "FakeDisorder (midsld)"),
@@ -6974,16 +6982,25 @@ fn localize_recipe_title(id: u8, fallback: &str, is_en: bool) -> String {
         3 => "#3 FakeDisorder (midsld, MD5, vk.com)".to_string(),
         4 => "#4 FakeDisorder + TlsRec (midsld, BadSeq -10000, rzd.ru)".to_string(),
         5 => "#5 IPv6 HopByHop2 + FakeSplit (midsld, fonts.google.com)".to_string(),
-        6 => "#6 MultiSplit + TlsRec (1,sniext+1,midsld)".to_string(),
-        7 => "#7 MultiDisorder (1,sniext+1,midsld, MD5, ya.ru)".to_string(),
-        8 => "#8 FakeDisorder (midsld, BadSum, mail.ru)".to_string(),
-        9 => "#9 FakeSplit (midsld, Auto-TTL=4, ozon.ru)".to_string(),
-        10 => "#10 OOB Urgent + TlsRec (URG pointer at midsld)".to_string(),
-        11 => "#11 HostFakeSplit (SNI..endhost-1, MD5, ya.ru)".to_string(),
-        12 => "#12 7-Point MultiDisorder (7 slices + TlsRec + MD5)".to_string(),
-        13 => "#13 PadEncap Framing (length-matched TLS 1.3 decoy)".to_string(),
-        14 => "#14 SYNData + wsize=2 + 7-Point MultiDisorder (BadSeq)".to_string(),
-        15 => "#15 HostFakeSplit + SeqOvl=336 + DataNoAck (Gosuslugi)".to_string(),
+        6 => "#6 MultiSplit [2, sni_ext, host, midsld] + TlsRec".to_string(),
+        7 => "#7 FakeSplit AutoTTL (SNI boundary, gosuslugi.ru)".to_string(),
+        8 => "#8 MultiDisorder [2, sni_ext, host, midsld] (MD5, vk.com)".to_string(),
+        9 => "#9 Disorder (1st byte AutoTTL + retransmit)".to_string(),
+        10 => "#10 7-Point MultiDisorder (Md5BadAck + rndsni)".to_string(),
+        11 => "#11 HostFakeSplit Disorder (in-band host slice, Md5BadAck, rzd.ru)".to_string(),
+        12 => "#12 FakeDisorder (BadAck -66000 + PadEncap + seqovl=8)".to_string(),
+        13 => "#13 7-Point MultiDisorder (BadSeq+BadAck+BadSum, ozon.ru)".to_string(),
+        14 => "#14 FakeSplit DataNoAck (PSH no-ACK + sniext+1 + seqovl=12, aws.amazon.com)"
+            .to_string(),
+        15 => "#15 HostFakeSplit Disorder (AutoTTL, max.ru)".to_string(),
+        16 => "#16 OOB Urgent (MSG_OOB urgent pointer at midsld, no fake)".to_string(),
+        17 => "#17 Disoob + TlsRec (out-of-order MSG_OOB at host+1 + wsize=64)".to_string(),
+        18 => "#18 MultiSplit + SeqOvl=210 (pure segment overlap, no fake)".to_string(),
+        19 => "#19 FakeSplit sni_del (SNI-stripped clone + DataNoAck + seqovl=16)".to_string(),
+        20 => "#20 MultiDisorder bin_noise (0x0F0F0F0F decoy + BadSeq+BadAck+BadSum)".to_string(),
+        21 => "#21 FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap + seqovl=10)".to_string(),
+        22 => "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)".to_string(),
+        23 => "#23 7-Point MultiDisorder (AutoTTL + sni_del + wsize=64)".to_string(),
         _ => localize_runtime_text(fallback, true),
     }
 }

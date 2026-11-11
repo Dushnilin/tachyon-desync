@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 pub mod upstream_compat;
-pub use upstream_compat::{cache_file, core_tls, inbound, logging, outbound};
+pub use upstream_compat::{cache_file, core_tls, inbound, logging, outbound, util};
 
 pub mod apps;
 pub mod desync;
