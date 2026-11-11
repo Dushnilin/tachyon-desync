@@ -4,7 +4,7 @@
   <g transform="translate(18, 16)">
     <rect x="0" y="0" width="276" height="100" rx="10" fill="#131822" stroke="#242e40" stroke-width="1"/>
     <text x="18" y="26" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" font-weight="700">АДАПТИВНЫЙ ПУЛ L1–L3</text>
-    <text x="18" y="58" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="24" font-weight="800">16 TCP + 4 UDP</text>
+    <text x="18" y="58" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="24" font-weight="800">24 TCP + 6 UDP</text>
     <text x="18" y="82" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12">Автоматический перебор и закрепление на 7 дней</text>
 
     <rect x="296" y="0" width="276" height="100" rx="10" fill="#131822" stroke="#242e40" stroke-width="1"/>

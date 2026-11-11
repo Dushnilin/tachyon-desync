@@ -34,7 +34,7 @@
 
     <rect x="702" y="0" width="210" height="136" rx="10" fill="#131822" stroke="#263144" stroke-width="1.2"/>
     <text x="718" y="26" fill="#d99b26" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">04 · ТРАНСФОРМАЦИЯ</text>
-    <text x="718" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">16 TCP + 4 UDP</text>
+    <text x="718" y="50" fill="#f1f5f9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700">24 TCP + 6 UDP</text>
     <text x="718" y="74" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• TlsRec + 7-точечный Split</text>
     <text x="718" y="94" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Fake (MD5 / PAWS / BadSeq / TTL)</text>
     <text x="718" y="114" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11.5">• Disorder / OOB / IPv6 Ext</text>

@@ -41,13 +41,13 @@
       Нативный десктопный движок адаптивной десинхронизации L3/L4/L7
     </text>
     <text x="0" y="172" fill="#94a3b8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif" font-size="14">
-      16 TCP и 4 UDP рецепта · Wintun / utun / tun L3 + SOCKS5/HTTP · GPU UI
+      24 TCP и 6 UDP рецептов · Wintun / utun / tun L3 + SOCKS5/HTTP · GPU UI
     </text>
 
     <g transform="translate(0, 200)">
       <rect x="0" y="0" width="235" height="58" rx="8" fill="#121722" stroke="#232c3d" stroke-width="1"/>
       <text x="14" y="22" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="700">ADAPTIVE BRAIN L1–L3</text>
-      <text x="14" y="43" fill="#f1f5f9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700">16 TCP + 4 UDP · 32 КиБ</text>
+      <text x="14" y="43" fill="#f1f5f9" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700">24 TCP + 6 UDP · 32 КиБ</text>
 
       <rect x="249" y="0" width="235" height="58" rx="8" fill="#121722" stroke="#232c3d" stroke-width="1"/>
       <text x="263" y="22" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="700">ПЕРЕХВАТ L3 / L4</text>

@@ -18,13 +18,13 @@
 
 <p>
   <strong>Native cross-platform desktop suite for adaptive traffic delivery, TLS record fragmentation, and L3/L4/L7 packet desynchronization across Windows, any Linux distribution, and any macOS system.</strong><br>
-  Three-tier <code>AdaptiveBrain L1–L3</code> selector (16 TCP + 4 UDP recipes) · <code>32 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter with userspace <code>smoltcp</code> stack · per-process PID filtering · Clean DNS (<code>:1253</code> / <code>:5353</code>) · Auto-TTL calibration · custom hardware-accelerated <code>OpenGL</code> window frame with zero WebView2 or browser processes.
+  Three-tier <code>AdaptiveBrain L1–L3</code> selector (24 TCP + 6 UDP recipes) · <code>32 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter with userspace <code>smoltcp</code> stack · per-process PID filtering · Clean DNS (<code>:1253</code> / <code>:5353</code>) · Auto-TTL calibration · custom hardware-accelerated <code>OpenGL</code> window frame with zero WebView2 or browser processes.
 </p>
 
 <p>
   <a href="#quick-start--prebuilt-binaries">Quick Start</a> ·
   <a href="#key-capabilities--interface">Capabilities</a> ·
-  <a href="#desynchronization-pipeline--16-recipes">L1–L3 Recipes</a> ·
+  <a href="#desynchronization-pipeline--24-recipes">L1–L3 Recipes</a> ·
   <a href="#capture-modes--per-process-routing">TUN L3 &amp; Process Filter</a> ·
   <a href="#building-from-source">Build</a>
 </p>
@@ -53,11 +53,11 @@
 - **Three-Tier `AdaptiveBrain L1–L3` Selector**:
   - **`L1` (Domain Memory, 7-day TTL)**: immediately applies the verified winning recipe for a known hostname (`SNI` / `Host`) from persistent `runtime-state.json`.
   - **`L2` (`/24` Subnet Cache)**: when connecting to a new subdomain hosted on an already learned `/24` IPv4 prefix, reuses the subnet's winning recipe without probing overhead.
-  - **`L3` (Global Channel Scoreboard)**: ranks all 16 TCP recipes by exponentially decayed transfer success on the current network path.
-- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after the remote server delivers at least `32 KiB` of application payload after the handshake (eliminating false positives from connections dropped right after `ServerHello`). Consecutive `TCP RST` bursts automatically trigger background re-probing.
+  - **`L3` (Global Channel Scoreboard)**: ranks all 24 TCP recipes using integer `RecipeStats` (success probability + `EWMA RTT`) and passive `IspFingerprint` path profiling.
+- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (with live `256 KiB` promotion and `active_elapsed` idle-interval subtraction on persistent `HTTP/2` and `WebSocket` pools). Consecutive `TCP RST` bursts automatically trigger background re-probing.
 - **Clean DNS & Local `hosts` Overrides**: built-in UDP resolver queries non-standard ports (`77.88.8.8:1253`, `208.67.222.222:5353`) alongside `1.1.1.1` and `8.8.8.8`, while the local `hosts` editor binds `domain=IP` directly inside the engine without touching `/etc/hosts` or `C:\Windows\System32\drivers\etc\hosts`.
 - **Strategy Generator, Auto-TTL Calibration & `ClientHello` Visualizer**:
-  - One-click probing across 8 reference recipes for any target domain with `RTT ms` measurement.
+  - One-click probing across all 24 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
   - Active `Auto-TTL` hop discovery (`2..10` hops) to find the exact minimum TTL that reaches transit middleboxes without reaching the destination server.
   - Interactive `TLS ClientHello` slice diagram (`SNI`, `SLD`, `midsld`, `endhost`, 7-point `Split`, `TlsRec`, `Fake`) and live JSON configuration preview.
 - **10 Built-in Service Categories & Per-Process Routing**: curated domain/CIDR lists (YouTube, Discord, Telegram, AI Platforms, Streaming, Gaming, Development, Domestic Direct), one-click process picker, and optional upstream proxy chaining (`SOCKS5://` or `HTTP://`).
@@ -66,40 +66,48 @@
 | :--- | :--- |
 | **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, Clean DNS & local `hosts` controls, one-click 6-service health check, collapsible 10-category service grid (collapsed by default), and pinned domain table. |
 | **`Flows`** | Live monitor of active and recent TCP/UDP flows showing process name, target domain/IP, applied recipe, RX/TX byte counters, and quick actions to send a domain to the Generator or bypass list (`Direct`). |
-| **`Generator`** | Automated per-domain recipe probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, and full custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `IPv6 Ext`, `QUIC`). |
+| **`Generator`** | Automated 24-recipe per-domain probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `IPv6 Ext`, `QUIC`). |
 | **`Lists`** | Per-application process filter (`All except selected` / `Only selected`), per-process strategy overrides, upstream proxy chaining (`SOCKS5/HTTP`), full JSON backup export/import, and editor for all 10 domain/subnet lists. |
-| **`Logs`** | Collapsible `L3` channel scoreboard across all 16 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and full log export to clipboard. |
+| **`Logs`** | Collapsible `L3` channel scoreboard across all 24 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and full log export to clipboard. |
 
 ---
 
 <p align="center">
-  <img src="assets/readme/section-pipeline.en.svg" width="100%" alt="Desynchronization Pipeline and 16 Recipes">
+  <img src="assets/readme/section-pipeline.en.svg" width="100%" alt="Desynchronization Pipeline and 24 Recipes">
 </p>
 
-## Desynchronization Pipeline & 16 Recipes
+## Desynchronization Pipeline & 24 Recipes
 
-In **`Auto (16 recipes)`** mode, the engine inspects the first outbound payload (`TLS ClientHello` or `HTTP Request`), computes semantic markers (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`), and executes one of 16 TCP recipes or 4 UDP/QUIC recipes:
+In **`Auto (24 recipes)`** mode, the engine inspects the first outbound payload (`TLS ClientHello` or `HTTP Request`), computes semantic markers (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`), and executes one of 24 TCP recipes or 6 UDP/QUIC recipes:
 
 | ID | Recipe Name | Wire-Level Transformation |
 | :---: | :--- | :--- |
-| **`#00`** | `FakeSplit (midsld, MD5 ClientHello clone)` | TLS record split + 2 fake `ClientHello` clones with `TCP MD5` (`Opt 19`) and `TTL=5` + TCP split at `midsld`. |
-| **`#01`** | `TlsRec + Split (SNI split without fake)` | Pure two-layer TLS record and TCP segment fragmentation at `midsld` with zero fake packets (immune to TTL filtering). |
-| **`#02`** | `FakeSplit + TlsRec (PAWS Timestamp, max.ru)` | Fake packet masked as `max.ru` with corrupted `TCP Timestamp` (`-600,000` ticks, discarded by the server via RFC 7323 PAWS) + `midsld` split. |
-| **`#03`** | `FakeDisorder (midsld, MD5, vk.com)` | Out-of-order delivery sending the second segment (`midsld..end`) before the first, paired with a `vk.com` fake (`TCP MD5`, `TTL=6`). |
-| **`#04`** | `FakeDisorder + TlsRec (BadSeq -10000, rzd.ru)` | Out-of-order delivery with dual TLS record splitting and an `rzd.ru` fake carrying a `-10,000` `TCP Sequence Number` offset. |
-| **`#05`** | `IPv6 HopByHop2 + FakeSplit (fonts.google.com)` | Prepends `IPv6 Hop-by-Hop × 2` extension headers + `fonts.google.com` fake (`MD5` + `BadSeq`) and `midsld` split. |
-| **`#06`** | `OOB + TlsRec + FakeSplit (Urgent Pointer)` | TCP segmentation with urgent out-of-band byte (`MSG_OOB` / `URG`) + TLS record split and `MD5` fake. |
-| **`#07`** | `HostFakeSplit (midsld, ya.ru, MD5 + TTL 5)` | Sandwiches the target `SNI` hostname between two `ya.ru` fake segments (`MD5`, `TTL=5`) while splitting the real `SNI` in two. |
-| **`#08`** | `MultiSplit 7-point + TlsRec (no fake)` | 7-point `ClientHello` slicing (`pos 1`, `sni+1`, `host+1`, `sld`, `midsld`, `sld_end-2`, `endhost`) without fake packets. |
-| **`#09`** | `FakeDisorder (pos 1 + midsld, TTL 4)` | Short-range `TTL=4` paired with `TCP MD5` and out-of-order segmentation starting at byte offset `1`. |
-| **`#10`** | `TlsRec Multi + Disorder (pos 2 + sni_ext)` | Multi-record TLS framing with out-of-order segment delivery along the `SNI` extension boundary (no fakes). |
-| **`#11`** | `HostFakeSplit + TlsRec (sberbank.ru, PAWS)` | `SNI` isolation masked as `sberbank.ru` using an expired `PAWS Timestamp (-600,000)`. |
-| **`#12`** | `FakeSplit (pos 1 + midsld, BadSum + MD5)` | Dual-fooling fake `ClientHello` clone combining an invalid L4 checksum (`BadSum`) and `TCP MD5`. |
-| **`#13`** | `IPv6 DestOpt + Disorder + TlsRec (gosuslugi.ru)` | `IPv6 Destination Options` header + out-of-order delivery and `gosuslugi.ru` fake (`PAWS` + `BadSeq`). |
-| **`#14`** | `FakeSplit + OOB (midsld, TTL 7, gosuslugi.ru)` | Extended `TTL=7` for long-haul transit paths + `TCP OOB` urgent byte and `midsld` split. |
-| **`#15`** | `HostFakeSplit + Disorder (rutube.ru, MD5 + BadSeq)` | Full combination of `HostFakeSplit`, out-of-order delivery (`Disorder`), TLS record splitting, and dual `rutube.ru` fakes. |
+| **`#00`** | `FakeSplit (midsld, MD5 ClientHello clone)` | TLS record split + fake `ClientHello` clone with `TCP MD5` (`Opt 19`) and TCP split at `midsld`. |
+| **`#01`** | `TlsRec + Split (SNI TLS record split without fake)` | Pure two-layer TLS record and TCP segment fragmentation at `midsld` with zero fake packets. |
+| **`#02`** | `FakeSplit + TlsRec (midsld, PAWS Timestamp, max.ru)` | Fake packet masked as `max.ru` with shifted `TCP Timestamp` (`-600,000` ticks, RFC 7323 PAWS) + `midsld` split. |
+| **`#03`** | `FakeDisorder (midsld, MD5, vk.com)` | Out-of-order segment delivery around `midsld` paired with a `vk.com` fake (`TCP MD5`). |
+| **`#04`** | `FakeDisorder + TlsRec (midsld, BadSeq -10000, rzd.ru)` | Out-of-order delivery with TLS record splitting and an `rzd.ru` fake carrying a `-10,000` `TCP Sequence Number` offset. |
+| **`#05`** | `IPv6 HopByHop2 + FakeSplit (midsld, fonts.google.com)` | Prepends `IPv6 Hop-by-Hop × 2` extension headers + `fonts.google.com` fake and `midsld` split. |
+| **`#06`** | `MultiSplit [2, sni_ext, host, midsld] + TlsRec` | 4-point `ClientHello` slicing combined with TLS record fragmentation and zero fake packets. |
+| **`#07`** | `FakeSplit AutoTTL (SNI boundary, gosuslugi.ru)` | Dynamic hop-based `AutoTTL` calculation + `SNI` boundary split masked with `gosuslugi.ru`. |
+| **`#08`** | `MultiDisorder [2, sni_ext, host, midsld] (MD5, vk.com)` | Multi-point out-of-order delivery of 4 `ClientHello` segments with `TCP MD5` and `vk.com` decoy. |
+| **`#09`** | `Disorder (1st-byte AutoTTL + retransmit)` | Isolates the initial TLS byte with `AutoTTL` and out-of-order main segment delivery via `RFC 5681`. |
+| **`#10`** | `7-Point MultiDisorder (Md5BadAck + rndsni)` | 7-point out-of-order slicing with combined `Md5BadAck` fooling and randomized decoy `SNI`. |
+| **`#11`** | `HostFakeSplit Disorder (in-band host slice, Md5BadAck, rzd.ru)` | Sandwiches the target hostname between two `rzd.ru` decoy segments (`Md5BadAck`) with out-of-order delivery. |
+| **`#12`** | `FakeDisorder (BadAck -66000 + PadEncap + seqovl=8)` | `-66,000` `ACK` offset, `PadEncap` framing, and `seqovl=8` sequence overlap. |
+| **`#13`** | `7-Point MultiDisorder (BadSeq+BadAck+BadSum, ozon.ru)` | 7-point `MultiDisorder` with triple L4 header modification (`BadSeq + BadAck + BadSum`) and `ozon.ru` decoy. |
+| **`#14`** | `FakeSplit DataNoAck (PSH without ACK + sniext+1 + seqovl=12)` | `DataNoAck` segment (`PSH` without `ACK`), `sniext+1` split, and `seqovl=12` overlap (`aws.amazon.com`). |
+| **`#15`** | `HostFakeSplit Disorder (AutoTTL, max.ru template)` | Combines `HostFakeSplit` and `Disorder` with adaptive `AutoTTL` and `max.ru` decoy profile. |
+| **`#16`** | `OOB Urgent (MSG_OOB + urgent pointer at midsld)` | Pure `TCP MSG_OOB` (`URG`) urgent byte injection directly at the `midsld` split offset without fakes. |
+| **`#17`** | `Disoob + TlsRec (out-of-order MSG_OOB at host+1 + wsize=64)` | Combines out-of-order delivery, `MSG_OOB` urgent byte at `host+1`, TLS record split, and `wsize=64` window clamping. |
+| **`#18`** | `MultiSplit + SeqOvl=210 (pure segment overlap, no fakes)` | Multi-point segmentation with `seqovl=210` sequence overlap and zero fake packet injection. |
+| **`#19`** | `FakeSplit sni_del (SNI-stripped clone + DataNoAck + seqovl=16)` | Structurally identical `ClientHello` clone with stripped `SNI` extension, `DataNoAck`, `sniext+1`, and `seqovl=16`. |
+| **`#20`** | `MultiDisorder bin_noise (binary decoy + triple L4)` | Non-TLS `0x0F0F0F0F` binary decoy payload paired with `BadSeq + BadAck + BadSum`. |
+| **`#21`** | `FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap)` | `SYN`-phase decoy payload (`Linux SOCK_RAW`) or `PadEncap + seqovl=10` with `Md5BadAck`. |
+| **`#22`** | `FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)` | `wsize=64` receive-window clamping during handshake + TLS record split and `host+1` `BadSum` decoy. |
+| **`#23`** | `7-Point MultiDisorder (AutoTTL + sni_del + wsize=64)` | 7-point `MultiDisorder` combining an `SNI`-stripped clone, dynamic `AutoTTL`, and `wsize=64` clamping. |
 
-For **UDP / QUIC** and voice datagrams, 4 dedicated recipes are applied automatically (`#0` 4 fake `QUIC Initial` datagrams with `TTL=5`; `#1` 6 fakes with `TTL=4` and leading `0x00`; `#2` 8 fakes with `TTL=6` + `IPv6 HopByHop`; `#3` 2 compact `0xFF` fakes with `TTL=3`), along with optional `QUIC UDP/443 -> TCP/TLS` fallback for browsers.
+For **UDP / QUIC** and voice datagrams, 6 dedicated recipes are applied automatically (`#0..#5`: `QUIC Initial` decoy bursts, 24-byte pseudo-random `opaque` datagrams with `udplen` padding, `IPv6 HopByHop` headers, and stepped `TTL 2..5`), along with instant `QUIC UDP/443 -> TCP/TLS` fallback via `ICMP Port Unreachable`.
 
 ---
 
