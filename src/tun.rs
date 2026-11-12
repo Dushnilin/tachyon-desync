@@ -1421,22 +1421,74 @@ mod linux_tun {
                     .args(["addr", "add", &format!("{ip}/{prefix}"), "dev", name])
                     .status();
             }
+            let async_fd = match AsyncFd::new(fd) {
+                Ok(afd) => afd,
+                Err(err) => {
+                    unsafe { libc::close(fd) };
+                    return Err(err);
+                }
+            };
             if auto_route {
+                crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE
+                    .store(1, std::sync::atomic::Ordering::Release);
                 let _ = std::process::Command::new("ip")
                     .args(["route", "replace", "default", "dev", name, "table", "2022"])
                     .status();
+                for mark_arg in ["0x2022/0xffff", "0x2022"] {
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022", "pref",
+                            "9000",
+                        ])
+                        .status();
+                }
                 let _ = std::process::Command::new("ip")
                     .args([
-                        "rule", "del", "not", "fwmark", "0x2022", "lookup", "2022", "pref", "9000",
+                        "rule",
+                        "del",
+                        "fwmark",
+                        "0x40000000/0x40000000",
+                        "lookup",
+                        "main",
+                        "pref",
+                        "8998",
                     ])
                     .status();
                 let _ = std::process::Command::new("ip")
                     .args([
-                        "rule", "add", "not", "fwmark", "0x2022", "lookup", "2022", "pref", "9000",
+                        "rule",
+                        "add",
+                        "fwmark",
+                        "0x40000000/0x40000000",
+                        "lookup",
+                        "main",
+                        "pref",
+                        "8998",
                     ])
                     .status();
+                let masked_ok = std::process::Command::new("ip")
+                    .args([
+                        "rule",
+                        "add",
+                        "not",
+                        "fwmark",
+                        "0x2022/0xffff",
+                        "lookup",
+                        "2022",
+                        "pref",
+                        "9000",
+                    ])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !masked_ok {
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "rule", "add", "not", "fwmark", "0x2022", "lookup", "2022", "pref",
+                            "9000",
+                        ])
+                        .status();
+                }
             }
-            let async_fd = AsyncFd::new(fd)?;
             Ok(Self {
                 async_fd,
                 name: name.to_string(),
@@ -1498,9 +1550,26 @@ mod linux_tun {
     impl Drop for LinuxTunDevice {
         fn drop(&mut self) {
             if self.auto_route {
+                crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE
+                    .store(0, std::sync::atomic::Ordering::Release);
+                for mark_arg in ["0x2022/0xffff", "0x2022"] {
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022", "pref",
+                            "9000",
+                        ])
+                        .status();
+                }
                 let _ = std::process::Command::new("ip")
                     .args([
-                        "rule", "del", "not", "fwmark", "0x2022", "lookup", "2022", "pref", "9000",
+                        "rule",
+                        "del",
+                        "fwmark",
+                        "0x40000000/0x40000000",
+                        "lookup",
+                        "main",
+                        "pref",
+                        "8998",
                     ])
                     .status();
                 let _ = std::process::Command::new("ip")

@@ -16,6 +16,9 @@ pub static WIN_OUTBOUND_IF_INDEX: AtomicU32 = AtomicU32::new(0);
 /// Индекс физического сетевого интерфейса по умолчанию (macOS) для исключения петли через utun.
 pub static MACOS_OUTBOUND_IF_INDEX: AtomicU32 = AtomicU32::new(0);
 
+/// Признак активного режима `auto_route` на Linux `tun` (`1` = активен, `0` = выключен).
+pub static LINUX_TUN_AUTO_ROUTE_ACTIVE: AtomicU32 = AtomicU32::new(0);
+
 /// Режим чистого DNS-резолвера (защита от подмены DNS-ответов):
 /// 0 = system, 1 = auto (1253/5353 + 1.1.1.1 + 8.8.8.8), 2 = cloudflare, 3 = google, 4 = port1253.
 pub static CLEAN_DNS_MODE: AtomicU32 = AtomicU32::new(1);
@@ -271,7 +274,7 @@ pub mod cache_file {
     }
 }
 
-/// Модуль `crate::inbound`, ожидаемый апстримным `outbound/desync/mod.rs`.
+/// Модуль `crate::inbound`, ожидаемый апстримными `outbound/desync/mod.rs` и `outbound/tlsspoof.rs`.
 pub mod inbound {
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -285,6 +288,19 @@ pub mod inbound {
 
     pub enum Conn {
         Desync(Box<TcpStream>, Arc<crate::outbound::desync::DesyncConfig>),
+    }
+
+    pub mod tun {
+        use std::sync::atomic::Ordering;
+
+        #[inline]
+        pub fn active_auto_route_mark() -> Option<u32> {
+            if crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE.load(Ordering::Acquire) > 0 {
+                Some(crate::upstream_compat::LINUX_BYPASS_SO_MARK)
+            } else {
+                None
+            }
+        }
     }
 }
 
