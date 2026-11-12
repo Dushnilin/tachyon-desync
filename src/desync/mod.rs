@@ -2,9 +2,7 @@
 //! и апстримным движком `crate::outbound::desync` из `tachyon-core` (компилируемым через `OUT_DIR`).
 
 use crate::outbound::desync as upstream;
-use crate::outbound::desync::packet::{
-    TlsReplyClass, classify_tls_reply, compute_seven_point_offsets, find_http_host, find_sni,
-};
+use crate::outbound::desync::packet::{compute_seven_point_offsets, find_http_host, find_sni};
 use crate::outbound::desync::payload::build_fake_tls_client_hello;
 pub use crate::upstream_compat::{WIN_OUTBOUND_IF_INDEX, bind_outbound_socket};
 use serde::{Deserialize, Serialize};
@@ -17,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-pub use upstream::DesyncWatchdog;
+pub use upstream::{AutoTtlReport, DesyncWatchdog, TtlHopProbe};
 
 /// Порог верифицированной передачи данных после рукопожатия (32 КиБ) из апстрима.
 pub const MIN_VERIFIED_TRANSFER_BYTES: u64 = upstream::DPI_CAP_WINDOW_BYTES;
@@ -120,8 +118,8 @@ pub const RECIPE_TITLES: [(&str, &str); 24] = [
         "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)",
     ),
     (
-        "r23_7pt_multidisorder_autottl_snidel",
-        "#23 7-Point MultiDisorder (AutoTTL + sni_del + wsize=64)",
+        "r23_multidisorder_wsize1_scale1",
+        "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)",
     ),
 ];
 
@@ -208,12 +206,16 @@ pub struct DesyncConfig {
     pub seqovl: usize,
     #[serde(alias = "window_clamp")]
     pub wsize: u32,
+    #[serde(default, alias = "scale")]
+    pub wscale: Option<u8>,
     pub syndata: bool,
     pub ipfrag: bool,
     pub udp_fake: bool,
     #[serde(alias = "udp_fake_repeats")]
     pub udp_repeats: u32,
     pub udp_fake_ttl: u8,
+    #[serde(default)]
+    pub explicit_udp_fake_ttl: bool,
     pub udplen: usize,
     pub block_quic: bool,
 }
@@ -235,11 +237,13 @@ impl Default for DesyncConfig {
             split_delay_ms: 1,
             seqovl: 0,
             wsize: 0,
+            wscale: None,
             syndata: false,
             ipfrag: false,
             udp_fake: true,
             udp_repeats: 3,
             udp_fake_ttl: 6,
+            explicit_udp_fake_ttl: false,
             udplen: 0,
             block_quic: true,
         }
@@ -307,12 +311,14 @@ impl DesyncConfig {
             repeats: 1,
             split_delay_ms: 1,
             seqovl: usize::from(r.seqovl),
-            wsize: if r.wsize_clamp { 64 } else { 0 },
+            wsize: u32::from(r.wsize),
+            wscale: r.wscale,
             syndata: r.syndata,
             ipfrag: false,
             udp_fake: true,
             udp_repeats: 3,
             udp_fake_ttl: 6,
+            explicit_udp_fake_ttl: false,
             udplen: 0,
             block_quic: true,
         }
@@ -370,6 +376,9 @@ impl DesyncConfig {
         }
         if self.wsize > 0 {
             obj.insert("wsize".to_string(), serde_json::json!(self.wsize));
+        }
+        if let Some(ws) = self.wscale {
+            obj.insert("wscale".to_string(), serde_json::json!(ws.min(14)));
         }
         if self.syndata {
             obj.insert("syndata".to_string(), serde_json::json!(true));
@@ -573,18 +582,20 @@ impl DesyncConfig {
             self.fake_sni.trim().to_string()
         };
         u.explicit_fake_sni = !self.auto;
-        u.fake_payload = Arc::from(build_fake_tls_client_hello(&u.fake_sni));
+        u.fake_payload = None;
         u.fake_ttl = self.fake_ttl.clamp(1, 64);
         u.explicit_fake_ttl = !self.auto;
         u.repeats = self.repeats.clamp(1, 10);
         u.split_delay_ms = self.split_delay_ms.min(50);
         u.seqovl = self.seqovl;
         u.wsize = self.wsize;
+        u.wscale = self.wscale.map(|s| s.min(14));
         u.syndata = self.syndata;
         u.ipfrag = self.ipfrag;
         u.udp_fake = self.udp_fake;
         u.udp_repeats = self.udp_repeats.clamp(1, 10);
         u.udp_fake_ttl = self.udp_fake_ttl.clamp(1, 64);
+        u.explicit_udp_fake_ttl = self.explicit_udp_fake_ttl || !self.auto;
         u.udplen = self.udplen;
         u
     }
@@ -627,10 +638,20 @@ pub fn extract_hostname(data: &[u8]) -> Option<String> {
 
 /// Установить исходящее TCP-соединение через `crate::outbound::dial::connect_tcp_addr`.
 pub async fn connect_outbound_tcp(dst: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    connect_outbound_tcp_with_window(dst, timeout, 0, None).await
+}
+
+/// Установить исходящее TCP-соединение с предконнектным зажимом приёмного окна (`wsize`, `wscale`) до отправки `SYN`.
+pub async fn connect_outbound_tcp_with_window(
+    dst: SocketAddr,
+    timeout: Duration,
+    wsize: u32,
+    wscale: Option<u8>,
+) -> io::Result<TcpStream> {
     let dial = crate::outbound::dial::DialOptions {
         connect_timeout_ms: Some(timeout.as_millis() as u64),
     };
-    crate::outbound::dial::connect_tcp_addr(dst, &dial).await
+    crate::outbound::dial::connect_tcp_addr_with_window(dst, &dial, wsize, wscale).await
 }
 
 /// Установить соединение через внешний `SOCKS5` или `HTTP CONNECT` прокси (для гибридного режима списков).
@@ -888,6 +909,11 @@ pub async fn connect_and_apply_desync_auto(
     }
 
     let upstream_cfg = cfg.to_upstream();
+    let (pre_wsize, pre_wscale) = if cfg.enabled && !first_pkt.is_empty() {
+        upstream::preferred_preconnect_window(host_opt.as_deref(), &upstream_cfg)
+    } else {
+        (0, None)
+    };
     let mut last_err: Option<io::Error> = None;
 
     for (attempt_idx, &target_addr) in candidate_addrs.iter().enumerate() {
@@ -896,7 +922,14 @@ pub async fn connect_and_apply_desync_auto(
         } else {
             Duration::from_millis(2800)
         };
-        let stream = match connect_outbound_tcp(target_addr, connect_timeout).await {
+        let stream = match connect_outbound_tcp_with_window(
+            target_addr,
+            connect_timeout,
+            pre_wsize,
+            pre_wscale,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 upstream::record_peer_ip_failure(target_addr.ip());
@@ -973,13 +1006,9 @@ pub async fn send_udp_fakes_same_tuple(
     };
 
     let port = dst.port();
-    let is_discord_voice = (50000..=65535).contains(&port) || (5000..=5020).contains(&port);
-    let is_stun = is_discord_voice
-        || (19294..=19344).contains(&port)
-        || port == 3478
-        || port == 5349
-        || port == 1400
-        || (19302..=19309).contains(&port);
+    let up_cfg = cfg.to_upstream();
+    let (base_fake_ttl, max_step_ttl, is_discord_voice, is_stun) =
+        upstream::engine::compute_udp_fake_ttl(port, adaptive, None, None, &up_cfg);
 
     let repeats = if adaptive {
         match udp_recipe {
@@ -995,7 +1024,7 @@ pub async fn send_udp_fakes_same_tuple(
     .clamp(1, 10);
 
     let use_opaque_blob = adaptive && matches!(udp_recipe, 1 | 4 | 5);
-    let stepped_ttl = adaptive && udp_recipe == 4;
+    let stepped_ttl = adaptive && udp_recipe == 4 && !up_cfg.explicit_udp_fake_ttl;
     let eff_udplen = if cfg.udplen > 0 {
         cfg.udplen
     } else if adaptive {
@@ -1008,13 +1037,16 @@ pub async fn send_udp_fakes_same_tuple(
         0
     };
 
-    let base_fake_ttl = cfg.udp_fake_ttl.clamp(2, 64);
     let _ = upstream::engine::set_socket_ttl_ref(&sref, base_fake_ttl, is_ipv6);
 
     let mut pad_buf = [0u8; 1328];
     for i in 0..repeats {
         if stepped_ttl {
-            let step_ttl = (2 + (i as u8 % 4)).min(base_fake_ttl.max(5)).max(2);
+            let step_ttl = if is_stun {
+                (2 + (i as u8 % 3)).min(max_step_ttl).max(2)
+            } else {
+                (2 + (i as u8 % 4)).min(max_step_ttl).max(2)
+            };
             let _ = upstream::engine::set_socket_ttl_ref(&sref, step_ttl, is_ipv6);
         }
 
@@ -1343,11 +1375,31 @@ pub fn pin_domain_recipe(host: &str, recipe_id: u8) {
 }
 
 pub fn remove_learned_domain(host: &str) {
+    let clean = sanitize_domain_input(host).to_ascii_lowercase();
+    if !clean.is_empty()
+        && let Ok(mut map) = domain_fail_tracker().lock()
+    {
+        map.remove(&clean);
+        let etld = upstream::packet::extract_etld_plus_one(&clean);
+        if !etld.is_empty() {
+            map.remove(etld);
+        }
+    }
     upstream::engine::gui_remove_learned_domain(host);
+    flush_persistent_cache();
+}
+
+pub(crate) fn clear_domain_fail_tracker() {
+    if let Ok(mut map) = domain_fail_tracker().lock() {
+        map.clear();
+        map.shrink_to(64);
+    }
 }
 
 pub fn clear_brain_cache() {
+    clear_domain_fail_tracker();
     upstream::reset_adaptive_state();
+    flush_persistent_cache();
 }
 
 static STORE_HANDLE: OnceLock<crate::cache_file::SharedCacheFile> = OnceLock::new();
@@ -1382,24 +1434,9 @@ fn sanitize_domain_input(domain: &str) -> &str {
         .trim()
 }
 
-/// Проверить, заканчивается ли прочитанный TLS-буфер ровно на границе TLS-записи.
-fn ends_on_tls_record_boundary(mut slice: &[u8]) -> bool {
-    while slice.len() >= 5 {
-        if !matches!(slice[0], 0x14..=0x17) || slice[1] != 0x03 || slice[2] > 0x04 {
-            return false;
-        }
-        let rec_len = u16::from_be_bytes([slice[3], slice[4]]) as usize;
-        if slice.len() < 5 + rec_len {
-            return false;
-        }
-        slice = &slice[5 + rec_len..];
-    }
-    slice.is_empty()
-}
-
 async fn execute_single_probe(
     dst: SocketAddr,
-    ch: Arc<[u8]>,
+    host: &str,
     rid: u8,
     code: String,
     title: String,
@@ -1407,127 +1444,26 @@ async fn execute_single_probe(
     wait: Duration,
 ) -> RecipeProbeResult {
     let upstream_cfg = gui_cfg.to_upstream();
-    let t0 = Instant::now();
-
-    let outcome: Result<(String, &'static str), (String, &'static str)> = async {
-        let mut stream = connect_outbound_tcp(dst, wait)
-            .await
-            .map_err(|e| (format!("Ошибка TCP SYN: {e}"), "connect_err"))?;
-        upstream::apply_desync_tcp(&stream, &ch, &upstream_cfg)
-            .await
-            .map_err(|e| (format!("Ошибка отправки: {e}"), "connect_err"))?;
-        let mut buf = [0u8; 4096];
-        let n = tokio::time::timeout(wait, stream.read(&mut buf))
-            .await
-            .map_err(|_| {
-                (
-                    "Таймаут ожидания ServerHello (Blackhole)".to_string(),
-                    "timeout",
-                )
-            })?
-            .map_err(|e| (format!("Сброс соединения (RST): {e}"), "rst_eof"))?;
-        if n == 0 {
-            return Err(("Соединение закрыто узлом (EOF)".to_string(), "rst_eof"));
-        }
-        match classify_tls_reply(&buf[..n]) {
-            TlsReplyClass::ServerHello => {
-                if upstream::packet::has_tls13_session_id_mismatch(&ch, &buf[..n]) {
-                    return Err((
-                        "Подмена TLS 1.3 ServerHello (несовпадение SessionID)".to_string(),
-                        "hijack",
-                    ));
-                }
-                // Проверяем отсутствие отложенного RST (Delayed RST injection) и поздних TLS Alert
-                // в течение 35 мс после ServerHello. Важно: второй чанк может быть либо продолжением
-                // фрагментированной TLS-записи сертификата, либо TLS 1.3 ApplicationData (0x17 0x03 0x03)!
-                let at_record_boundary = ends_on_tls_record_boundary(&buf[..n]);
-                let mut trail = [0u8; 512];
-                match tokio::time::timeout(Duration::from_millis(35), stream.read(&mut trail)).await
-                {
-                    Ok(Err(e)) => Err((
-                        format!("Сброс после ServerHello (Delayed RST): {e}"),
-                        "rst_eof",
-                    )),
-                    Ok(Ok(0)) => Err((
-                        "Обрыв потока сразу после ServerHello (EOF)".to_string(),
-                        "rst_eof",
-                    )),
-                    Ok(Ok(m)) => {
-                        let tail = &trail[..m];
-                        if tail.starts_with(b"HTTP/1.") {
-                            Err((
-                                "Подмена ответа после ServerHello (HTTP Redirect)".to_string(),
-                                "hijack",
-                            ))
-                        } else if at_record_boundary
-                            && tail.len() >= 7
-                            && tail[0] == 0x15
-                            && tail[1] == 0x03
-                            && tail[2] <= 0x04
-                            && matches!(tail[6], 20 | 22 | 47 | 50)
-                        {
-                            Err((
-                                format!(
-                                    "TLS Alert после ServerHello (desc={} — фейк дошёл до сервера)",
-                                    tail[6]
-                                ),
-                                "tls_alert",
-                            ))
-                        } else {
-                            Ok((format!("ServerHello получен ({} Б)", n + m), "ok"))
-                        }
-                    }
-                    Err(_) => Ok((format!("ServerHello получен ({n} Б)"), "ok")),
-                }
-            }
-            TlsReplyClass::TlsAlert { level, description } => {
-                if description == 50 || description == 47 || description == 22 {
-                    Err((
-                        format!("TLS Alert (desc={description} — фейк дошёл до сервера)"),
-                        "tls_alert",
-                    ))
-                } else {
-                    Ok((
-                        format!("TLS Alert (level={level}, desc={description} — сервер ответил)"),
-                        "ok",
-                    ))
-                }
-            }
-            TlsReplyClass::ForeignInjection => Err((
-                "Подмена ответа на маршруте (HTTP Redirect / Blockpage)".to_string(),
-                "hijack",
-            )),
-        }
-    }
-    .await;
-
-    let rtt = t0.elapsed().as_millis() as u32;
-    match outcome {
-        Ok((detail, reason)) => RecipeProbeResult {
-            recipe_id: rid,
-            recipe_code: code,
-            recipe_title: title,
-            ok: true,
-            rtt_ms: rtt,
-            block_reason: reason.to_string(),
-            detail,
-            config: gui_cfg,
-        },
-        Err((detail, reason)) => RecipeProbeResult {
-            recipe_id: rid,
-            recipe_code: code,
-            recipe_title: title,
-            ok: false,
-            rtt_ms: rtt,
-            block_reason: reason.to_string(),
-            detail,
-            config: gui_cfg,
-        },
+    let recipe_opt = if (rid as usize) < upstream::ADAPTIVE_RECIPES.len() {
+        Some(upstream::ADAPTIVE_RECIPES[rid as usize])
+    } else {
+        None
+    };
+    let out = upstream::probe_desync_https_32k(dst, host, recipe_opt, &upstream_cfg, wait).await;
+    RecipeProbeResult {
+        recipe_id: rid,
+        recipe_code: code,
+        recipe_title: title,
+        ok: out.ok && out.verified_32k,
+        rtt_ms: out.rtt_ms,
+        block_reason: out.block_reason,
+        detail: out.detail,
+        config: gui_cfg,
     }
 }
 
 /// Полный генератор и сканер стратегий по домену: тестирует 12 или все 24 рецепта параллельными волнами,
-/// классифицирует ответы и синтезирует оптимальную конфигурацию `DesyncConfig` + JSON `tachyon-core`.
+/// проверяет полное чтение `> 32 КиБ` по TLS 1.3 и синтезирует оптимальную конфигурацию `DesyncConfig` + JSON `tachyon-core`.
 pub async fn generate_domain_strategy(
     domain: &str,
     port: u16,
@@ -1564,12 +1500,12 @@ async fn generate_domain_strategy_with_mask(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))?;
 
     let packet_preview = inspect_client_hello_slices(clean_domain);
-    let ch: Arc<[u8]> = Arc::from(build_fake_tls_client_hello(clean_domain));
+    let host_arc: Arc<str> = Arc::from(clean_domain);
     let total_recipes = RECIPE_TITLES.len() as u8;
     let test_ids: Vec<u8> = if scan_all {
         (0..total_recipes).collect()
     } else {
-        let mut base = vec![0u8, 1, 2, 3, 6, 10, 11, 14, 17, 18, 19, 21];
+        let mut base = vec![0u8, 1, 2, 3, 6, 10, 11, 14, 18, 19, 21, 23];
         // Если часть базовых рецептов уже забанена на 32 KiB гейте, добираем незабаненные из полного пула
         for alt in 0..total_recipes {
             if base.len() >= 14 {
@@ -1592,11 +1528,11 @@ async fn generate_domain_strategy_with_mask(
             let idx = (rid as usize).min(RECIPE_TITLES.len() - 1);
             let (code, title) = RECIPE_TITLES[idx];
             let gui_cfg = DesyncConfig::from_recipe_id(rid);
-            let ch_clone = ch.clone();
+            let host_c = host_arc.clone();
             handles.push(tokio::spawn(async move {
                 execute_single_probe(
                     dst,
-                    ch_clone,
+                    &host_c,
                     rid,
                     code.to_string(),
                     title.to_string(),
@@ -1613,23 +1549,48 @@ async fn generate_domain_strategy_with_mask(
         }
     }
 
+    let mut cap_mask = 0u32;
+    for r in &results {
+        if r.block_reason == "cap_16k" && (r.recipe_id as usize) < 24 {
+            cap_mask |= 1u32 << r.recipe_id;
+        }
+    }
+    let effective_banned = (banned_mask | cap_mask) & 0xFF_FFFF;
+
     let passed: Vec<&RecipeProbeResult> = results.iter().filter(|r| r.ok).collect();
     let passed_count = passed.len();
     let total_tested = results.len();
 
-    // Приоритет отдаём рецептам, которые не находятся в маске отбраковки 32 KiB гейта (`banned_mask`)
+    // Приоритет отдаём рецептам, которые не находятся в маске отбраковки 32 KiB гейта (`effective_banned`)
     let best = passed
         .iter()
         .copied()
-        .filter(|r| (banned_mask & (1u32 << r.recipe_id)) == 0)
+        .filter(|r| (effective_banned & (1u32 << r.recipe_id)) == 0)
         .min_by_key(|r| r.rtt_ms)
         .or_else(|| passed.iter().copied().min_by_key(|r| r.rtt_ms));
 
+    let cap_count = results
+        .iter()
+        .filter(|r| r.block_reason == "cap_16k")
+        .count();
+    let leaked_alerts = results
+        .iter()
+        .filter(|r| r.block_reason == "tls_alert")
+        .count();
+    let rst_count = results
+        .iter()
+        .filter(|r| r.block_reason == "rst_eof")
+        .count();
+    let timeout_count = results
+        .iter()
+        .filter(|r| r.block_reason == "timeout")
+        .count();
+
     let (best_recipe_id, recommended_config, diagnosis) = if let Some(win) = best {
         let saved_mask = if pin_verified {
-            banned_mask & 0xFF_FFFF & !(1u32 << win.recipe_id)
+            effective_banned & !(1u32 << win.recipe_id)
         } else {
-            banned_mask
+            effective_banned
         };
         upstream::engine::gui_set_learned_candidate(
             clean_domain,
@@ -1637,28 +1598,16 @@ async fn generate_domain_strategy_with_mask(
             saved_mask,
             pin_verified,
         );
-        let leaked_alerts = results
-            .iter()
-            .filter(|r| r.block_reason == "tls_alert")
-            .count();
-        let rst_count = results
-            .iter()
-            .filter(|r| r.block_reason == "rst_eof")
-            .count();
-        let timeout_count = results
-            .iter()
-            .filter(|r| r.block_reason == "timeout")
-            .count();
 
         let diag = format!(
-            "Оптимальный рецепт #{:02} ({} мс). Прошло {passed_count}/{total_tested} рецептов (RST: {rst_count}, Blackhole: {timeout_count}, Alert: {leaked_alerts}). Рецепт закреплён в AdaptiveBrain.",
+            "Оптимальный рецепт #{:02} ({} мс, >32 КиБ проверено). Прошло {passed_count}/{total_tested} рецептов (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}, Alert: {leaked_alerts}). Рецепт закреплён в AdaptiveBrain.",
             win.recipe_id, win.rtt_ms
         );
         (Some(win.recipe_id), win.config.clone(), diag)
     } else {
         let fallback = DesyncConfig::from_preset(DesyncPreset::SevenPointDisorder);
         let diag = format!(
-            "Ни один из {total_tested} базовых рецептов не получил ServerHello от {clean_domain} ({dst}). Рекомендуется комбинированный 7-Point MultiDisorder или режим TUN."
+            "Ни один из {total_tested} проверенных рецептов не прошёл контроль чтения >32 КиБ для {clean_domain} ({dst}) (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}). Рекомендуется полное сканирование 24 рецептов или режим TUN."
         );
         (None, fallback, diag)
     };
@@ -1703,25 +1652,34 @@ pub async fn probe_custom_strategy(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))?;
 
     let packet_preview = inspect_client_hello_slices(clean_domain);
-    let ch: Arc<[u8]> = Arc::from(build_fake_tls_client_hello(clean_domain));
     let wait = Duration::from_millis(timeout_ms.clamp(600, 4000));
 
     let mut cfg = custom_cfg.clone();
     cfg.enabled = true;
     cfg.auto = false;
+    let win_suffix = if cfg.wsize > 0 {
+        if let Some(ws) = cfg.wscale {
+            format!(", wsize={}:scale={ws}", cfg.wsize)
+        } else {
+            format!(", wsize={}", cfg.wsize)
+        }
+    } else {
+        String::new()
+    };
     let title = format!(
-        "Конструктор: {} + {} (split={}{}{}{})",
+        "Конструктор: {} + {} (split={}{}{}{}{})",
         cfg.mode,
         cfg.fooling,
         cfg.split_pos,
         if cfg.tlsrec_first { ", tlsrec" } else { "" },
         if cfg.multi_seven_point { ", 7-pt" } else { "" },
         if cfg.host_fake { ", hostfake" } else { "" },
+        win_suffix,
     );
 
     let res = execute_single_probe(
         dst,
-        ch,
+        clean_domain,
         99,
         "custom_builder".to_string(),
         title,
@@ -1733,7 +1691,7 @@ pub async fn probe_custom_strategy(
     let passed_count = usize::from(res.ok);
     let diagnosis = if res.ok {
         format!(
-            "Пользовательская стратегия успешно прошла проверку на {clean_domain} ({dst}) за {} мс: {}",
+            "Пользовательская стратегия успешно прошла проверку чтения >32 КиБ на {clean_domain} ({dst}) за {} мс: {}",
             res.rtt_ms, res.detail
         )
     } else {
@@ -1779,7 +1737,7 @@ pub struct ServiceHealthItem {
     pub detail: String,
 }
 
-/// Параллельная экспресс-диагностика 6 ключевых сервисов через активный десинхронизатор.
+/// Параллельная экспресс-диагностика 6 ключевых сервисов через активный десинхронизатор с контролем `> 32 КиБ`.
 pub async fn run_services_health_check(active_cfg: &DesyncConfig) -> Vec<ServiceHealthItem> {
     let targets: &[(&str, &str)] = &[
         ("YouTube", "www.youtube.com"),
@@ -1807,64 +1765,78 @@ pub async fn run_services_health_check(active_cfg: &DesyncConfig) -> Vec<Service
                     .copied()
                     .ok_or_else(|| "IP not found".to_string())?;
 
-                let ch = build_fake_tls_client_hello(domain);
-                let (mut stream, pre_read, used_recipe, _) = tokio::time::timeout(
-                    Duration::from_millis(2600),
-                    connect_and_apply_desync_auto(dst, &ch, &cfg, Some(domain)),
-                )
-                .await
-                .map_err(|_| "Timeout".to_string())?
-                .map_err(|e| format!("{e}"))?;
-
-                let reply = if !pre_read.is_empty() {
-                    pre_read
+                let up_cfg = cfg.to_upstream();
+                let learned_rid = if cfg.auto {
+                    let snap = upstream::engine::gui_snapshot_learned_domains();
+                    snap.iter()
+                        .find(|d| d.host.eq_ignore_ascii_case(domain))
+                        .or_else(|| {
+                            let etld = upstream::packet::extract_etld_plus_one(domain);
+                            (!etld.is_empty())
+                                .then(|| snap.iter().find(|d| d.host.eq_ignore_ascii_case(etld)))
+                                .flatten()
+                        })
+                        .map(|d| d.recipe_id)
                 } else {
-                    let mut buf = [0u8; 1024];
-                    let read_res =
-                        tokio::time::timeout(Duration::from_millis(2000), stream.read(&mut buf))
-                            .await;
-                    let n = match read_res {
-                        Ok(Ok(n)) if n > 0 => n,
-                        other => {
-                            if cfg.auto {
-                                report_transfer_outcome(
-                                    Some(domain),
-                                    Some(dst),
-                                    0,
-                                    ch.len() as u64,
-                                    0,
-                                    t0.elapsed().as_millis() as u64,
-                                    false,
-                                );
-                            }
-                            return match other {
-                                Err(_) => Err("ServerHello timeout".to_string()),
-                                Ok(Err(e)) => Err(format!("RST: {e}")),
-                                _ => Err("EOF".to_string()),
-                            };
-                        }
-                    };
-                    buf[..n].to_vec()
+                    None
+                };
+                let recipe_opt = learned_rid
+                    .and_then(|rid| upstream::ADAPTIVE_RECIPES.get(rid as usize).copied());
+
+                let out = upstream::probe_desync_https_32k(
+                    dst,
+                    domain,
+                    recipe_opt,
+                    &up_cfg,
+                    Duration::from_millis(2600),
+                )
+                .await;
+
+                let used_recipe = if cfg.auto {
+                    learned_rid.or_else(|| {
+                        let snap = upstream::engine::gui_snapshot_learned_domains();
+                        snap.iter()
+                            .find(|d| d.host.eq_ignore_ascii_case(domain))
+                            .or_else(|| {
+                                let etld = upstream::packet::extract_etld_plus_one(domain);
+                                (!etld.is_empty())
+                                    .then(|| {
+                                        snap.iter().find(|d| d.host.eq_ignore_ascii_case(etld))
+                                    })
+                                    .flatten()
+                            })
+                            .map(|d| d.recipe_id)
+                    })
+                } else {
+                    None
                 };
 
-                match classify_tls_reply(&reply) {
-                    TlsReplyClass::ServerHello => {
-                        let rtt = t0.elapsed().as_millis() as u32;
-                        Ok((rtt, used_recipe, format!("TLS 1.3 OK ({dst})")))
+                if out.ok && out.verified_32k {
+                    if cfg.auto {
+                        report_transfer_outcome(
+                            Some(domain),
+                            Some(dst),
+                            out.rx_wire_bytes as u64,
+                            512,
+                            out.rx_app_bytes as u64,
+                            u64::from(out.rtt_ms),
+                            true,
+                        );
                     }
-                    TlsReplyClass::TlsAlert { description, .. } => {
-                        if description == 50 || description == 47 || description == 22 {
-                            Err(format!("TLS Alert ({description})"))
-                        } else {
-                            let rtt = t0.elapsed().as_millis() as u32;
-                            Ok((
-                                rtt,
-                                used_recipe,
-                                format!("TLS Alert #{description} ({dst})"),
-                            ))
-                        }
+                    Ok((out.rtt_ms, used_recipe, format!("{} ({dst})", out.detail)))
+                } else {
+                    if cfg.auto && out.block_reason != "connect_err" {
+                        report_transfer_outcome(
+                            Some(domain),
+                            Some(dst),
+                            out.rx_wire_bytes as u64,
+                            512,
+                            out.rx_app_bytes as u64,
+                            u64::from(out.rtt_ms).max(2600),
+                            false,
+                        );
                     }
-                    TlsReplyClass::ForeignInjection => Err("Injection / Redirect".to_string()),
+                    Err(out.detail)
                 }
             }
             .await;
@@ -1899,30 +1871,7 @@ pub async fn run_services_health_check(active_cfg: &DesyncConfig) -> Vec<Service
     out
 }
 
-/// Результат проверки одного значения `TTL` при авто-калибровке дистанции до транзитного узла.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TtlHopProbe {
-    pub ttl: u8,
-    pub ok: bool,
-    pub rtt_ms: u32,
-    pub status: String,
-}
-
-/// Сводный отчёт авто-калибровки `TTL` (`fake_ttl` / `udp_fake_ttl`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoTtlReport {
-    pub domain: String,
-    pub resolved_ip: String,
-    pub optimal_ttl: u8,
-    pub min_working_ttl: Option<u8>,
-    pub max_working_ttl: Option<u8>,
-    pub probes: Vec<TtlHopProbe>,
-    pub summary: String,
-}
-
-/// Авто-калибровка оптимального `TTL` для фейковых пакетов (`fake_ttl` / `udp_fake_ttl`):
-/// выполняет серию проб с `fooling = "ttl"` на дистанциях `TTL = 2..=11`, находит окно хопов,
-/// где фейковый пакет проходит транзитный узел, но сгорает до целевого сервера, и возвращает оптимальный `TTL`.
+/// Авто-калибровка оптимального `TTL` для фейковых пакетов (`fake_ttl` / `udp_fake_ttl`) через апстримный зонд `tachyon-core`.
 pub async fn calibrate_optimal_ttl(domain: &str, port: u16) -> io::Result<AutoTtlReport> {
     let clean = sanitize_domain_input(domain);
     let target = if clean.is_empty() {
@@ -1938,103 +1887,29 @@ pub async fn calibrate_optimal_ttl(domain: &str, port: u16) -> io::Result<AutoTt
         .copied()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))?;
 
-    let ch: Arc<[u8]> = Arc::from(build_fake_tls_client_hello(target));
-    let wait = Duration::from_millis(1600);
-    let ttl_candidates: Vec<u8> = (2..=10).collect();
-    let mut probes = Vec::with_capacity(ttl_candidates.len());
-
-    for chunk in ttl_candidates.chunks(5) {
-        let mut handles = Vec::with_capacity(chunk.len());
-        for &ttl in chunk {
-            let ch_c = ch.clone();
-            let mut cfg = DesyncConfig::from_preset(DesyncPreset::FakeDisorder);
-            cfg.enabled = true;
-            cfg.auto = false;
-            cfg.mode = "fake_disorder".to_string();
-            cfg.fooling = "ttl".to_string();
-            cfg.split_pos = "midsld".to_string();
-            cfg.tlsrec_first = true;
-            cfg.fake_ttl = ttl;
-            handles.push(tokio::spawn(async move {
-                let r = execute_single_probe(
-                    dst,
-                    ch_c,
-                    ttl,
-                    format!("ttl_{ttl}"),
-                    format!("TTL={ttl}"),
-                    cfg,
-                    wait,
-                )
-                .await;
-                TtlHopProbe {
-                    ttl,
-                    ok: r.ok,
-                    rtt_ms: r.rtt_ms,
-                    status: r.block_reason,
-                }
-            }));
-        }
-        for h in handles {
-            if let Ok(p) = h.await {
-                probes.push(p);
-            }
-        }
-    }
-
-    probes.sort_by_key(|p| p.ttl);
-    let working: Vec<&TtlHopProbe> = probes.iter().filter(|p| p.ok).collect();
-    let min_working_ttl = working.first().map(|p| p.ttl);
-    let max_working_ttl = working.last().map(|p| p.ttl);
-
-    // Ищем первый TTL, где сервер вернул tls_alert (значит фейк долетел до самого сервера)
-    let first_server_alert_ttl = probes
-        .iter()
-        .find(|p| p.status == "tls_alert")
-        .map(|p| p.ttl);
-
-    let optimal_ttl = if let (Some(min_t), Some(max_t)) = (min_working_ttl, max_working_ttl) {
-        if let Some(alert_t) = first_server_alert_ttl {
-            alert_t.saturating_sub(1).clamp(min_t, max_t)
-        } else if max_t > min_t {
-            min_t + 1
-        } else {
-            min_t
-        }
-    } else if let Some(alert_t) = first_server_alert_ttl {
-        alert_t.saturating_sub(1).clamp(2, 9)
-    } else {
-        5
-    };
-
-    let summary = match (min_working_ttl, max_working_ttl) {
-        (Some(min_t), Some(max_t)) => format!(
-            "Оптимальный TTL = {optimal_ttl} (рабочее окно: {min_t}..{max_t} хопов до {target} [{dst}])"
-        ),
-        _ => format!(
-            "Установлен базовый TTL = {optimal_ttl} для {target} ({dst}); на этом маршруте рекомендуется Fooling = md5 / badseq"
-        ),
-    };
-
-    Ok(AutoTtlReport {
-        domain: target.to_string(),
-        resolved_ip: dst.to_string(),
-        optimal_ttl,
-        min_working_ttl,
-        max_working_ttl,
-        probes,
-        summary,
-    })
+    Ok(upstream::calibrate_ttl_hops(
+        dst,
+        target,
+        &DesyncConfig::default().to_upstream(),
+        Duration::from_millis(1600),
+    )
+    .await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    static FAIL_TRACKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn learned_candidate_preserves_banned_mask_and_demotes_stalled_32k_cap() {
-        let host = "shard-test.googlevideo.com";
+        let _guard = FAIL_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let host = "shard-test.googlevideo-desync-unit.com";
         remove_learned_domain(host);
-        remove_learned_domain("googlevideo.com");
+        remove_learned_domain("googlevideo-desync-unit.com");
 
         // Симулируем кандидата от авто-переобучения с сохранённой маской забаненных рецептов (#0 и #1)
         let initial_mask: u32 = (1 << 0) | (1 << 1);
@@ -2057,7 +1932,7 @@ mod tests {
         );
 
         remove_learned_domain(host);
-        remove_learned_domain("googlevideo.com");
+        remove_learned_domain("googlevideo-desync-unit.com");
     }
 
     #[test]
@@ -2089,9 +1964,12 @@ mod tests {
 
     #[test]
     fn clean_short_json_and_websocket_sessions_do_not_ban_working_recipe() {
-        let host = "gateway-test.discord.gg";
+        let _guard = FAIL_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let host = "gateway-test.discord-desync-unit.gg";
         remove_learned_domain(host);
-        remove_learned_domain("discord.gg");
+        remove_learned_domain("discord-desync-unit.gg");
 
         upstream::engine::gui_set_learned_candidate(host, 1, 0, false);
 
@@ -2121,11 +1999,11 @@ mod tests {
         );
 
         remove_learned_domain(host);
-        remove_learned_domain("discord.gg");
+        remove_learned_domain("discord-desync-unit.gg");
     }
 
     #[tokio::test]
-    async fn execute_single_probe_accepts_tls13_appdata_record_after_server_hello() {
+    async fn execute_single_probe_rejects_post_handshake_truncation_below_32k() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -2133,40 +2011,89 @@ mod tests {
             let (mut s, _) = listener.accept().await.unwrap();
             let mut req = [0u8; 2048];
             let _ = s.read(&mut req).await.unwrap();
-            // Чанк 1: валидный TLS ServerHello (0x16 0x03 0x03, len=5, ServerHello=0x02) + CCS
-            s.write_all(&[
-                0x16, 0x03, 0x03, 0x00, 0x05, 0x02, 0x00, 0x00, 0x01, 0x00, // ServerHello
-                0x14, 0x03, 0x03, 0x00, 0x01, 0x01, // ChangeCipherSpec
-            ])
-            .await
-            .unwrap();
-            // Чанк 2 через 8 мс (попадает в 35-мс окно trail!): TLS 1.3 ApplicationData (0x17 0x03 0x03)
-            tokio::time::sleep(Duration::from_millis(8)).await;
-            s.write_all(&[
-                0x17, 0x03, 0x03, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44,
-            ])
-            .await
-            .unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Валидный заголовок ServerHello без завершения TLS 1.3 и без 32 КиБ данных (имитация 16 KiB cap)
+            let mut sh = vec![0u8; 96];
+            sh[0] = 0x16;
+            sh[1] = 0x03;
+            sh[2] = 0x03;
+            sh[3] = 0x00;
+            sh[4] = 91;
+            sh[5] = 0x02;
+            sh[6] = 0x00;
+            sh[7] = 0x00;
+            sh[8] = 87;
+            sh[9] = 0x03;
+            sh[10] = 0x03;
+            let _ = s.write_all(&sh).await;
+            drop(s);
         });
 
-        let ch: Arc<[u8]> = Arc::from(build_fake_tls_client_hello("discord.com"));
         let res = execute_single_probe(
             addr,
-            ch,
-            1,
-            "r1_tlsrec_sni".to_string(),
-            "#1 TlsRec".to_string(),
-            DesyncConfig::from_recipe_id(1),
-            Duration::from_millis(1200),
+            "discord.com",
+            17,
+            "r17_disoob_tlsrec_wsize64".to_string(),
+            "#17 Disoob".to_string(),
+            DesyncConfig::from_recipe_id(17),
+            Duration::from_millis(900),
         )
         .await;
         assert!(
-            res.ok,
-            "TLS 1.3 0x17 EncryptedExtensions/Certificate in trail must pass probe, got: {}",
-            res.detail
+            !res.ok,
+            "truncated stream below 32 KiB must never return ok=true in Strategy Generator: {:?}",
+            res
         );
         let _ = srv.await;
+    }
+
+    #[test]
+    fn recipe_23_wsize_1_wscale_1_and_core_outbound_json() {
+        let cfg = DesyncConfig::from_recipe_id(23);
+        assert_eq!(cfg.mode, "multi_disorder");
+        assert_eq!(cfg.split_pos, "midsld");
+        assert_eq!(cfg.wsize, 1);
+        assert_eq!(cfg.wscale, Some(1));
+
+        let json = cfg.to_core_outbound_json();
+        assert_eq!(json.get("wsize").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(json.get("wscale").and_then(|v| v.as_u64()), Some(1));
+
+        let up = cfg.to_upstream();
+        assert_eq!(up.wsize, 1);
+        assert_eq!(up.wscale, Some(1));
+    }
+
+    #[test]
+    fn remove_learned_domain_and_clear_brain_reset_fail_tracker() {
+        let _guard = FAIL_TRACKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let host = "stuck-cache-test.discord-desync-unit.gg";
+        notify_domain_connection_result(host, false);
+        upstream::engine::gui_set_learned_candidate(host, 15, 1 << 17, false);
+
+        assert!(
+            domain_fail_tracker()
+                .lock()
+                .unwrap()
+                .contains_key("stuck-cache-test.discord-desync-unit.gg")
+        );
+        remove_learned_domain(host);
+        assert!(
+            !domain_fail_tracker()
+                .lock()
+                .unwrap()
+                .contains_key("stuck-cache-test.discord-desync-unit.gg")
+        );
+        assert!(
+            get_learned_domains_snapshot()
+                .iter()
+                .all(|d| d.host != host && d.host != "discord-desync-unit.gg")
+        );
+
+        notify_domain_connection_result("another-test.googlevideo-desync-unit.com", false);
+        clear_domain_fail_tracker();
+        assert!(domain_fail_tracker().lock().unwrap().is_empty());
     }
 
     #[tokio::test]

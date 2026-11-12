@@ -205,6 +205,8 @@ struct ListEditorModal {
     list_id: Option<String>,
     name: String,
     strategy: String,
+    udp_ports: String,
+    udp_fake_ttl: u8,
     entries_text: String,
     quick_entry: String,
 }
@@ -216,6 +218,8 @@ impl Default for ListEditorModal {
             list_id: None,
             name: String::new(),
             strategy: "auto".to_string(),
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries_text: String::new(),
             quick_entry: String::new(),
         }
@@ -2357,21 +2361,59 @@ impl TachyonGuiApp {
                     if ui
                         .small_button(
                             RichText::new(if is_en {
-                                "Reset Cache"
+                                "Reset All Cache"
                             } else {
-                                "Сбросить кэш"
+                                "Сбросить весь кэш"
                             })
                             .size(10.0),
                         )
                         .clicked()
                     {
                         self.dispatch_ipc("clear_brain", serde_json::json!({}));
+                        self.push_toast(
+                            ToastKind::Info,
+                            if is_en {
+                                "Adaptive cache cleared"
+                            } else {
+                                "Кэш адаптивного подбора очищен"
+                            },
+                            "adaptive_cache.json",
+                        );
                     }
                 });
             });
 
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let rst_dom_lbl = if is_en {
+                        "Reset Domain"
+                    } else {
+                        "Сбросить домен"
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.pin_host_input.trim().is_empty(),
+                            egui::Button::new(RichText::new(rst_dom_lbl).size(10.0)),
+                        )
+                        .clicked()
+                    {
+                        let host = self.pin_host_input.trim().to_string();
+                        self.pin_host_input.clear();
+                        self.dispatch_ipc(
+                            "remove_learned_domain",
+                            serde_json::json!({ "host": host }),
+                        );
+                        self.push_toast(
+                            ToastKind::Info,
+                            if is_en {
+                                "Domain cache reset"
+                            } else {
+                                "Кэш домена сброшен"
+                            },
+                            host,
+                        );
+                    }
+
                     let pin_btn_lbl = if is_en { "Pin" } else { "Закрепить" };
                     if ui.button(RichText::new(pin_btn_lbl).size(10.0)).clicked() {
                         let host = self.pin_host_input.trim().to_string();
@@ -2526,7 +2568,19 @@ impl TachyonGuiApp {
                     });
 
                 if let Some(h) = remove_host {
-                    self.dispatch_ipc("remove_learned_domain", serde_json::json!({ "host": h }));
+                    self.dispatch_ipc(
+                        "remove_learned_domain",
+                        serde_json::json!({ "host": h.clone() }),
+                    );
+                    self.push_toast(
+                        ToastKind::Info,
+                        if is_en {
+                            "Domain cache reset"
+                        } else {
+                            "Кэш домена сброшен"
+                        },
+                        h,
+                    );
                 }
             }
         });
@@ -3278,7 +3332,7 @@ impl TachyonGuiApp {
                 });
             }
 
-            // Быстрые чипы целей
+            // Быстрые чипы целей и управление кэшем AdaptiveBrain
             ui.horizontal_wrapped(|ui| {
                 let targets = [
                     ("youtube.com", "www.youtube.com"),
@@ -3297,6 +3351,63 @@ impl TachyonGuiApp {
                         self.probe_domain = dom.to_string();
                         self.packet_preview = inspect_client_hello_slices(&self.probe_domain);
                     }
+                }
+                ui.separator();
+                let rst_dom_lbl = if is_en {
+                    "Reset Domain Cache"
+                } else {
+                    "Сбросить кэш домена"
+                };
+                if ui
+                    .small_button(RichText::new(rst_dom_lbl).size(10.0))
+                    .on_hover_text(if is_en {
+                        "Remove learned recipe and ban mask for the current domain in adaptive_cache.json"
+                    } else {
+                        "Удалить сохранённый рецепт и маску отбраковки для текущего домена из adaptive_cache.json"
+                    })
+                    .clicked()
+                {
+                    let dom = self.probe_domain.trim().to_string();
+                    if !dom.is_empty() {
+                        self.dispatch_ipc(
+                            "remove_learned_domain",
+                            serde_json::json!({ "host": dom.clone() }),
+                        );
+                        self.push_toast(
+                            ToastKind::Info,
+                            if is_en {
+                                "Domain cache reset"
+                            } else {
+                                "Кэш домена сброшен"
+                            },
+                            dom,
+                        );
+                    }
+                }
+                let rst_all_lbl = if is_en {
+                    "Reset All Cache"
+                } else {
+                    "Сбросить весь кэш"
+                };
+                if ui
+                    .small_button(RichText::new(rst_all_lbl).size(10.0))
+                    .on_hover_text(if is_en {
+                        "Clear all AdaptiveBrain entries and flush adaptive_cache.json"
+                    } else {
+                        "Полностью очистить кэш адаптивного подбора и перезаписать adaptive_cache.json"
+                    })
+                    .clicked()
+                {
+                    self.dispatch_ipc("clear_brain", serde_json::json!({}));
+                    self.push_toast(
+                        ToastKind::Info,
+                        if is_en {
+                            "Adaptive cache cleared"
+                        } else {
+                            "Кэш адаптивного подбора очищен"
+                        },
+                        "adaptive_cache.json",
+                    );
                 }
             });
 
@@ -3479,7 +3590,9 @@ impl TachyonGuiApp {
                                 Self::card_frame(r.ok).show(ui, |ui| {
                                     ui.horizontal_wrapped(|ui| {
                                         let (st_txt, st_col) = if r.ok {
-                                            ("OK", SEMANTIC_OK)
+                                            ("32K OK", SEMANTIC_OK)
+                                        } else if r.block_reason == "cap_16k" {
+                                            ("CAP <32K", SEMANTIC_WARN)
                                         } else {
                                             (r.block_reason.as_str(), SEMANTIC_ERR)
                                         };
@@ -4005,6 +4118,33 @@ impl TachyonGuiApp {
                         self.builder_dirty = true;
                     }
                 }
+                ui.separator();
+                if ui
+                    .small_button(
+                        RichText::new("googlevideo (wsize=1:scale=1)")
+                            .monospace()
+                            .size(10.0)
+                            .color(ACCENT),
+                    )
+                    .on_hover_text(if is_en {
+                        "Apply multidisorder:pos=midsld + wssize:wsize=1:scale=1 preset for googlevideo.com"
+                    } else {
+                        "Применить пресет multidisorder:pos=midsld + wssize:wsize=1:scale=1 для googlevideo.com"
+                    })
+                    .clicked()
+                {
+                    self.builder_cfg.auto = false;
+                    self.builder_cfg.mode = "multi_disorder".to_string();
+                    self.builder_cfg.fooling = "autottl".to_string();
+                    self.builder_cfg.split_pos = "midsld".to_string();
+                    self.builder_cfg.fake_sni = "sni_del".to_string();
+                    self.builder_cfg.tlsrec_first = false;
+                    self.builder_cfg.multi_seven_point = false;
+                    self.builder_cfg.host_fake = false;
+                    self.builder_cfg.wsize = 1;
+                    self.builder_cfg.wscale = Some(1);
+                    self.builder_dirty = true;
+                }
             });
 
             ui.horizontal_wrapped(|ui| {
@@ -4039,6 +4179,36 @@ impl TachyonGuiApp {
                 {
                     self.builder_dirty = true;
                 }
+
+                ui.label(RichText::new("scale:").size(10.0).color(TEXT_SECONDARY));
+                let scale_txt = match self.builder_cfg.wscale {
+                    Some(ws) => ws.to_string(),
+                    None => "Auto".to_string(),
+                };
+                egui::ComboBox::from_id_salt("b_wscale")
+                    .width(56.0)
+                    .selected_text(RichText::new(scale_txt).monospace().size(10.0))
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.builder_cfg.wscale.is_none(), "Auto")
+                            .clicked()
+                        {
+                            self.builder_cfg.wscale = None;
+                            self.builder_dirty = true;
+                        }
+                        for ws in 0u8..=14 {
+                            if ui
+                                .selectable_label(
+                                    self.builder_cfg.wscale == Some(ws),
+                                    ws.to_string(),
+                                )
+                                .clicked()
+                            {
+                                self.builder_cfg.wscale = Some(ws);
+                                self.builder_dirty = true;
+                            }
+                        }
+                    });
 
                 ui.label(RichText::new("UDP Rep:").size(10.0).color(TEXT_SECONDARY));
                 if ui
@@ -4337,6 +4507,22 @@ impl TachyonGuiApp {
                 );
             }
 
+            let mut override_game = self.snap.config.lists_override_game_bypass;
+            let override_lbl = if is_en {
+                "Apply domain lists above built-in game bypass (Anti-Cheat / Game, e.g. CloudFront CDN)"
+            } else {
+                "Применять доменные списки поверх игрового байпаса (Античит / Игра, напр. CloudFront CDN)"
+            };
+            if ui
+                .checkbox(&mut override_game, RichText::new(override_lbl).size(10.0))
+                .changed()
+            {
+                self.dispatch_ipc(
+                    "update_app_filter",
+                    serde_json::json!({ "lists_override_game_bypass": override_game }),
+                );
+            }
+
             let selected_apps = self.snap.config.selected_apps.clone();
             let app_strats_map = self.snap.config.app_strategies.clone();
             let all_app_strat_opts = self.all_strategy_options(is_en);
@@ -4630,6 +4816,7 @@ impl TachyonGuiApp {
             let mut upd_strat: Option<(String, String)> = None;
             let mut upd_quic: Option<(String, bool)> = None;
             let mut upd_udp: Option<(String, bool)> = None;
+            let mut upd_udp_ttl: Option<(String, u8)> = None;
             let mut open_edit: Option<String> = None;
             let mut del_list: Option<String> = None;
 
@@ -4728,6 +4915,60 @@ impl TachyonGuiApp {
                                 {
                                     upd_udp = Some((item.id.clone(), uf));
                                 }
+
+                                if item.udp_fake {
+                                    ui.label(
+                                        RichText::new("UDP TTL:")
+                                            .size(10.0)
+                                            .color(TEXT_SECONDARY),
+                                    );
+                                    let mut uttl = item.udp_fake_ttl;
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut uttl)
+                                                .range(0..=64)
+                                                .custom_formatter(|v, _| {
+                                                    let n = v as u8;
+                                                    if n == 0 {
+                                                        "Auto".to_string()
+                                                    } else {
+                                                        n.to_string()
+                                                    }
+                                                }),
+                                        )
+                                        .on_hover_text(if is_en {
+                                            "UDP fake packet TTL for this list (0 = Auto: TTL=3 on Voice/STUN ports)"
+                                        } else {
+                                            "TTL фейковых UDP-пакетов для этого списка (0 = Авто: TTL=3 для голосовых портов)"
+                                        })
+                                        .changed()
+                                    {
+                                        upd_udp_ttl = Some((item.id.clone(), uttl));
+                                    }
+
+                                    let ports_btn_lbl = if item.udp_ports.trim().is_empty() {
+                                        if is_en {
+                                            "UDP ports...".to_string()
+                                        } else {
+                                            "UDP порты...".to_string()
+                                        }
+                                    } else {
+                                        format!("UDP: {}", item.udp_ports.trim())
+                                    };
+                                    if ui
+                                        .small_button(
+                                            RichText::new(ports_btn_lbl).monospace().size(9.5),
+                                        )
+                                        .on_hover_text(if is_en {
+                                            "Configure UDP port ranges for this list (e.g. 19294-19344, 50000-50100)"
+                                        } else {
+                                            "Настроить диапазоны UDP-портов списка (напр. 19294-19344, 50000-50100)"
+                                        })
+                                        .clicked()
+                                    {
+                                        open_edit = Some(item.id.clone());
+                                    }
+                                }
                             });
                         });
                     }
@@ -4754,6 +4995,12 @@ impl TachyonGuiApp {
                     serde_json::json!({ "id": id, "udp_fake": uf }),
                 );
             }
+            if let Some((id, uttl)) = upd_udp_ttl {
+                self.dispatch_ipc(
+                    "update_list",
+                    serde_json::json!({ "id": id, "udp_fake_ttl": uttl }),
+                );
+            }
             if let Some(id) = open_edit {
                 self.open_list_modal(Some(&id));
             }
@@ -4772,6 +5019,8 @@ impl TachyonGuiApp {
                 list_id: Some(found.id.clone()),
                 name: found.name.clone(),
                 strategy: found.strategy.as_code(),
+                udp_ports: found.udp_ports.clone(),
+                udp_fake_ttl: found.udp_fake_ttl,
                 entries_text: found.entries.join("\n"),
                 quick_entry: String::new(),
             };
@@ -4782,6 +5031,8 @@ impl TachyonGuiApp {
             list_id: None,
             name: String::new(),
             strategy: "auto".to_string(),
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries_text: String::new(),
             quick_entry: String::new(),
         };
@@ -4840,6 +5091,35 @@ impl TachyonGuiApp {
                                 }
                             }
                         });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "UDP Ports:"
+                        } else {
+                            "UDP порты:"
+                        })
+                        .size(10.0),
+                    );
+                    ui.add(
+                        TextEdit::singleline(&mut self.list_modal.udp_ports)
+                            .hint_text("19294-19344, 50000-50100")
+                            .desired_width(188.0),
+                    );
+                    ui.label(RichText::new("UDP TTL:").size(10.0));
+                    ui.add(
+                        egui::DragValue::new(&mut self.list_modal.udp_fake_ttl)
+                            .range(0..=64)
+                            .custom_formatter(|v, _| {
+                                let n = v as u8;
+                                if n == 0 {
+                                    "Auto (3)".to_string()
+                                } else {
+                                    n.to_string()
+                                }
+                            }),
+                    );
                 });
 
                 ui.horizontal(|ui| {
@@ -4918,6 +5198,8 @@ impl TachyonGuiApp {
                 self.list_modal.name.trim().to_string()
             };
             let strategy = self.list_modal.strategy.clone();
+            let udp_ports = self.list_modal.udp_ports.trim().to_string();
+            let udp_fake_ttl = self.list_modal.udp_fake_ttl;
             let entries_text = self.list_modal.entries_text.clone();
             if let Some(id) = self.list_modal.list_id.clone() {
                 self.dispatch_ipc(
@@ -4926,6 +5208,8 @@ impl TachyonGuiApp {
                         "id": id,
                         "name": name,
                         "strategy": strategy,
+                        "udp_ports": udp_ports,
+                        "udp_fake_ttl": udp_fake_ttl,
                         "entries_text": entries_text
                     }),
                 );
@@ -4935,6 +5219,8 @@ impl TachyonGuiApp {
                     serde_json::json!({
                         "name": name,
                         "strategy": strategy,
+                        "udp_ports": udp_ports,
+                        "udp_fake_ttl": udp_fake_ttl,
                         "entries_text": entries_text
                     }),
                 );
@@ -6230,6 +6516,34 @@ impl TachyonGuiApp {
                 "Auto-TTL",
             ),
             (
+                "reset_domain_cache".to_string(),
+                if is_en {
+                    "Generator"
+                } else {
+                    "Генератор"
+                },
+                if is_en {
+                    format!("Reset Adaptive Cache for Domain ({})", self.probe_domain)
+                } else {
+                    format!("Сбросить кэш для домена ({})", self.probe_domain)
+                },
+                "Cache",
+            ),
+            (
+                "clear_brain_cache".to_string(),
+                if is_en {
+                    "Generator"
+                } else {
+                    "Генератор"
+                },
+                if is_en {
+                    "Reset Entire AdaptiveBrain Cache (adaptive_cache.json)".to_string()
+                } else {
+                    "Сбросить весь кэш адаптивного подбора (adaptive_cache.json)".to_string()
+                },
+                "Flush",
+            ),
+            (
                 "copy_logs".to_string(),
                 if is_en { "Logs" } else { "Журнал" },
                 if is_en {
@@ -6621,6 +6935,36 @@ impl TachyonGuiApp {
                 "clear_logs" => {
                     self.dispatch_ipc("clear_logs", serde_json::json!({}));
                 }
+                "reset_domain_cache" => {
+                    let dom = self.probe_domain.trim().to_string();
+                    if !dom.is_empty() {
+                        self.dispatch_ipc(
+                            "remove_learned_domain",
+                            serde_json::json!({ "host": dom.clone() }),
+                        );
+                        self.push_toast(
+                            ToastKind::Info,
+                            if is_en {
+                                "Domain cache reset"
+                            } else {
+                                "Кэш домена сброшен"
+                            },
+                            dom,
+                        );
+                    }
+                }
+                "clear_brain_cache" => {
+                    self.dispatch_ipc("clear_brain", serde_json::json!({}));
+                    self.push_toast(
+                        ToastKind::Info,
+                        if is_en {
+                            "Adaptive cache cleared"
+                        } else {
+                            "Кэш адаптивного подбора очищен"
+                        },
+                        "adaptive_cache.json",
+                    );
+                }
                 "check_updates" => {
                     self.about_modal_open = true;
                     self.trigger_update_check();
@@ -6936,6 +7280,9 @@ fn build_outbound_json_string(cfg: &DesyncConfig) -> String {
     if cfg.wsize > 0 {
         map.insert("wsize".to_string(), serde_json::json!(cfg.wsize));
     }
+    if let Some(ws) = cfg.wscale {
+        map.insert("wscale".to_string(), serde_json::json!(ws.min(14)));
+    }
     if cfg.syndata {
         map.insert("syndata".to_string(), serde_json::json!(true));
     }
@@ -7000,7 +7347,8 @@ fn localize_recipe_title(id: u8, fallback: &str, is_en: bool) -> String {
         20 => "#20 MultiDisorder bin_noise (0x0F0F0F0F decoy + BadSeq+BadAck+BadSum)".to_string(),
         21 => "#21 FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap + seqovl=10)".to_string(),
         22 => "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)".to_string(),
-        23 => "#23 7-Point MultiDisorder (AutoTTL + sni_del + wsize=64)".to_string(),
+        23 => "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)"
+            .to_string(),
         _ => localize_runtime_text(fallback, true),
     }
 }

@@ -60,6 +60,7 @@ pub struct AppStateConfig {
     pub app_filter_mode: AppFilterMode,
     pub selected_apps: Vec<String>,
     pub force_desync_selected_apps: bool,
+    pub lists_override_game_bypass: bool,
     pub lists: Vec<ListProfile>,
 }
 
@@ -82,6 +83,7 @@ impl Default for AppStateConfig {
             app_filter_mode: AppFilterMode::All,
             selected_apps: Vec::new(),
             force_desync_selected_apps: true,
+            lists_override_game_bypass: true,
             lists: default_builtin_lists(),
         }
     }
@@ -178,7 +180,7 @@ impl DesyncRuntime {
             AppStateConfig::default()
         };
 
-        // Repair builtin list names/descriptions if an older state.json had broken encoding
+        // Repair builtin list names/descriptions and migrate Discord Voice UDP ports/TTL on existing state.json
         let defaults = default_builtin_lists();
         for item in &mut cfg.lists {
             if item.builtin
@@ -187,6 +189,14 @@ impl DesyncRuntime {
             {
                 item.name = def.name.clone();
                 item.description = def.description.clone();
+            }
+            if item.id == "discord" {
+                if item.udp_ports.trim().is_empty() {
+                    item.udp_ports = "19294-19344, 50000-50100".to_string();
+                }
+                if item.udp_fake_ttl == 0 || item.udp_fake_ttl == 6 {
+                    item.udp_fake_ttl = 3;
+                }
             }
         }
 
@@ -205,7 +215,8 @@ impl DesyncRuntime {
                 &cfg.app_strategies,
                 &cfg.dns_overrides,
             )
-            .with_custom_profiles(&cfg.custom_profiles),
+            .with_custom_profiles(&cfg.custom_profiles)
+            .with_lists_override_game_bypass(cfg.lists_override_game_bypass),
         );
 
         let initial_apps = if use_persistent_files {
@@ -232,7 +243,7 @@ impl DesyncRuntime {
         rt.push_log(
             "info",
             "system",
-            "Движок десинхронизации Tachyon Desync инициализирован (апстрим tachyon-core, 16 адаптивных рецептов)",
+            "Движок десинхронизации Tachyon Desync инициализирован (апстрим tachyon-core, 24 адаптивных рецепта)",
         );
         rt
     }
@@ -302,7 +313,8 @@ impl DesyncRuntime {
                 &cfg.app_strategies,
                 &cfg.dns_overrides,
             )
-            .with_custom_profiles(&cfg.custom_profiles),
+            .with_custom_profiles(&cfg.custom_profiles)
+            .with_lists_override_game_bypass(cfg.lists_override_game_bypass),
         );
         *self.matcher.write().await = compiled;
 
@@ -678,6 +690,8 @@ impl DesyncRuntime {
                                     strategy: ListStrategy::Direct,
                                     block_quic: false,
                                     udp_fake: false,
+                                    udp_ports: String::new(),
+                                    udp_fake_ttl: 0,
                                     entries: Vec::new(),
                                 },
                             );
@@ -806,6 +820,12 @@ impl DesyncRuntime {
                         if let Some(uf) = payload.get("udp_fake").and_then(|v| v.as_bool()) {
                             list.udp_fake = uf;
                         }
+                        if let Some(up) = payload.get("udp_ports").and_then(|v| v.as_str()) {
+                            list.udp_ports = up.trim().to_string();
+                        }
+                        if let Some(ut) = payload.get("udp_fake_ttl").and_then(|v| v.as_u64()) {
+                            list.udp_fake_ttl = (ut as u8).min(64);
+                        }
                         if let Some(name) = payload.get("name").and_then(|v| v.as_str())
                             && !name.trim().is_empty()
                         {
@@ -843,6 +863,17 @@ impl DesyncRuntime {
                     .get("strategy")
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto");
+                let udp_ports = payload
+                    .get("udp_ports")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let udp_fake_ttl = payload
+                    .get("udp_fake_ttl")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| (v as u8).min(64))
+                    .unwrap_or(0);
                 let entries_text = payload
                     .get("entries_text")
                     .and_then(|v| v.as_str())
@@ -871,6 +902,8 @@ impl DesyncRuntime {
                         strategy: ListStrategy::from_code(strategy_str),
                         block_quic: true,
                         udp_fake: true,
+                        udp_ports,
+                        udp_fake_ttl,
                         entries,
                     },
                 );
@@ -913,6 +946,12 @@ impl DesyncRuntime {
                     .and_then(|v| v.as_bool())
                 {
                     cfg.force_desync_selected_apps = force;
+                }
+                if let Some(override_game) = payload
+                    .get("lists_override_game_bypass")
+                    .and_then(|v| v.as_bool())
+                {
+                    cfg.lists_override_game_bypass = override_game;
                 }
                 if let Some(arr) = payload.get("selected_apps").and_then(|v| v.as_array()) {
                     let mut clean = Vec::new();
@@ -1146,8 +1185,15 @@ impl DesyncRuntime {
             }
             "remove_learned_domain" => {
                 if let Some(host) = payload.get("host").and_then(|v| v.as_str()) {
-                    remove_learned_domain(host);
-                    flush_persistent_cache();
+                    let trimmed = host.trim();
+                    if !trimmed.is_empty() {
+                        remove_learned_domain(trimmed);
+                        self.push_log(
+                            "info",
+                            "adaptive",
+                            &format!("Сброшен кэш адаптивного подбора для домена {trimmed}"),
+                        );
+                    }
                 }
                 serde_json::to_value(self.snapshot().await).unwrap_or_default()
             }

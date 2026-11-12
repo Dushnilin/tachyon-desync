@@ -8,7 +8,7 @@
 <img src="assets/readme/hero-board.en.svg" width="100%" alt="Tachyon Desync — Cross-Platform Desktop L3/L4/L7 Adaptive Packet Desynchronizer">
 
 <p>
-  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.0.9-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.0.9"></a>
+  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.0.10-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.0.10"></a>
   <img src="https://img.shields.io/badge/Rust-2024_Edition-f97316?style=flat-square&logo=rust&logoColor=white&labelColor=0f172a" alt="Rust 2024">
   <img src="https://img.shields.io/badge/UI-Native_OpenGL_(egui)-38bdf8?style=flat-square&labelColor=0f172a" alt="Native OpenGL UI">
   <img src="https://img.shields.io/badge/Capture-Wintun_%7C_utun_%7C_tun_L3_%2B_SOCKS5-10b981?style=flat-square&labelColor=0f172a" alt="Wintun + utun + tun L3 + SOCKS5">
@@ -54,20 +54,20 @@
   - **`L1` (Domain Memory, 7-day TTL)**: immediately applies the verified winning recipe for a known hostname (`SNI` / `Host`) from persistent `runtime-state.json`.
   - **`L2` (`/24` Subnet Cache)**: when connecting to a new subdomain hosted on an already learned `/24` IPv4 prefix, reuses the subnet's winning recipe without probing overhead.
   - **`L3` (Global Channel Scoreboard)**: ranks all 24 TCP recipes using integer `RecipeStats` (success probability + `EWMA RTT`) and passive `IspFingerprint` path profiling.
-- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (with live `256 KiB` promotion and `active_elapsed` idle-interval subtraction on persistent `HTTP/2` and `WebSocket` pools). Consecutive `TCP RST` bursts automatically trigger background re-probing.
+- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (both on live streams with `256 KiB` promotion and `active_elapsed` idle subtraction, and via pipelined 1-RTT `TLS 1.3` `> 32 KiB` probing in the Generator and Constructor). Consecutive `TCP RST` bursts automatically trigger background re-probing.
 - **Clean DNS & Local `hosts` Overrides**: built-in UDP resolver queries non-standard ports (`77.88.8.8:1253`, `208.67.222.222:5353`) alongside `1.1.1.1` and `8.8.8.8`, while the local `hosts` editor binds `domain=IP` directly inside the engine without touching `/etc/hosts` or `C:\Windows\System32\drivers\etc\hosts`.
 - **Strategy Generator, Auto-TTL Calibration & `ClientHello` Visualizer**:
-  - One-click probing across all 24 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
+  - One-click `> 32 KiB` probing across all 24 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
   - Active `Auto-TTL` hop discovery (`2..10` hops) to find the exact minimum TTL that reaches transit middleboxes without reaching the destination server.
   - Interactive `TLS ClientHello` slice diagram (`SNI`, `SLD`, `midsld`, `endhost`, 7-point `Split`, `TlsRec`, `Fake`) and live JSON configuration preview.
-- **10 Built-in Service Categories & Per-Process Routing**: curated domain/CIDR lists (YouTube, Discord, Telegram, AI Platforms, Streaming, Gaming, Development, Domestic Direct), one-click process picker, and optional upstream proxy chaining (`SOCKS5://` or `HTTP://`).
+- **10 Built-in Service Categories & Per-Process Routing**: curated domain/CIDR lists with per-list `UDP ports` and `UDP TTL` (YouTube, Discord, Telegram, AI Platforms, Streaming, Gaming, Development, Domestic Direct), domain-list priority over built-in game/anticheat bypass, one-click process picker, and optional upstream proxy chaining (`SOCKS5://` or `HTTP://`).
 
 | UI Tab | Purpose & Controls |
 | :--- | :--- |
-| **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, Clean DNS & local `hosts` controls, one-click 6-service health check, collapsible 10-category service grid (collapsed by default), and pinned domain table. |
+| **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, Clean DNS & local `hosts` controls, one-click 6-service `> 32 KiB` health check, 10-category service grid, pinned domain table, and `AdaptiveBrain` cache reset. |
 | **`Flows`** | Live monitor of active and recent TCP/UDP flows showing process name, target domain/IP, applied recipe, RX/TX byte counters, and quick actions to send a domain to the Generator or bypass list (`Direct`). |
-| **`Generator`** | Automated 24-recipe per-domain probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `IPv6 Ext`, `QUIC`). |
-| **`Lists`** | Per-application process filter (`All except selected` / `Only selected`), per-process strategy overrides, upstream proxy chaining (`SOCKS5/HTTP`), full JSON backup export/import, and editor for all 10 domain/subnet lists. |
+| **`Generator`** | Automated 24-recipe per-domain `> 32 KiB` probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, cache reset, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, `IPv6 Ext`, `QUIC`). |
+| **`Lists`** | Per-application process filter and list priority over game bypass, per-process strategy overrides, upstream proxy chaining (`SOCKS5/HTTP`), full JSON backup export/import, and editor for all 10 domain/subnet lists (`UDP ports`, `UDP TTL`). |
 | **`Logs`** | Collapsible `L3` channel scoreboard across all 24 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and full log export to clipboard. |
 
 ---
@@ -105,7 +105,7 @@ In **`Auto (24 recipes)`** mode, the engine inspects the first outbound payload 
 | **`#20`** | `MultiDisorder bin_noise (binary decoy + triple L4)` | Non-TLS `0x0F0F0F0F` binary decoy payload paired with `BadSeq + BadAck + BadSum`. |
 | **`#21`** | `FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap)` | `SYN`-phase decoy payload (`Linux SOCK_RAW`) or `PadEncap + seqovl=10` with `Md5BadAck`. |
 | **`#22`** | `FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)` | `wsize=64` receive-window clamping during handshake + TLS record split and `host+1` `BadSum` decoy. |
-| **`#23`** | `7-Point MultiDisorder (AutoTTL + sni_del + wsize=64)` | 7-point `MultiDisorder` combining an `SNI`-stripped clone, dynamic `AutoTTL`, and `wsize=64` clamping. |
+| **`#23`** | `MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del)` | Out-of-order slicing at `midsld` paired with pre-connect `wsize=1`, `TCP Window Scale = 1`, `AutoTTL`, and an `SNI`-stripped clone. |
 
 For **UDP / QUIC** and voice datagrams, 6 dedicated recipes are applied automatically (`#0..#5`: `QUIC Initial` decoy bursts, 24-byte pseudo-random `opaque` datagrams with `udplen` padding, `IPv6 HopByHop` headers, and stepped `TTL 2..5`), along with instant `QUIC UDP/443 -> TCP/TLS` fallback via `ICMP Port Unreachable`.
 

@@ -198,7 +198,15 @@ pub mod cache_file {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if let Ok(json) = serde_json::to_string(&self.data) {
-                    let _ = std::fs::write(p, json);
+                    let tmp = p.with_extension("json.tmp");
+                    if std::fs::write(&tmp, &json).is_ok() {
+                        if std::fs::rename(&tmp, p).is_err() {
+                            let _ = std::fs::write(p, &json);
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                    } else {
+                        let _ = std::fs::write(p, &json);
+                    }
                 }
             }
         }
@@ -331,15 +339,17 @@ pub mod core_tls {
             // GREASE (0x1a1a)
             exts.extend_from_slice(&[0x1a, 0x1a, 0x00, 0x00]);
 
-            // 1. server_name (0x0000)
-            let sni_list_len = (host_len + 3) as u16;
-            let sni_ext_len = sni_list_len + 2;
-            exts.extend_from_slice(&[0x00, 0x00]);
-            exts.extend_from_slice(&sni_ext_len.to_be_bytes());
-            exts.extend_from_slice(&sni_list_len.to_be_bytes());
-            exts.push(0x00);
-            exts.extend_from_slice(&(host_len as u16).to_be_bytes());
-            exts.extend_from_slice(host_bytes);
+            // 1. server_name (0x0000) — опускается при пустом SNI (`sni_del` / ECH-only)
+            if !host_bytes.is_empty() {
+                let sni_list_len = (host_len + 3) as u16;
+                let sni_ext_len = sni_list_len + 2;
+                exts.extend_from_slice(&[0x00, 0x00]);
+                exts.extend_from_slice(&sni_ext_len.to_be_bytes());
+                exts.extend_from_slice(&sni_list_len.to_be_bytes());
+                exts.push(0x00);
+                exts.extend_from_slice(&(host_len as u16).to_be_bytes());
+                exts.extend_from_slice(host_bytes);
+            }
 
             // 2. extended_master_secret (0x0017) & renegotiation_info (0xff01)
             exts.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
@@ -411,6 +421,16 @@ pub mod core_tls {
             exts.extend_from_slice(&[
                 0x00, 0x2b, 0x00, 0x07, 0x06, 0x3a, 0x3a, 0x03, 0x04, 0x03, 0x03,
             ]);
+
+            // 9. encrypted_client_hello GREASE (0xfe0d, RFC 9849) для идентичности с Chrome uTLS
+            let mut ech_rand = [0u8; 65];
+            let _ = getrandom::fill(&mut ech_rand);
+            exts.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x4a, 0x00, 0x00, 0x01, 0x00, 0x01]);
+            exts.push(ech_rand[0]);
+            exts.extend_from_slice(&[0x00, 0x20]);
+            exts.extend_from_slice(&ech_rand[1..33]);
+            exts.extend_from_slice(&[0x00, 0x20]);
+            exts.extend_from_slice(&ech_rand[33..65]);
 
             let cipher_suites: &[u8] = &[
                 0x4a, 0x4a, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c,
@@ -575,6 +595,7 @@ pub mod outbound {
                 if let Ok(mut guard) = dns_cache().lock() {
                     if guard.len() > 2048 {
                         guard.clear();
+                        guard.shrink_to(256);
                     }
                     guard.insert(clean.clone(), (ips.clone(), std::time::Instant::now()));
                 }
@@ -616,6 +637,10 @@ pub mod outbound {
                 ));
             }
             if let Ok(mut guard) = dns_cache().lock() {
+                if guard.len() > 2048 {
+                    guard.clear();
+                    guard.shrink_to(256);
+                }
                 guard.insert(
                     clean.clone(),
                     (fallback_ips.clone(), std::time::Instant::now()),
@@ -889,6 +914,15 @@ pub mod outbound {
             dst: SocketAddr,
             dial: &DialOptions,
         ) -> io::Result<TcpStream> {
+            connect_tcp_addr_with_window(dst, dial, 0, None).await
+        }
+
+        pub async fn connect_tcp_addr_with_window(
+            dst: SocketAddr,
+            dial: &DialOptions,
+            wsize: u32,
+            wscale: Option<u8>,
+        ) -> io::Result<TcpStream> {
             let timeout = Duration::from_millis(dial.connect_timeout_ms.unwrap_or(4500));
             let sock = if dst.is_ipv6() {
                 tokio::net::TcpSocket::new_v6()?
@@ -897,6 +931,13 @@ pub mod outbound {
             };
             bind_outbound_socket(&sock, dst.is_ipv6());
             let _ = sock.set_nodelay(true);
+            if wsize > 0 || wscale.is_some() {
+                super::tlsspoof::apply_preconnect_tcp_window_sock(
+                    &socket2::SockRef::from(&sock),
+                    wsize,
+                    wscale,
+                );
+            }
 
             tokio::time::timeout(timeout, sock.connect(dst))
                 .await

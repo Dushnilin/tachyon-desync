@@ -109,6 +109,12 @@ pub struct ListProfile {
     pub strategy: ListStrategy,
     pub block_quic: bool,
     pub udp_fake: bool,
+    /// Диапазоны целевых UDP-портов для списка (например, `19294-19344, 50000-50100`).
+    #[serde(default)]
+    pub udp_ports: String,
+    /// Индивидуальный TTL для UDP-фейков списка (`0` = авто: `3` для STUN/Voice, иначе по профилю).
+    #[serde(default)]
+    pub udp_fake_ttl: u8,
     /// Строки правил: домены (`youtube.com`), ключевые слова (`kw:googlevideo`), подсети (`149.154.160.0/20`).
     pub entries: Vec<String>,
 }
@@ -132,6 +138,31 @@ pub enum MatchDecision {
     },
 }
 
+/// Разобрать строку портов и диапазонов вида `"19294-19344, 50000-50100, 3478"`.
+pub fn parse_port_ranges(spec: &str) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for token in spec.split([',', ';', ' ', '\t', '\n', '\r']) {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((a_str, b_str)) = t.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a_str.trim().parse::<u16>(), b_str.trim().parse::<u16>())
+                && a > 0
+                && b > 0
+            {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                out.push((lo, hi));
+            }
+        } else if let Ok(p) = t.parse::<u16>()
+            && p > 0
+        {
+            out.push((p, p));
+        }
+    }
+    out
+}
+
 /// Скомпилированный без-аллокационный матчер списков.
 #[derive(Debug, Clone)]
 pub struct CompiledListRule {
@@ -140,6 +171,8 @@ pub struct CompiledListRule {
     pub strategy: ListStrategy,
     pub block_quic: bool,
     pub udp_fake: bool,
+    pub udp_port_ranges: Vec<(u16, u16)>,
+    pub udp_fake_ttl: u8,
     pub exact_domains: HashSet<String>,
     pub domain_suffixes: Vec<String>,
     pub keywords: Vec<String>,
@@ -152,6 +185,7 @@ impl CompiledListRule {
         let mut domain_suffixes = Vec::new();
         let mut keywords = Vec::new();
         let mut subnets = Vec::new();
+        let mut udp_port_ranges = parse_port_ranges(&profile.udp_ports);
 
         for raw in &profile.entries {
             let line = raw
@@ -161,6 +195,14 @@ impl CompiledListRule {
                 .trim()
                 .to_ascii_lowercase();
             if line.is_empty() {
+                continue;
+            }
+            if let Some(port_spec) = line
+                .strip_prefix("udp:")
+                .or_else(|| line.strip_prefix("udp_ports:"))
+                .or_else(|| line.strip_prefix("ports:"))
+            {
+                udp_port_ranges.extend(parse_port_ranges(port_spec));
                 continue;
             }
             if let Some((dom_part, _ip_part)) = line.split_once('=') {
@@ -215,6 +257,8 @@ impl CompiledListRule {
             strategy: profile.strategy.clone(),
             block_quic: profile.block_quic,
             udp_fake: profile.udp_fake,
+            udp_port_ranges,
+            udp_fake_ttl: profile.udp_fake_ttl,
             exact_domains,
             domain_suffixes,
             keywords,
@@ -222,30 +266,61 @@ impl CompiledListRule {
         }
     }
 
-    pub fn matches(&self, host: Option<&str>, dst_ip: IpAddr) -> bool {
+    pub fn matches_domain_or_ip(&self, host: Option<&str>, dst_ip: IpAddr) -> bool {
         for &(net, prefix) in &self.subnets {
             if ip_in_subnet(dst_ip, net, prefix) {
                 return true;
             }
         }
         if let Some(h) = host {
-            let h_lc = h.trim().trim_end_matches('.').to_ascii_lowercase();
-            if h_lc.is_empty() {
+            let trimmed = h.trim().trim_end_matches('.');
+            if trimmed.is_empty() {
                 return false;
             }
-            if self.exact_domains.contains(&h_lc) {
+            let h_lc: std::borrow::Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase())
+            {
+                std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(trimmed)
+            };
+            let h_ref = h_lc.as_ref();
+            if self.exact_domains.contains(h_ref) {
                 return true;
             }
             for suf in &self.domain_suffixes {
-                if h_lc.ends_with(suf.as_str()) {
+                if h_ref.ends_with(suf.as_str()) {
                     return true;
                 }
             }
             for kw in &self.keywords {
-                if h_lc.contains(kw.as_str()) {
+                if h_ref.contains(kw.as_str()) {
                     return true;
                 }
             }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn matches(&self, host: Option<&str>, dst_ip: IpAddr) -> bool {
+        self.matches_domain_or_ip(host, dst_ip)
+    }
+
+    pub fn matches_packet(
+        &self,
+        host: Option<&str>,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        is_udp: bool,
+    ) -> bool {
+        if self.matches_domain_or_ip(host, dst_ip) {
+            return true;
+        }
+        if is_udp && !self.udp_port_ranges.is_empty() {
+            return self
+                .udp_port_ranges
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&dst_port));
         }
         false
     }
@@ -284,6 +359,7 @@ pub struct CompiledMatcher {
     pub app_filter_mode: AppFilterMode,
     pub selected_apps: Vec<String>,
     pub force_desync_selected_apps: bool,
+    pub lists_override_game_bypass: bool,
     pub upstream_proxy: String,
     pub app_strategies: Vec<(String, ListStrategy)>,
 }
@@ -374,9 +450,17 @@ impl CompiledMatcher {
             app_filter_mode,
             selected_apps: normalized_apps,
             force_desync_selected_apps,
+            lists_override_game_bypass: true,
             upstream_proxy: upstream_proxy.trim().to_string(),
             app_strategies,
         }
+    }
+
+    /// Разрешить доменным и подсетевым спискам работать поверх встроенного игрового байпаса
+    /// (например, для докачки патчей с CDN `cloudfront.net` без десинхронизации всего игрового `.exe`).
+    pub fn with_lists_override_game_bypass(mut self, enabled: bool) -> Self {
+        self.lists_override_game_bypass = enabled;
+        self
     }
 
     /// Подключить именованные пользовательские профили стратегий (`profile:<id>`).
@@ -451,21 +535,56 @@ impl CompiledMatcher {
                 ListStrategy::CustomProfile(pid) => self.lookup_custom_profile(pid).block_quic,
                 _ => self.custom_global_config.block_quic,
             };
-            return self.strategy_to_decision(
+            return self.strategy_to_decision_ext(
                 app_strat,
                 app_block_quic,
                 true, // для выделенных .exe (Discord.exe, игры) включаем UDP Fake по умолчанию
+                0,
                 &format!("Профиль .exe ({app_label})"),
                 dst_port,
                 is_udp,
             );
         }
 
+        // Если имя хоста не передано явно (например, UDP/QUIC или TCP без SNI), проверяем DNS-кэш
+        let snooped = if host.is_none() {
+            lookup_dns_mapping(dst_ip)
+        } else {
+            None
+        };
+        let effective_host = host.or(snooped.as_deref());
+
+        // Домены авторизации античитов и игрового матчмейкинга (Demonware / RICOCHET / Battle.net / EAC / BattlEye)
+        // всегда идут напрямую без модификации пакетов.
+        if is_anticheat_or_game_auth_domain(effective_host) {
+            return MatchDecision::Direct {
+                matched_list: Some("Античит / Игровой шлюз".to_string()),
+            };
+        }
+
         // 2. Автоматическое прямое соединение (Direct Bypass) для процессов ядерных античитов
         // и защищённых мультиплеерных игр (RICOCHET / Call of Duty, EasyAntiCheat, BattlEye,
         // Riot Vanguard, FACEIT, EA AntiCheat, Battle.net), если пользователь явно не задал
         // индивидуальный профиль для этого .exe выше.
+        // При включённой опции `lists_override_game_bypass` доменные и подсетевые списки
+        // (например, CloudFront для докачки патчей) срабатывают поверх игрового байпаса,
+        // оставляя игровые UDP-порты и шлюзы античитов в прямом соединении.
         if is_anticheat_or_protected_game_process(app_name) {
+            if self.lists_override_game_bypass {
+                for rule in &self.rules {
+                    if rule.matches_domain_or_ip(effective_host, dst_ip) {
+                        return self.strategy_to_decision_ext(
+                            &rule.strategy,
+                            rule.block_quic,
+                            rule.udp_fake,
+                            rule.udp_fake_ttl,
+                            &rule.name,
+                            dst_port,
+                            is_udp,
+                        );
+                    }
+                }
+            }
             let app_label = app_name.unwrap_or("anticheat");
             return MatchDecision::Direct {
                 matched_list: Some(format!("Античит / Игра ({app_label})")),
@@ -494,28 +613,13 @@ impl CompiledMatcher {
             }
         }
 
-        // Если имя хоста не передано явно (например, UDP/QUIC или TCP без SNI), проверяем DNS-кэш
-        let snooped = if host.is_none() {
-            lookup_dns_mapping(dst_ip)
-        } else {
-            None
-        };
-        let effective_host = host.or(snooped.as_deref());
-
-        // Домены авторизации античитов и игрового матчмейкинга (Demonware / RICOCHET / Battle.net / EAC / BattlEye)
-        // всегда идут напрямую без модификации пакетов.
-        if is_anticheat_or_game_auth_domain(effective_host) {
-            return MatchDecision::Direct {
-                matched_list: Some("Античит / Игровой шлюз".to_string()),
-            };
-        }
-
         for rule in &self.rules {
-            if rule.matches(effective_host, dst_ip) {
-                return self.strategy_to_decision(
+            if rule.matches_packet(effective_host, dst_ip, dst_port, is_udp) {
+                return self.strategy_to_decision_ext(
                     &rule.strategy,
                     rule.block_quic,
                     rule.udp_fake,
+                    rule.udp_fake_ttl,
                     &rule.name,
                     dst_port,
                     is_udp,
@@ -530,10 +634,11 @@ impl CompiledMatcher {
             && self.matches_selected_app(app_name)
         {
             let app_label = app_name.unwrap_or("приложение");
-            return self.strategy_to_decision(
+            return self.strategy_to_decision_ext(
                 &ListStrategy::Auto,
                 self.custom_global_config.block_quic,
                 true,
+                0,
                 &format!("Приложение {app_label}"),
                 dst_port,
                 is_udp,
@@ -566,25 +671,43 @@ impl CompiledMatcher {
                 self.custom_global_config.udp_fake,
             ),
         };
-        self.strategy_to_decision(
+        self.strategy_to_decision_ext(
             &self.default_strategy,
             default_block_quic,
             default_udp_fake,
+            0,
             "По умолчанию",
             dst_port,
             is_udp,
         )
     }
 
-    fn strategy_to_decision(
+    #[allow(clippy::too_many_arguments)]
+    fn strategy_to_decision_ext(
         &self,
         strategy: &ListStrategy,
         block_quic: bool,
         udp_fake: bool,
+        rule_udp_fake_ttl: u8,
         list_name: &str,
         dst_port: u16,
         is_udp: bool,
     ) -> MatchDecision {
+        let is_voice_or_stun = is_udp
+            && ((19294..=19344).contains(&dst_port)
+                || (50000..=65535).contains(&dst_port)
+                || (5000..=5020).contains(&dst_port)
+                || matches!(dst_port, 3478 | 5349 | 1400)
+                || (19302..=19309).contains(&dst_port));
+        let apply_udp_ttl = |cfg: &mut DesyncConfig| {
+            if rule_udp_fake_ttl > 0 {
+                cfg.udp_fake_ttl = rule_udp_fake_ttl.clamp(1, 64);
+                cfg.explicit_udp_fake_ttl = true;
+            } else if is_voice_or_stun && cfg.auto {
+                cfg.udp_fake_ttl = 3;
+                cfg.explicit_udp_fake_ttl = false;
+            }
+        };
         match strategy {
             ListStrategy::Direct => MatchDecision::Direct {
                 matched_list: Some(list_name.to_string()),
@@ -612,6 +735,7 @@ impl CompiledMatcher {
                 cfg.fake_sni = self.custom_global_config.fake_sni.clone();
                 cfg.fake_ttl = self.custom_global_config.fake_ttl;
                 cfg.repeats = self.custom_global_config.repeats;
+                apply_udp_ttl(&mut cfg);
                 MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
@@ -631,6 +755,7 @@ impl CompiledMatcher {
                 cfg.fake_sni = self.custom_global_config.fake_sni.clone();
                 cfg.fake_ttl = self.custom_global_config.fake_ttl;
                 cfg.repeats = self.custom_global_config.repeats;
+                apply_udp_ttl(&mut cfg);
                 MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
@@ -655,6 +780,7 @@ impl CompiledMatcher {
                 cfg.udp_fake = udp_fake;
                 cfg.fake_sni = self.custom_global_config.fake_sni.clone();
                 cfg.fake_ttl = self.custom_global_config.fake_ttl;
+                apply_udp_ttl(&mut cfg);
                 MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
@@ -672,6 +798,7 @@ impl CompiledMatcher {
                 cfg.enabled = true;
                 cfg.block_quic = block_quic;
                 cfg.udp_fake = udp_fake;
+                apply_udp_ttl(&mut cfg);
                 MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
@@ -689,6 +816,7 @@ impl CompiledMatcher {
                 cfg.enabled = true;
                 cfg.block_quic = block_quic;
                 cfg.udp_fake = udp_fake;
+                apply_udp_ttl(&mut cfg);
                 MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
@@ -1071,6 +1199,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: true,
             udp_fake: true,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "youtube.com",
                 "googlevideo.com",
@@ -1099,6 +1229,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: false,
             udp_fake: true,
+            udp_ports: "19294-19344, 50000-50100".to_string(),
+            udp_fake_ttl: 3,
             entries: vec![
                 "discord.com",
                 "discordapp.com",
@@ -1125,6 +1257,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: false,
             udp_fake: true,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "telegram.org",
                 "t.me",
@@ -1156,6 +1290,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: true,
             udp_fake: false,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "openai.com",
                 "chatgpt.com",
@@ -1188,6 +1324,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: true,
             udp_fake: false,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "x.com",
                 "twitter.com",
@@ -1218,6 +1356,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: true,
             udp_fake: true,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "twitch.tv",
                 "ttvnw.net",
@@ -1244,6 +1384,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: false,
             udp_fake: true,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "roblox.com",
                 "rbxcdn.com",
@@ -1272,6 +1414,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Auto,
             block_quic: true,
             udp_fake: false,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "github.com",
                 "githubusercontent.com",
@@ -1301,6 +1445,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             strategy: ListStrategy::Direct,
             block_quic: false,
             udp_fake: false,
+            udp_ports: String::new(),
+            udp_fake_ttl: 0,
             entries: vec![
                 "ru",
                 "su",
@@ -1751,5 +1897,114 @@ mod tests {
             }
             other => panic!("Expected Desync with disc_ttl4 profile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_discord_voice_udp_ports_and_list_udp_ttl() {
+        let mut lists = default_builtin_lists();
+        let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        let finland_relay: IpAddr = "35.217.14.88".parse().unwrap();
+
+        for port in [19294u16, 19310, 19344, 50000, 50042, 50100] {
+            let dec = matcher.evaluate(None, finland_relay, port, true);
+            match dec {
+                MatchDecision::Desync {
+                    config,
+                    matched_list,
+                } => {
+                    assert!(matched_list.contains("Discord"), "port={port}");
+                    assert!(config.udp_fake, "port={port}");
+                    assert_eq!(config.udp_fake_ttl, 3, "port={port} must use safe TTL=3");
+                    assert!(config.explicit_udp_fake_ttl, "port={port}");
+                }
+                other => panic!("Expected Discord UDP Desync on port {port}, got {other:?}"),
+            }
+        }
+
+        // Произвольный игровой UDP-порт (3074) вне диапазонов списка идёт напрямую
+        let d_other = matcher.evaluate(None, finland_relay, 3074, true);
+        assert!(matches!(d_other, MatchDecision::Direct { .. }));
+
+        // Пользовательская переопределённая настройка UDP TTL=4 прямо в списке Discord
+        if let Some(disc) = lists.iter_mut().find(|l| l.id == "discord") {
+            disc.udp_fake_ttl = 4;
+        }
+        let matcher4 = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        if let MatchDecision::Desync { config, .. } =
+            matcher4.evaluate(None, finland_relay, 50025, true)
+        {
+            assert_eq!(config.udp_fake_ttl, 4);
+            assert!(config.explicit_udp_fake_ttl);
+        } else {
+            panic!("Expected Desync with UDP TTL=4");
+        }
+    }
+
+    #[test]
+    fn test_lists_override_game_bypass_for_cloudfront_cdn() {
+        let mut lists = default_builtin_lists();
+        lists.insert(
+            0,
+            ListProfile {
+                id: "custom_cdn".to_string(),
+                name: "CloudFront Patch CDN".to_string(),
+                description: "CDN обновлений".to_string(),
+                builtin: false,
+                enabled: true,
+                strategy: ListStrategy::Auto,
+                block_quic: true,
+                udp_fake: false,
+                udp_ports: String::new(),
+                udp_fake_ttl: 0,
+                entries: vec!["cloudfront.net".to_string()],
+            },
+        );
+
+        // 1. По умолчанию (lists_override_game_bypass = true):
+        // cod.exe -> d2cyf1jgpkmugk.cloudfront.net получает десинк по доменному списку,
+        // но авторизация demonware.net и игровые UDP-пакеты cod.exe идут строго напрямую!
+        let matcher_on =
+            CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        let d_patch = matcher_on.evaluate_with_app(
+            Some("d2cyf1jgpkmugk.cloudfront.net"),
+            "18.165.83.42".parse().unwrap(),
+            443,
+            false,
+            Some("cod.exe"),
+        );
+        assert!(matches!(d_patch, MatchDecision::Desync { .. }));
+
+        let d_auth = matcher_on.evaluate_with_app(
+            Some("prod.umbrella.demonware.net"),
+            "185.34.107.129".parse().unwrap(),
+            443,
+            false,
+            Some("cod.exe"),
+        );
+        assert!(matches!(d_auth, MatchDecision::Direct { .. }));
+
+        let d_udp_voice_range = matcher_on.evaluate_with_app(
+            None,
+            "185.34.107.129".parse().unwrap(),
+            50010,
+            true,
+            Some("cod.exe"),
+        );
+        assert!(
+            matches!(d_udp_voice_range, MatchDecision::Direct { .. }),
+            "port-only UDP rules must never hijack protected game UDP traffic"
+        );
+
+        // 2. При отключении переключателя (lists_override_game_bypass = false):
+        // весь трафик cod.exe идёт напрямую, игнорируя доменные списки.
+        let matcher_off = matcher_on.with_lists_override_game_bypass(false);
+        let d_patch_off = matcher_off.evaluate_with_app(
+            Some("d2cyf1jgpkmugk.cloudfront.net"),
+            "18.165.83.42".parse().unwrap(),
+            443,
+            false,
+            Some("cod.exe"),
+        );
+        assert!(matches!(d_patch_off, MatchDecision::Direct { .. }));
     }
 }
