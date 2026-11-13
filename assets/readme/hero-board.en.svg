@@ -72,7 +72,7 @@
     <text x="20" y="19" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" font-weight="700">T</text>
     <text x="36" y="19" fill="#ededed" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="11" font-weight="700">Tachyon Desync</text>
     <rect x="128" y="8" width="44" height="15" rx="3" fill="#232325" stroke="#262629" stroke-width="1"/>
-    <text x="150" y="18.5" text-anchor="middle" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9">v0.0.10</text>
+    <text x="150" y="18.5" text-anchor="middle" fill="#85858b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9">v0.0.11</text>
 
     <rect x="400" y="7" width="54" height="17" rx="3" fill="#232325" stroke="#3e3e44" stroke-width="0.8"/>
     <text x="427" y="18.5" text-anchor="middle" fill="#a1a1a6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="9.5">About</text>

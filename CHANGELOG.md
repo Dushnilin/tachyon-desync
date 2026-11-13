@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.11
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.2` (`6f4ef3f0`)**:
+  - релиз 0.5.2: протокол wdtt/csqtt v3, ускорение фейловера urltest и сборка i386_pentium4.
+  - релиз 0.5.1: адаптация под железо 64m..2g+, ускорение h2/quic и фикс discord voice в desync.
+  - fptn: сериализация YaFF, пулинг SessionID и серверный RealityMode2.
+  - учёт активного времени в DesyncWatchdog и платформенные cap-breakers.
+  - core-runtime, core-config: adaptive desync 24 recipes, anticheat-safe Windows process lookup, SNI/Host tracking, AmneziaWG 3.1.
+
 ## 0.0.10
 
 ### Исправления и улучшения
