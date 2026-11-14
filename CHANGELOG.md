@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.6` (`11963e9c`)**:
+  - релиз 0.5.6: разбор cps-цепочек amneziawg с +/<c> и плоские поля wireguard endpoint.
+  - склеить модули нативного tailscale, статистику пиров, split-dns и откат перезагрузки.
+  - переработать локальный движок tailscale на событийный цикл, split-dns, icmp и peerapi.
+  - доработать stun, derp, disco, wireguard и exit node в tailscale.
+  - обновить control-plane и netmap нативного tailscale (ts2021, followup, backoff и split-dns).
+
 ## 0.1.2
 
 ### Исправления и улучшения
