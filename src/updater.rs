@@ -114,6 +114,7 @@ pub fn is_newer_version(current: &str, remote: &str) -> bool {
 
 /// Создать подпроцесс без появления консольного окна на Windows (`CREATE_NO_WINDOW`).
 fn hidden_command(program: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {

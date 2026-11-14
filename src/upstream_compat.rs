@@ -134,6 +134,21 @@ pub mod util {
     }
 }
 
+/// Профиль аппаратных ресурсов, ожидаемый апстримным `tlsspoof.rs` (`crate::hardware::HardwareProfile`).
+pub mod hardware {
+    #[derive(Debug, Clone, Copy)]
+    pub struct HardwareProfile {
+        pub total_ram_mb: u64,
+    }
+
+    impl HardwareProfile {
+        #[inline]
+        pub fn detect() -> Self {
+            Self { total_ram_mb: 2048 }
+        }
+    }
+}
+
 /// Модуль постоянного хранилища `cache.db`, ожидаемый апстримным `engine.rs` (`crate::cache_file`).
 pub mod cache_file {
     use super::*;
@@ -301,6 +316,31 @@ pub mod inbound {
                 None
             }
         }
+    }
+}
+
+/// Минимальный модуль `crate::dns`, ожидаемый апстримным `outbound/desync/mod.rs` для выбора семейства адресов.
+pub mod dns {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum Strategy {
+        PreferIPv4,
+        PreferIPv6,
+        IPv4Only,
+        IPv6Only,
+    }
+
+    pub struct DnsServiceStub;
+
+    impl DnsServiceStub {
+        #[inline]
+        pub fn strategy(&self) -> Strategy {
+            Strategy::PreferIPv4
+        }
+    }
+
+    #[inline]
+    pub fn current() -> Option<DnsServiceStub> {
+        None
     }
 }
 
@@ -516,10 +556,21 @@ pub mod outbound {
     pub mod dial {
         use super::*;
         use serde::{Deserialize, Serialize};
+        use std::future::Future;
+
+        const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
 
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
         pub struct DialOptions {
             pub connect_timeout_ms: Option<u64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub connect_timeout: Option<Duration>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub domain_strategy: Option<crate::dns::Strategy>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub fallback_delay: Option<Duration>,
+            #[serde(default)]
+            pub parallel: bool,
         }
 
         impl DialOptions {
@@ -527,6 +578,13 @@ pub mod outbound {
                 _obj: &serde_json::Map<String, serde_json::Value>,
             ) -> Result<Self, String> {
                 Ok(Self::default())
+            }
+
+            #[inline]
+            pub fn fallback_delay(&self) -> Duration {
+                self.fallback_delay
+                    .filter(|delay| !delay.is_zero())
+                    .unwrap_or(DEFAULT_FALLBACK_DELAY)
             }
         }
 
@@ -939,7 +997,11 @@ pub mod outbound {
             wsize: u32,
             wscale: Option<u8>,
         ) -> io::Result<TcpStream> {
-            let timeout = Duration::from_millis(dial.connect_timeout_ms.unwrap_or(4500));
+            let timeout = dial
+                .connect_timeout
+                .filter(|d| !d.is_zero())
+                .or_else(|| dial.connect_timeout_ms.map(Duration::from_millis))
+                .unwrap_or_else(|| Duration::from_millis(4500));
             let sock = if dst.is_ipv6() {
                 tokio::net::TcpSocket::new_v6()?
             } else {
@@ -947,7 +1009,7 @@ pub mod outbound {
             };
             bind_outbound_socket(&sock, dst.is_ipv6());
             let _ = sock.set_nodelay(true);
-            if wsize > 0 || wscale.is_some() {
+            if wscale.is_some() && !dst.ip().is_loopback() {
                 super::tlsspoof::apply_preconnect_tcp_window_sock(
                     &socket2::SockRef::from(&sock),
                     wsize,
@@ -958,6 +1020,98 @@ pub mod outbound {
             tokio::time::timeout(timeout, sock.connect(dst))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))?
+        }
+
+        pub async fn dial_serial<F, Fut, T>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
+        where
+            F: FnMut(SocketAddr) -> Fut + Send + 'static,
+            Fut: Future<Output = io::Result<T>> + Send,
+            T: Send + 'static,
+        {
+            dial_serial_slice(&addrs, dial).await
+        }
+
+        async fn dial_serial_slice<F, Fut, T>(addrs: &[SocketAddr], mut dial: F) -> io::Result<T>
+        where
+            F: FnMut(SocketAddr) -> Fut,
+            Fut: Future<Output = io::Result<T>>,
+        {
+            let mut last = None;
+            for &addr in addrs {
+                match dial(addr).await {
+                    Ok(value) => return Ok(value),
+                    Err(err) => last = Some(err),
+                }
+            }
+            Err(last.unwrap_or_else(|| io::Error::other("no address to dial")))
+        }
+
+        pub async fn dial_fast_fallback<F, Fut, T>(
+            addrs: &[SocketAddr],
+            prefer_ipv6: bool,
+            fallback_delay: Duration,
+            dial: F,
+        ) -> io::Result<T>
+        where
+            F: Fn(SocketAddr) -> Fut + Clone + Send + Sync + 'static,
+            Fut: Future<Output = io::Result<T>> + Send,
+            T: Send + 'static,
+        {
+            let has_primary = addrs.iter().any(|addr| addr.is_ipv6() == prefer_ipv6);
+            let has_fallback = addrs.iter().any(|addr| addr.is_ipv6() != prefer_ipv6);
+            if !has_primary || !has_fallback {
+                return dial_serial_slice(addrs, dial).await;
+            }
+            let (primaries, fallbacks): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
+                .iter()
+                .copied()
+                .partition(|addr| addr.is_ipv6() == prefer_ipv6);
+
+            let primary_fut = dial_serial(primaries, dial.clone());
+            tokio::pin!(primary_fut);
+            let wait = tokio::time::sleep(fallback_delay);
+            tokio::pin!(wait);
+
+            let early_primary = tokio::select! {
+                res = &mut primary_fut => Some(res),
+                _ = &mut wait => None,
+            };
+            if let Some(res) = early_primary {
+                if res.is_ok() {
+                    return res;
+                }
+                return match dial_serial(fallbacks, dial).await {
+                    Ok(val) => Ok(val),
+                    Err(_) => res,
+                };
+            }
+
+            let fallback_fut = dial_serial(fallbacks, dial);
+            tokio::pin!(fallback_fut);
+            let mut primary_err: Option<io::Error> = None;
+            let mut fallback_done = false;
+            loop {
+                tokio::select! {
+                    res = &mut primary_fut, if primary_err.is_none() => match res {
+                        Ok(val) => return Ok(val),
+                        Err(err) => {
+                            if fallback_done {
+                                return Err(err);
+                            }
+                            primary_err = Some(err);
+                        }
+                    },
+                    res = &mut fallback_fut, if !fallback_done => match res {
+                        Ok(val) => return Ok(val),
+                        Err(_) => {
+                            if let Some(err) = primary_err.take() {
+                                return Err(err);
+                            }
+                            fallback_done = true;
+                        }
+                    },
+                }
+            }
         }
 
         pub async fn connect_tcp(

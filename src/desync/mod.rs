@@ -649,7 +649,9 @@ pub async fn connect_outbound_tcp_with_window(
     wscale: Option<u8>,
 ) -> io::Result<TcpStream> {
     let dial = crate::outbound::dial::DialOptions {
+        connect_timeout: Some(timeout),
         connect_timeout_ms: Some(timeout.as_millis() as u64),
+        ..Default::default()
     };
     crate::outbound::dial::connect_tcp_addr_with_window(dst, &dial, wsize, wscale).await
 }
