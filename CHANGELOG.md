@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.4` (`551f06ed`)**:
+  - склеить модули нативного tailscale, статистику пиров, split-dns и откат перезагрузки.
+  - переработать локальный движок tailscale на событийный цикл, split-dns, icmp и peerapi.
+  - доработать stun, derp, disco, wireguard и exit node в tailscale.
+  - обновить control-plane и netmap нативного tailscale (ts2021, followup, backoff и split-dns).
+  - релиз 0.5.3: фиксы desync для apple/android tv и ipv6, снижение расхода cpu/ram и записей cache.db.
+
 ## 0.1.0
 
 ### Исправления и улучшения
