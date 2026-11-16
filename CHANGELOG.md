@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.8` (`ea264337`)**:
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+  - убрать спин в egress_credit и починить полузакрытые tcp-сессии в туннелях (#64).
+  - релиз 0.5.7: сквозной ipv6 и fakeipv6, стабильность desync и кэш-узлов, устранение утечек и защита flash.
+
 ## 0.2.0
 
 ### Новые возможности и улучшения
