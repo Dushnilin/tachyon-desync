@@ -5,19 +5,23 @@
 #[cfg(windows)]
 use crate::desync::WIN_OUTBOUND_IF_INDEX;
 use crate::desync::{
-    RECIPE_TITLES, bind_outbound_socket, connect_and_apply_desync_auto, connect_outbound_tcp,
-    connect_via_upstream_proxy, extract_hostname, report_transfer_outcome, report_udp_quic_outcome,
-    send_udp_fakes_same_tuple,
+    bind_outbound_socket, extract_hostname, is_quic_dead_for_target, is_quic_long_header,
+    report_udp_quic_outcome_with_host, send_udp_fakes_same_tuple_with_host,
 };
 use crate::lists::{CompiledMatcher, MatchDecision, record_dns_mapping};
 use crate::proxy::{LogCallback, TrafficCounters};
+use crate::upstream_compat::{
+    ACTIVE_QUIC_FAST_FAILOVER, ACTIVE_TUN_IPV6, ACTIVE_TUN_MSS_CLAMP, ACTIVE_TUN_MTU,
+    TcpCongestionMode, active_tcp_congestion_mode,
+};
 use bytes::Bytes;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{
     Device, DeviceCapabilities, Medium, RxToken as PhyRxToken, TxToken as PhyTxToken,
 };
 use smoltcp::socket::tcp::{
-    Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+    CongestionControl as SmolCongestionControl, Socket as TcpSocket,
+    SocketBuffer as TcpSocketBuffer, State as TcpState,
 };
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::HardwareAddress;
@@ -29,12 +33,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, RwLock, mpsc};
 
 const TUN_QUEUE_CAP: usize = 512;
-const MAX_TCP_SESSIONS: usize = 512;
 const MAX_UDP_SESSIONS: usize = 256;
 
 /// Преобразовать префикс маски `/prefix` в `Ipv4Addr`.
@@ -47,9 +50,191 @@ pub fn prefix_to_ipv4_netmask(prefix: u8) -> Ipv4Addr {
     }
 }
 
+/// Зажим TCP SYN MSS и обход цепочки расширенных заголовков IPv6 (`0`, `43`, `44`, `51`, `60`)
+/// из движка `tachyon-core 0.5.7`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MssClamp {
+    enabled: bool,
+    maximum_segment_size: u16,
+}
+
+impl MssClamp {
+    fn for_mtu(mtu: usize) -> Self {
+        let ipv4_mss = mtu.saturating_sub(40);
+        if ipv4_mss < 536 {
+            return Self::default();
+        }
+        Self {
+            enabled: true,
+            maximum_segment_size: ipv4_mss.min(u16::MAX as usize) as u16,
+        }
+    }
+
+    fn apply_in_place(&self, packet: &mut [u8]) -> bool {
+        if !self.enabled || !ACTIVE_TUN_MSS_CLAMP.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(first) = packet.first().copied() else {
+            return false;
+        };
+        let mut effective = self.maximum_segment_size;
+        if (first >> 4) == 6 {
+            let Some(adjusted) = effective.checked_sub(20).filter(|&v| v > 0) else {
+                return false;
+            };
+            effective = adjusted;
+        }
+        let Some(tcp_off) = locate_tcp_syn_segment(packet) else {
+            return false;
+        };
+        clamp_tcp_syn_segment_mss(&mut packet[tcp_off..], effective)
+    }
+}
+
+fn ipv6_payload_offset_proto(packet: &[u8]) -> Option<(u8, usize)> {
+    if packet.len() < 40 || (packet[0] >> 4) != 6 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let end = 40usize.checked_add(payload_len)?;
+    if packet.len() < end {
+        return None;
+    }
+    let mut next_header = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..16 {
+        match next_header {
+            0 | 43 | 60 => {
+                if offset + 8 > end {
+                    return None;
+                }
+                let ext_len = (packet[offset + 1] as usize + 1) * 8;
+                if offset + ext_len > end {
+                    return None;
+                }
+                next_header = packet[offset];
+                offset += ext_len;
+            }
+            44 => {
+                if offset + 8 > end {
+                    return None;
+                }
+                let frag_off_and_m =
+                    u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) & 0xfff9;
+                if frag_off_and_m != 0 {
+                    return None;
+                }
+                next_header = packet[offset];
+                offset += 8;
+            }
+            51 => {
+                if offset + 8 > end {
+                    return None;
+                }
+                let ext_len = (packet[offset + 1] as usize + 2) * 4;
+                if ext_len < 8 || offset + ext_len > end {
+                    return None;
+                }
+                next_header = packet[offset];
+                offset += ext_len;
+            }
+            59 => return None,
+            proto => return Some((proto, offset)),
+        }
+    }
+    None
+}
+
+fn locate_tcp_syn_segment(packet: &[u8]) -> Option<usize> {
+    if packet.is_empty() {
+        return None;
+    }
+    let ip_hdr_len = match packet[0] >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            if u16::from_be_bytes([packet[2], packet[3]]) as usize != packet.len()
+                || (u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff) != 0
+            {
+                return None;
+            }
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            if ihl < 20 || ihl > packet.len() || packet[9] != 6 {
+                return None;
+            }
+            ihl
+        }
+        6 => {
+            let (proto, off) = ipv6_payload_offset_proto(packet)?;
+            if proto != 6 {
+                return None;
+            }
+            off
+        }
+        _ => return None,
+    };
+    if packet.len() < ip_hdr_len + 20 {
+        return None;
+    }
+    if (packet[ip_hdr_len + 13] & 0x02) == 0 {
+        return None;
+    }
+    Some(ip_hdr_len)
+}
+
+fn clamp_tcp_syn_segment_mss(tcp_segment: &mut [u8], max_mss: u16) -> bool {
+    let data_offset = ((tcp_segment[12] >> 4) as usize) * 4;
+    if data_offset < 20 || data_offset > tcp_segment.len() {
+        return false;
+    }
+    let mut clamped = false;
+    let mut off = 20usize;
+    while off < data_offset {
+        let kind = tcp_segment[off];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            off += 1;
+            continue;
+        }
+        if off + 1 >= data_offset {
+            break;
+        }
+        let opt_len = tcp_segment[off + 1] as usize;
+        if opt_len < 2 || off + opt_len > data_offset {
+            break;
+        }
+        if kind == 2 && opt_len == 4 {
+            let val_off = off + 2;
+            let advertised = u16::from_be_bytes([tcp_segment[val_off], tcp_segment[val_off + 1]]);
+            if advertised > max_mss {
+                tcp_segment[val_off..val_off + 2].copy_from_slice(&max_mss.to_be_bytes());
+                let (mut prev, mut next) = (advertised, max_mss);
+                if !val_off.is_multiple_of(2) {
+                    prev = prev.swap_bytes();
+                    next = next.swap_bytes();
+                }
+                let cur_sum = u16::from_be_bytes([tcp_segment[16], tcp_segment[17]]);
+                let mut sum = u32::from(!cur_sum) + u32::from(!prev) + u32::from(next);
+                while (sum >> 16) != 0 {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+                let new_sum = !(sum as u16);
+                tcp_segment[16..18].copy_from_slice(&new_sum.to_be_bytes());
+                clamped = true;
+            }
+        }
+        off += opt_len;
+    }
+    clamped
+}
+
 /// Виртуальное устройство `smoltcp`, обменивающееся IP-пакетами с платформенным TUN.
 struct VirtualTunDevice {
     mtu: usize,
+    clamp: MssClamp,
     rx_queue: VecDeque<Vec<u8>>,
     tx_queue: VecDeque<Vec<u8>>,
 }
@@ -58,6 +243,7 @@ impl VirtualTunDevice {
     fn new(mtu: usize) -> Self {
         Self {
             mtu,
+            clamp: MssClamp::for_mtu(mtu),
             rx_queue: VecDeque::with_capacity(128),
             tx_queue: VecDeque::with_capacity(128),
         }
@@ -79,6 +265,7 @@ impl PhyRxToken for VirtualRxToken {
 
 struct VirtualTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
+    clamp: MssClamp,
 }
 
 impl PhyTxToken for VirtualTxToken<'_> {
@@ -88,6 +275,7 @@ impl PhyTxToken for VirtualTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
+        self.clamp.apply_in_place(&mut buffer);
         if self.queue.len() < TUN_QUEUE_CAP {
             self.queue.push_back(buffer);
         }
@@ -109,11 +297,13 @@ impl Device for VirtualTunDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let packet = self.rx_queue.pop_front()?;
+        let mut packet = self.rx_queue.pop_front()?;
+        self.clamp.apply_in_place(&mut packet);
         Some((
             VirtualRxToken { packet },
             VirtualTxToken {
                 queue: &mut self.tx_queue,
+                clamp: self.clamp,
             },
         ))
     }
@@ -124,6 +314,7 @@ impl Device for VirtualTunDevice {
         }
         Some(VirtualTxToken {
             queue: &mut self.tx_queue,
+            clamp: self.clamp,
         })
     }
 
@@ -136,12 +327,24 @@ impl Device for VirtualTunDevice {
 }
 
 /// Адаптер `AsyncRead + AsyncWrite` поверх виртуального TCP-сокета `smoltcp`.
+type TunReserveFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    tokio::sync::mpsc::OwnedPermit<bytes::Bytes>,
+                    tokio::sync::mpsc::error::SendError<()>,
+                >,
+            > + Send,
+    >,
+>;
+
 pub struct TunStream {
     rx: mpsc::Receiver<Bytes>,
     tx: mpsc::Sender<Bytes>,
     notify: Arc<Notify>,
     peer_closed: Arc<AtomicBool>,
     current: Option<(Bytes, usize)>,
+    reserve_fut: Option<TunReserveFut>,
 }
 
 impl AsyncRead for TunStream {
@@ -189,7 +392,7 @@ impl AsyncRead for TunStream {
 
 impl AsyncWrite for TunStream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -200,6 +403,22 @@ impl AsyncWrite for TunStream {
             return Poll::Ready(Ok(0));
         }
         let take = buf.len().min(32_768);
+        if let Some(mut fut) = self.reserve_fut.take() {
+            match std::future::Future::poll(fut.as_mut(), cx) {
+                Poll::Ready(Ok(permit)) => {
+                    permit.send(Bytes::copy_from_slice(&buf[..take]));
+                    self.notify.notify_one();
+                    return Poll::Ready(Ok(take));
+                }
+                Poll::Ready(Err(_)) => {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+                }
+                Poll::Pending => {
+                    self.reserve_fut = Some(fut);
+                    return Poll::Pending;
+                }
+            }
+        }
         match self.tx.try_send(Bytes::copy_from_slice(&buf[..take])) {
             Ok(()) => {
                 self.notify.notify_one();
@@ -207,13 +426,21 @@ impl AsyncWrite for TunStream {
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.notify.notify_one();
-                let tx = self.tx.clone();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    let _ = tx.reserve().await;
-                    waker.wake();
-                });
-                Poll::Pending
+                let mut fut = Box::pin(self.tx.clone().reserve_owned());
+                match std::future::Future::poll(fut.as_mut(), cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        permit.send(Bytes::copy_from_slice(&buf[..take]));
+                        self.notify.notify_one();
+                        Poll::Ready(Ok(take))
+                    }
+                    Poll::Ready(Err(_)) => {
+                        Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+                    }
+                    Poll::Pending => {
+                        self.reserve_fut = Some(fut);
+                        Poll::Pending
+                    }
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
@@ -320,30 +547,30 @@ fn parse_ip_packet_meta(pkt: &[u8]) -> Option<(u8, SocketAddr, SocketAddr, u8, u
             None
         }
     } else if version == 6 {
-        if pkt.len() < 48 {
+        let (next_hdr, l4_off) = ipv6_payload_offset_proto(pkt)?;
+        if l4_off + 8 > pkt.len() {
             return None;
         }
-        let next_hdr = pkt[6];
         let mut s6 = [0u8; 16];
         let mut d6 = [0u8; 16];
         s6.copy_from_slice(&pkt[8..24]);
         d6.copy_from_slice(&pkt[24..40]);
         let src_ip = IpAddr::V6(Ipv6Addr::from(s6));
         let dst_ip = IpAddr::V6(Ipv6Addr::from(d6));
-        let src_port = u16::from_be_bytes([pkt[40], pkt[41]]);
-        let dst_port = u16::from_be_bytes([pkt[42], pkt[43]]);
+        let src_port = u16::from_be_bytes([pkt[l4_off], pkt[l4_off + 1]]);
+        let dst_port = u16::from_be_bytes([pkt[l4_off + 2], pkt[l4_off + 3]]);
         if next_hdr == 6 {
-            if pkt.len() < 60 {
+            if l4_off + 20 > pkt.len() {
                 return None;
             }
-            let tcp_hdr_len = ((pkt[52] >> 4) as usize) * 4;
-            let flags = pkt[53];
+            let tcp_hdr_len = ((pkt[l4_off + 12] >> 4) as usize) * 4;
+            let flags = pkt[l4_off + 13];
             Some((
                 6,
                 SocketAddr::new(src_ip, src_port),
                 SocketAddr::new(dst_ip, dst_port),
                 flags,
-                40 + tcp_hdr_len,
+                l4_off + tcp_hdr_len,
             ))
         } else if next_hdr == 17 {
             Some((
@@ -351,7 +578,7 @@ fn parse_ip_packet_meta(pkt: &[u8]) -> Option<(u8, SocketAddr, SocketAddr, u8, u
                 SocketAddr::new(src_ip, src_port),
                 SocketAddr::new(dst_ip, dst_port),
                 0,
-                48,
+                l4_off + 8,
             ))
         } else {
             None
@@ -363,86 +590,70 @@ fn parse_ip_packet_meta(pkt: &[u8]) -> Option<(u8, SocketAddr, SocketAddr, u8, u
 
 /// Построить обратный IP + UDP пакет для записи ответа обратно в TUN.
 fn build_tun_udp_response(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let udp_len = (8 + payload.len()) as u16;
-    let mut udp = vec![0u8; 8 + payload.len()];
-    udp[0..2].copy_from_slice(&src.port().to_be_bytes());
-    udp[2..4].copy_from_slice(&dst.port().to_be_bytes());
-    udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
-    udp[8..].copy_from_slice(payload);
-
-    let fold_l4_csum = |mut sum: u32, l4: &[u8]| -> u16 {
-        let (chunks, rem) = l4.as_chunks::<2>();
-        for &c in chunks {
-            sum += u16::from_be_bytes(c) as u32;
-        }
-        if let Some(&last) = rem.first() {
-            sum += u16::from_be_bytes([last, 0]) as u32;
-        }
-        while (sum >> 16) != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        let csum = !(sum as u16);
-        if csum == 0 { 0xFFFF } else { csum }
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
     };
-
+    let udp_repr = UdpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+    };
+    let udp_len = udp_repr.header_len() + payload.len();
+    let caps = ChecksumCapabilities::default();
     match (src.ip(), dst.ip()) {
         (IpAddr::V4(s4), IpAddr::V4(d4)) => {
-            let s_oct = s4.octets();
-            let d_oct = d4.octets();
-            let pseudo_sum = 17u32
-                + (udp.len() as u32)
-                + (u16::from_be_bytes([s_oct[0], s_oct[1]]) as u32)
-                + (u16::from_be_bytes([s_oct[2], s_oct[3]]) as u32)
-                + (u16::from_be_bytes([d_oct[0], d_oct[1]]) as u32)
-                + (u16::from_be_bytes([d_oct[2], d_oct[3]]) as u32);
-            let udp_csum = fold_l4_csum(pseudo_sum, &udp);
-            udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
-
-            let total_len = (20 + udp.len()) as u16;
-            let mut ip = vec![0u8; 20 + udp.len()];
-            ip[0] = 0x45;
-            ip[2..4].copy_from_slice(&total_len.to_be_bytes());
-            ip[4..6].copy_from_slice(&0x2468u16.to_be_bytes());
-            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-            ip[8] = 64;
-            ip[9] = 17; // UDP
-            ip[12..16].copy_from_slice(&s_oct);
-            ip[16..20].copy_from_slice(&d_oct);
-            let mut sum: u32 = 0;
-            for &chunk in ip[..20].as_chunks::<2>().0 {
-                sum += u16::from_be_bytes(chunk) as u32;
+            let ip_repr = Ipv4Repr {
+                src_addr: s4,
+                dst_addr: d4,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_len,
+                hop_limit: 64,
+            };
+            let ip_hdr_len = ip_repr.buffer_len();
+            let mut buf = vec![0u8; ip_hdr_len + udp_len];
+            {
+                let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf[..]);
+                ip_repr.emit(&mut ip_pkt, &caps);
             }
-            while (sum >> 16) != 0 {
-                sum = (sum & 0xFFFF) + (sum >> 16);
+            {
+                let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
+                udp_repr.emit(
+                    &mut udp_pkt,
+                    &IpAddress::Ipv4(s4),
+                    &IpAddress::Ipv4(d4),
+                    payload.len(),
+                    |dst_buf| dst_buf.copy_from_slice(payload),
+                    &caps,
+                );
             }
-            let ip_csum = !(sum as u16);
-            ip[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-            ip[20..].copy_from_slice(&udp);
-            Some(ip)
+            Some(buf)
         }
         (IpAddr::V6(s6), IpAddr::V6(d6)) => {
-            let s_oct = s6.octets();
-            let d_oct = d6.octets();
-            let mut pseudo_sum = 17u32 + (udp.len() as u32);
-            for &c in s_oct.as_chunks::<2>().0 {
-                pseudo_sum += u16::from_be_bytes(c) as u32;
+            let ip_repr = Ipv6Repr {
+                src_addr: s6,
+                dst_addr: d6,
+                next_header: IpProtocol::Udp,
+                payload_len: udp_len,
+                hop_limit: 64,
+            };
+            let ip_hdr_len = ip_repr.buffer_len();
+            let mut buf = vec![0u8; ip_hdr_len + udp_len];
+            {
+                let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf[..]);
+                ip_repr.emit(&mut ip_pkt);
             }
-            for &c in d_oct.as_chunks::<2>().0 {
-                pseudo_sum += u16::from_be_bytes(c) as u32;
+            {
+                let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
+                udp_repr.emit(
+                    &mut udp_pkt,
+                    &IpAddress::Ipv6(s6),
+                    &IpAddress::Ipv6(d6),
+                    payload.len(),
+                    |dst_buf| dst_buf.copy_from_slice(payload),
+                    &caps,
+                );
             }
-            let udp_csum = fold_l4_csum(pseudo_sum, &udp);
-            udp[6..8].copy_from_slice(&udp_csum.to_be_bytes());
-
-            let payload_len = udp.len() as u16;
-            let mut ip = vec![0u8; 40 + udp.len()];
-            ip[0..4].copy_from_slice(&[0x60, 0x00, 0x00, 0x00]);
-            ip[4..6].copy_from_slice(&payload_len.to_be_bytes());
-            ip[6] = 17; // Next Header: UDP
-            ip[7] = 64; // Hop Limit
-            ip[8..24].copy_from_slice(&s_oct);
-            ip[24..40].copy_from_slice(&d_oct);
-            ip[40..].copy_from_slice(&udp);
-            Some(ip)
+            Some(buf)
         }
         _ => None,
     }
@@ -456,17 +667,28 @@ pub async fn run_tun_capture(
     log_fn: LogCallback,
     stop_flag: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let mtu = 1420usize;
+    let mtu = (ACTIVE_TUN_MTU.load(Ordering::Relaxed) as usize).clamp(1280, 9000);
+    let enable_v6 = ACTIVE_TUN_IPV6.load(Ordering::Relaxed);
     let v4_addrs = [(Ipv4Addr::new(172, 19, 0, 1), 30u8)];
-    let v6_addrs: [(Ipv6Addr, u8); 0] = [];
+    let v6_addrs_storage = [(Ipv6Addr::new(0xfd00, 0x172, 0x19, 0, 0, 0, 0, 1), 126u8)];
+    let v6_addrs: &[(Ipv6Addr, u8)] = if enable_v6 { &v6_addrs_storage } else { &[] };
+    let max_tcp_sessions =
+        crate::hardware::HardwareProfile::detect().current_tun_max_tcp_sessions();
 
-    let platform_dev = PlatformTunHandle::open(interface_name, mtu, &v4_addrs, &v6_addrs, true)?;
+    let platform_dev = PlatformTunHandle::open(interface_name, mtu, &v4_addrs, v6_addrs, true)?;
+    let cc_mode = active_tcp_congestion_mode();
     (log_fn)(
         "info",
         "tun",
         &format!(
-            "Системный интерфейс TUN «{}» активирован (MTU {mtu}, адрес 172.19.0.1/30)",
-            platform_dev.name()
+            "Системный интерфейс TUN «{}» активирован (MTU {mtu}, IPv4 172.19.0.1/30{}, CC={}, макс. сессий TCP={max_tcp_sessions})",
+            platform_dev.name(),
+            if enable_v6 {
+                ", IPv6 fd00:172:19::1/126"
+            } else {
+                ""
+            },
+            cc_mode.as_str(),
         ),
     );
 
@@ -489,7 +711,8 @@ pub async fn run_tun_capture(
 
     let mut sockets = SocketSet::new(Vec::new());
     let mut tcp_sessions: HashMap<(SocketAddr, SocketAddr), TunTcpSession> = HashMap::new();
-    let mut udp_sessions: HashMap<(SocketAddr, SocketAddr), Instant> = HashMap::new();
+    let mut udp_sessions: lru::LruCache<(SocketAddr, SocketAddr), Instant> =
+        lru::LruCache::new(std::num::NonZeroUsize::new(MAX_UDP_SESSIONS).unwrap());
     let udp_nat: TunUdpNatTable = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let udp_permits = Arc::new(tokio::sync::Semaphore::new(512));
     let notify = Arc::new(Notify::new());
@@ -526,7 +749,10 @@ pub async fn run_tun_capture(
                         if proto == 6 {
                             // TCP-пакет
                             let is_syn = (flags & 0x02) != 0 && (flags & 0x10) == 0;
-                            if is_syn && !tcp_sessions.contains_key(&(src, dst)) && tcp_sessions.len() < MAX_TCP_SESSIONS {
+                            if is_syn
+                                && !tcp_sessions.contains_key(&(src, dst))
+                                && tcp_sessions.len() < max_tcp_sessions
+                            {
                                 spawn_tun_tcp_session(
                                     src,
                                     dst,
@@ -547,11 +773,10 @@ pub async fn run_tun_capture(
                                 continue;
                             };
                             let udp_payload = pkt[payload_off..].to_vec();
-                            if udp_sessions.len() > MAX_UDP_SESSIONS {
-                                udp_sessions.retain(|_, ts| ts.elapsed() < Duration::from_secs(60));
-                            }
-                            let is_first_udp = !udp_sessions.contains_key(&(src, dst));
-                            udp_sessions.insert((src, dst), Instant::now());
+                            let is_first_udp = udp_sessions
+                                .get(&(src, dst))
+                                .is_none_or(|ts| ts.elapsed() >= Duration::from_secs(60));
+                            udp_sessions.put((src, dst), Instant::now());
 
                             let matcher_snap = matcher.read().await.clone();
                             let udp_nat_clone = udp_nat.clone();
@@ -588,6 +813,16 @@ pub async fn run_tun_capture(
     Ok(())
 }
 
+#[inline]
+fn active_smoltcp_congestion_control() -> SmolCongestionControl {
+    match active_tcp_congestion_mode() {
+        TcpCongestionMode::Bbr => SmolCongestionControl::Bbr,
+        TcpCongestionMode::Cubic => SmolCongestionControl::Cubic,
+        TcpCongestionMode::Reno => SmolCongestionControl::Reno,
+        TcpCongestionMode::None => SmolCongestionControl::None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_tun_tcp_session(
     src: SocketAddr,
@@ -599,11 +834,36 @@ fn spawn_tun_tcp_session(
     counters: &Arc<TrafficCounters>,
     log_fn: &LogCallback,
 ) {
-    let rx_buf = TcpSocketBuffer::new(vec![0u8; 65536]);
-    let tx_buf = TcpSocketBuffer::new(vec![0u8; 65536]);
+    let init_buf = crate::hardware::smol_tcp_init_buf();
+    let active_streams = sessions
+        .values()
+        .filter(|s| {
+            !s.app_closed
+                && !s.peer_closed.load(Ordering::Relaxed)
+                && s.to_app.as_ref().is_some_and(|tx| !tx.is_closed())
+        })
+        .count();
+    let max_buf = crate::hardware::smol_tcp_fair_max_buf(active_streams + 1);
+    if active_streams >= 1 {
+        for s in sessions.values().filter(|s| {
+            !s.app_closed
+                && !s.peer_closed.load(Ordering::Relaxed)
+                && s.to_app.as_ref().is_some_and(|tx| !tx.is_closed())
+        }) {
+            sockets
+                .get_mut::<TcpSocket>(s.handle)
+                .set_auto_tune_max(max_buf);
+        }
+    }
+
+    let rx_buf = TcpSocketBuffer::new(vec![0u8; init_buf]);
+    let tx_buf = TcpSocketBuffer::new(vec![0u8; init_buf]);
     let mut sock = TcpSocket::new(rx_buf, tx_buf);
+    sock.set_auto_tune_max(max_buf);
+    sock.set_congestion_control(active_smoltcp_congestion_control());
     sock.set_nagle_enabled(false);
     sock.set_ack_delay(None);
+    sock.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
 
     if sock.listen(dst).is_ok() {
         let handle = sockets.add(sock);
@@ -617,6 +877,7 @@ fn spawn_tun_tcp_session(
             notify: notify.clone(),
             peer_closed: peer_closed.clone(),
             current: None,
+            reserve_fut: None,
         };
 
         let matcher_lock = matcher.clone();
@@ -662,10 +923,6 @@ async fn handle_tun_tcp_stream(
     log_fn: LogCallback,
 ) -> io::Result<()> {
     let app_name = crate::apps::resolve_socket_process_name(src_port, false);
-    let app_tag = app_name
-        .as_deref()
-        .map(|a| format!(" [{a}]"))
-        .unwrap_or_default();
 
     let mut first_pkt = vec![0u8; 16384];
     match tokio::time::timeout(Duration::from_millis(500), client.read(&mut first_pkt)).await {
@@ -697,211 +954,33 @@ async fn handle_tun_tcp_stream(
         false,
         app_name.as_deref(),
     );
-    let display_target = sni_host
-        .clone()
-        .unwrap_or_else(|| dst_addr.ip().to_string());
-
-    counters.total_connections.fetch_add(1, Ordering::Relaxed);
-    counters.active_connections.fetch_add(1, Ordering::Relaxed);
-
-    let t0 = Instant::now();
-    let res = match decision {
-        MatchDecision::Block { reason } => {
-            let _flow = crate::flows::register_flow(
-                "TCP",
-                app_name.as_deref(),
-                sni_host.as_deref(),
-                dst_addr,
-                "Block".to_string(),
-                false,
-                false,
-            );
-            (log_fn)(
-                "warn",
-                "block",
-                &format!(
-                    "TUN{app_tag} {display_target}:{} — {reason}",
-                    dst_addr.port()
-                ),
-            );
-            Ok(())
-        }
-        MatchDecision::Direct { matched_list } => {
-            let list_tag = matched_list.unwrap_or_else(|| "Прямое".to_string());
-            let flow = crate::flows::register_flow(
-                "TCP",
-                app_name.as_deref(),
-                sni_host.as_deref(),
-                dst_addr,
-                format!("Direct ({list_tag})"),
-                false,
-                true,
-            );
-            let mut remote = connect_outbound_tcp(dst_addr, Duration::from_secs(6)).await?;
-            if !first_pkt.is_empty() {
-                remote.write_all(&first_pkt).await?;
-                let n = first_pkt.len() as u64;
-                counters.tx_bytes.fetch_add(n, Ordering::Relaxed);
-                flow.record.add_tx(n);
-            }
-            (log_fn)(
-                "info",
-                "direct",
-                &format!(
-                    "TUN{app_tag} {display_target}:{} -> Прямое ({list_tag})",
-                    dst_addr.port()
-                ),
-            );
-            let _ = crate::flows::copy_bidirectional_live(
-                &mut client,
-                &mut remote,
-                &counters,
-                &flow.record,
-            )
-            .await?;
-            Ok(())
-        }
-        MatchDecision::UpstreamProxy {
-            proxy_url,
-            matched_list,
-        } => {
-            let flow = crate::flows::register_flow(
-                "TCP",
-                app_name.as_deref(),
-                sni_host.as_deref(),
-                dst_addr,
-                format!("Upstream ({matched_list})"),
-                true,
-                true,
-            );
-            let mut remote =
-                connect_via_upstream_proxy(&proxy_url, dst_addr, sni_host.as_deref(), &first_pkt)
-                    .await?;
-            if !first_pkt.is_empty() {
-                let n = first_pkt.len() as u64;
-                counters.tx_bytes.fetch_add(n, Ordering::Relaxed);
-                flow.record.add_tx(n);
-            }
-            (log_fn)(
-                "info",
-                "proxy",
-                &format!(
-                    "TUN{app_tag} {display_target}:{} -> Внешний прокси {proxy_url} [{matched_list}]",
-                    dst_addr.port()
-                ),
-            );
-            let _ = crate::flows::copy_bidirectional_live(
-                &mut client,
-                &mut remote,
-                &counters,
-                &flow.record,
-            )
-            .await?;
-            Ok(())
-        }
-        MatchDecision::Desync {
-            config,
-            matched_list,
-        } => {
-            counters
-                .desynced_connections
-                .fetch_add(1, Ordering::Relaxed);
-            let (mut remote, pre_read, used_recipe, resolved_host) =
-                connect_and_apply_desync_auto(dst_addr, &first_pkt, &config, sni_host.as_deref())
-                    .await?;
-            let strategy_code = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].0
-            } else {
-                "custom"
-            };
-            let flow = crate::flows::register_flow(
-                "TCP",
-                app_name.as_deref(),
-                sni_host.as_deref(),
-                dst_addr,
-                format!("Desync [{strategy_code}]"),
-                true,
-                true,
-            );
-            let first_n = first_pkt.len() as u64;
-            counters.tx_bytes.fetch_add(first_n, Ordering::Relaxed);
-            flow.record.add_tx(first_n);
-
-            let strategy_label = if let Some(r_idx) = used_recipe {
-                RECIPE_TITLES[(r_idx as usize).min(RECIPE_TITLES.len() - 1)].1
-            } else {
-                "Профиль"
-            };
-            (log_fn)(
-                "info",
-                "desync",
-                &format!(
-                    "TUN{app_tag} {display_target}:{} -> [{matched_list}] {strategy_label}",
-                    dst_addr.port()
-                ),
-            );
-
-            let mut total_rx = 0u64;
-            if !pre_read.is_empty() {
-                client.write_all(&pre_read).await?;
-                let nr = pre_read.len() as u64;
-                total_rx += nr;
-                counters.rx_bytes.fetch_add(nr, Ordering::Relaxed);
-                flow.record.add_rx(nr);
-            }
-            let target_host = resolved_host.as_deref().or(sni_host.as_deref());
-            let relay_res = crate::flows::copy_bidirectional_desync_live(
-                &mut client,
-                &mut remote,
-                &counters,
-                &flow.record,
-                target_host,
-                Some(dst_addr),
-                total_rx,
-                !first_pkt.is_empty(),
-                config.auto,
-                t0,
-            )
-            .await;
-            let (relayed_up, relayed_down, report_elapsed_ms) = match &relay_res {
-                Ok((u, d, act_ms)) => (*u, *d, *act_ms),
-                Err(_) => (
-                    flow.record
-                        .tx_bytes
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(first_n),
-                    flow.record
-                        .rx_bytes
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(total_rx),
-                    t0.elapsed().as_millis() as u64,
-                ),
-            };
-            total_rx = total_rx.saturating_add(relayed_down);
-            if config.auto {
-                report_transfer_outcome(
-                    target_host,
-                    Some(dst_addr),
-                    total_rx,
-                    relayed_up,
-                    relayed_down,
-                    report_elapsed_ms,
-                    relay_res.is_ok(),
-                );
-            }
-            relay_res.map(|_| ())
-        }
-    };
-
-    counters.active_connections.fetch_sub(1, Ordering::Relaxed);
-    res
+    crate::proxy::execute_tcp_decision(
+        client, dst_addr, first_pkt, sni_host, app_name, decision, "TUN", counters, log_fn,
+    )
+    .await
 }
+
+static TUN_NAT_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+#[inline]
+fn nat_now_ms() -> u64 {
+    TUN_NAT_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+const UDP_NAT_IDLE_MS: u64 = 60_000;
+const UDP_NAT_MAX_ENTRIES: usize = 1024;
+
+type AdaptiveUdpPeersMap = HashMap<SocketAddr, (u64, bool, Option<String>)>;
 
 #[derive(Clone)]
 struct TunUdpNatEntry {
     sock: Arc<UdpSocket>,
-    /// Отслеживаемые адаптивные UDP-узлы: `peer -> (rx_bytes, reported_ok)`
-    adaptive_peers: Arc<std::sync::Mutex<HashMap<SocketAddr, (u64, bool)>>>,
+    /// Отслеживаемые адаптивные UDP-узлы: `peer -> (rx_bytes, reported_ok, host_opt)`
+    adaptive_peers: Arc<std::sync::Mutex<AdaptiveUdpPeersMap>>,
+    last_active_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 type TunUdpNatTable = Arc<std::sync::Mutex<HashMap<(SocketAddr, bool), TunUdpNatEntry>>>;
@@ -923,55 +1002,90 @@ fn emit_tun_icmp_port_unreachable(
 async fn get_or_create_udp_nat_socket(
     src: SocketAddr,
     is_ipv6: bool,
-    track_adaptive_dst: Option<SocketAddr>,
+    track_adaptive_target: Option<(SocketAddr, Option<String>)>,
     udp_nat: &TunUdpNatTable,
     tun_tx: &mpsc::Sender<Vec<u8>>,
     counters: &Arc<TrafficCounters>,
 ) -> io::Result<Arc<UdpSocket>> {
-    if let Ok(guard) = udp_nat.lock()
-        && let Some(existing) = guard.get(&(src, is_ipv6))
-    {
-        if let Some(dst) = track_adaptive_dst
-            && let Ok(mut peers) = existing.adaptive_peers.lock()
-            && peers.len() < 32
-        {
-            peers.entry(dst).or_insert((0, false));
+    let now_ms = nat_now_ms();
+    if let Ok(mut guard) = udp_nat.lock() {
+        if let Some(existing) = guard.get(&(src, is_ipv6)) {
+            existing.last_active_ms.store(now_ms, Ordering::Relaxed);
+            if let Some((dst, ref host)) = track_adaptive_target
+                && let Ok(mut peers) = existing.adaptive_peers.lock()
+                && peers.len() < 32
+            {
+                let entry = peers.entry(dst).or_insert((0, false, None));
+                if entry.2.is_none() && host.is_some() {
+                    entry.2 = host.clone();
+                }
+            }
+            return Ok(existing.sock.clone());
         }
-        return Ok(existing.sock.clone());
+        guard.retain(|_, entry| {
+            now_ms.saturating_sub(entry.last_active_ms.load(Ordering::Relaxed)) <= UDP_NAT_IDLE_MS
+        });
+        if guard.len() >= UDP_NAT_MAX_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "UDP NAT table full",
+            ));
+        }
     }
 
     let sock = Arc::new(bind_and_connect_udp(is_ipv6).await?);
     let adaptive_peers = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    if let Some(dst) = track_adaptive_dst
+    if let Some((dst, ref host)) = track_adaptive_target
         && let Ok(mut peers) = adaptive_peers.lock()
     {
-        peers.insert(dst, (0, false));
+        peers.insert(dst, (0, false, host.clone()));
     }
+    let last_active_ms = Arc::new(std::sync::atomic::AtomicU64::new(nat_now_ms()));
 
-    if let Ok(mut guard) = udp_nat.lock() {
-        if let Some(existing) = guard.get(&(src, is_ipv6)) {
-            if let Some(dst) = track_adaptive_dst
-                && let Ok(mut peers) = existing.adaptive_peers.lock()
-                && peers.len() < 32
-            {
-                peers.entry(dst).or_insert((0, false));
+    match udp_nat.lock() {
+        Ok(mut guard) => {
+            let now_ms = nat_now_ms();
+            if let Some(existing) = guard.get(&(src, is_ipv6)) {
+                existing.last_active_ms.store(now_ms, Ordering::Relaxed);
+                if let Some((dst, host)) = track_adaptive_target
+                    && let Ok(mut peers) = existing.adaptive_peers.lock()
+                    && peers.len() < 32
+                {
+                    let entry = peers.entry(dst).or_insert((0, false, None));
+                    if entry.2.is_none() && host.is_some() {
+                        entry.2 = host;
+                    }
+                }
+                return Ok(existing.sock.clone());
             }
-            return Ok(existing.sock.clone());
-        }
-        if guard.len() < 1024 {
+            guard.retain(|_, entry| {
+                now_ms.saturating_sub(entry.last_active_ms.load(Ordering::Relaxed))
+                    <= UDP_NAT_IDLE_MS
+            });
+            if guard.len() >= UDP_NAT_MAX_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "UDP NAT table full",
+                ));
+            }
             guard.insert(
                 (src, is_ipv6),
                 TunUdpNatEntry {
                     sock: sock.clone(),
                     adaptive_peers: adaptive_peers.clone(),
+                    last_active_ms: last_active_ms.clone(),
                 },
             );
+        }
+        Err(_) => {
+            return Err(io::Error::other("UDP NAT table lock poisoned"));
         }
     }
 
     let sock_reader = sock.clone();
     let nat_reader = udp_nat.clone();
     let peers_reader = adaptive_peers;
+    let last_active_reader = last_active_ms;
     let tun_tx_reader = tun_tx.clone();
     let counters_reader = counters.clone();
     tokio::spawn(async move {
@@ -982,16 +1096,17 @@ async fn get_or_create_udp_nat_socket(
                 recv_res = tokio::time::timeout(Duration::from_secs(60), sock_reader.recv_from(&mut rbuf)) => {
                     match recv_res {
                         Ok(Ok((n, peer))) if n > 0 => {
+                            last_active_reader.store(nat_now_ms(), Ordering::Relaxed);
                             counters_reader
                                 .rx_bytes
                                 .fetch_add(n as u64, Ordering::Relaxed);
-                            let mut should_promote = false;
+                            let mut promote_host: Option<Option<String>> = None;
                             if let Ok(mut peers) = peers_reader.lock()
-                                && let Some((rx_sum, reported)) = peers.get_mut(&peer)
+                                && let Some((rx_sum, reported, host_opt)) = peers.get_mut(&peer)
                             {
                                 *rx_sum = rx_sum.saturating_add(n as u64);
-                                // Для UDP 443 (QUIC) закрепляем рецепт только после 256 КиБ (DESYNC_LIVE_PROMOTE_BYTES),
-                                // как в tachyon-core 0.5.0, чтобы 16 KB QUIC cap не фиксировал мёртвый QUIC-узел как живой.
+                                // Для UDP 443 (QUIC) закрепляем рецепт только после 256 КиБ (`DESYNC_LIVE_PROMOTE_BYTES`),
+                                // чтобы 16 KB QUIC cap не фиксировал мёртвый QUIC-узел как живой.
                                 let promote_gate = if peer.port() == 443 {
                                     crate::desync::DESYNC_LIVE_PROMOTE_BYTES
                                 } else {
@@ -999,11 +1114,11 @@ async fn get_or_create_udp_nat_socket(
                                 };
                                 if !*reported && *rx_sum >= promote_gate {
                                     *reported = true;
-                                    should_promote = true;
+                                    promote_host = Some(host_opt.clone());
                                 }
                             }
-                            if should_promote {
-                                report_udp_quic_outcome(peer, true);
+                            if let Some(host_opt) = promote_host {
+                                report_udp_quic_outcome_with_host(Some(peer), host_opt.as_deref(), true);
                             }
                             if let Some(ip_pkt) = build_tun_udp_response(peer, src, &rbuf[..n]) {
                                 let _ = tun_tx_reader.send(ip_pkt).await;
@@ -1017,13 +1132,16 @@ async fn get_or_create_udp_nat_socket(
         if !tun_tx_reader.is_closed()
             && let Ok(peers) = peers_reader.lock()
         {
-            for (&peer, &(rx_sum, reported)) in peers.iter() {
-                if !reported && rx_sum == 0 {
-                    report_udp_quic_outcome(peer, false);
+            for (&peer, (rx_sum, reported, host_opt)) in peers.iter() {
+                if !*reported && *rx_sum == 0 {
+                    report_udp_quic_outcome_with_host(Some(peer), host_opt.as_deref(), false);
                 }
             }
         }
-        if let Ok(mut guard) = nat_reader.lock() {
+        if let Ok(mut guard) = nat_reader.lock()
+            && let Some(entry) = guard.get(&(src, is_ipv6))
+            && Arc::ptr_eq(&entry.sock, &sock_reader)
+        {
             guard.remove(&(src, is_ipv6));
         }
     });
@@ -1113,13 +1231,15 @@ async fn handle_tun_udp_datagram(
             matched_list,
         } => {
             if dst.port() == 443
-                && ((config.block_quic && payload.len() >= 120 && (payload[0] & 0x80) != 0)
-                    || (config.auto && crate::desync::is_quic_endpoint_dead(dst)))
+                && ((config.block_quic && is_quic_long_header(&payload))
+                    || (config.auto
+                        && ACTIVE_QUIC_FAST_FAILOVER.load(Ordering::Relaxed)
+                        && is_quic_dead_for_target(Some(dst), udp_host.as_deref())))
             {
                 emit_tun_icmp_port_unreachable(&tun_tx, dst, src, &payload);
                 return;
             }
-            let track_dst = config.auto.then_some(dst);
+            let track_dst = config.auto.then(|| (dst, udp_host.clone()));
             if let Ok(sock) = get_or_create_udp_nat_socket(
                 src,
                 dst.is_ipv6(),
@@ -1131,25 +1251,52 @@ async fn handle_tun_udp_datagram(
             .await
             {
                 if is_first {
+                    let quic_mode = dst.port() == 443 && config.quic_desync && !config.block_quic;
+                    let quic_rep = if config.quic_repeats > 0 {
+                        config.quic_repeats
+                    } else if config.udp_repeats > 0 {
+                        config.udp_repeats
+                    } else {
+                        4
+                    }
+                    .clamp(1, 20);
                     let fg = crate::flows::register_flow(
                         "UDP",
                         app_name.as_deref(),
                         udp_host.as_deref(),
                         dst,
-                        format!("UDP Fake x{}", config.udp_repeats),
+                        if quic_mode {
+                            format!("QUIC Desync x{quic_rep}")
+                        } else {
+                            format!("UDP Fake x{}", config.udp_repeats)
+                        },
                         true,
                         true,
                     );
                     fg.record.add_tx(payload.len() as u64);
-                    (log_fn)(
-                        "info",
-                        "udp_desync",
-                        &format!(
-                            "UDP{app_tag} {dst} -> [{matched_list}] фейков: {}, TTL={}",
-                            config.udp_repeats, config.udp_fake_ttl
-                        ),
-                    );
-                    let _ = send_udp_fakes_same_tuple(&sock, dst, &config).await;
+                    if quic_mode || (dst.port() != 443 && config.udp_fake && config.udp_repeats > 0)
+                    {
+                        let shown_rep = if quic_mode {
+                            quic_rep
+                        } else {
+                            config.udp_repeats
+                        };
+                        (log_fn)(
+                            "info",
+                            "udp_desync",
+                            &format!(
+                                "UDP{app_tag} {dst} -> [{matched_list}] фейков: {shown_rep}, TTL={}",
+                                config.udp_fake_ttl
+                            ),
+                        );
+                        let _ = send_udp_fakes_same_tuple_with_host(
+                            &sock,
+                            dst,
+                            udp_host.as_deref(),
+                            &config,
+                        )
+                        .await;
+                    }
                 }
                 if sock.send_to(&payload, dst).await.is_ok() {
                     counters
@@ -1367,7 +1514,7 @@ impl PlatformTunHandle {
 mod linux_tun {
     use std::io;
     use std::net::Ipv4Addr;
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use tokio::io::unix::AsyncFd;
 
     const IFF_TUN: libc::c_short = 0x0001;
@@ -1382,7 +1529,7 @@ mod linux_tun {
     }
 
     pub struct LinuxTunDevice {
-        async_fd: AsyncFd<RawFd>,
+        async_fd: AsyncFd<OwnedFd>,
         name: String,
         auto_route: bool,
     }
@@ -1394,11 +1541,12 @@ mod linux_tun {
             v4_addrs: &[(Ipv4Addr, u8)],
             auto_route: bool,
         ) -> io::Result<Self> {
-            let fd =
+            let raw_fd =
                 unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-            if fd < 0 {
+            if raw_fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
             let mut ifr = IfReq {
                 ifr_name: [0; libc::IFNAMSIZ],
                 ifr_flags: IFF_TUN | IFF_NO_PI,
@@ -1407,10 +1555,8 @@ mod linux_tun {
             for (i, b) in name.bytes().take(libc::IFNAMSIZ - 1).enumerate() {
                 ifr.ifr_name[i] = b as libc::c_char;
             }
-            if unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut ifr) } < 0 {
-                let err = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(err);
+            if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &mut ifr) } < 0 {
+                return Err(io::Error::last_os_error());
             }
 
             let _ = std::process::Command::new("ip")
@@ -1421,13 +1567,7 @@ mod linux_tun {
                     .args(["addr", "add", &format!("{ip}/{prefix}"), "dev", name])
                     .status();
             }
-            let async_fd = match AsyncFd::new(fd) {
-                Ok(afd) => afd,
-                Err(err) => {
-                    unsafe { libc::close(fd) };
-                    return Err(err);
-                }
-            };
+            let async_fd = unsafe { AsyncFd::register(fd) }?;
             if auto_route {
                 crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE
                     .store(1, std::sync::atomic::Ordering::Release);
@@ -1576,10 +1716,6 @@ mod linux_tun {
                     .args(["route", "flush", "table", "2022"])
                     .status();
             }
-            let raw_fd = *self.async_fd.get_ref();
-            unsafe {
-                libc::close(raw_fd);
-            }
         }
     }
 }
@@ -1590,7 +1726,7 @@ mod macos_tun {
     use std::ffi::CString;
     use std::io;
     use std::net::Ipv4Addr;
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::Ordering;
     use tokio::io::unix::AsyncFd;
 
@@ -1617,7 +1753,7 @@ mod macos_tun {
     }
 
     pub struct MacosTunDevice {
-        async_fd: AsyncFd<RawFd>,
+        async_fd: AsyncFd<OwnedFd>,
         name: String,
         auto_route: bool,
     }
@@ -1648,20 +1784,19 @@ mod macos_tun {
                 MACOS_OUTBOUND_IF_INDEX.store(idx, Ordering::Release);
             }
 
-            let fd = unsafe { libc::socket(PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
-            if fd < 0 {
+            let raw_fd = unsafe { libc::socket(PF_SYSTEM, libc::SOCK_DGRAM, SYSPROTO_CONTROL) };
+            if raw_fd < 0 {
                 return Err(io::Error::last_os_error());
             }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
             let mut info = CtlInfo {
                 ctl_id: 0,
                 ctl_name: [0u8; 96],
             };
             info.ctl_name[..UTUN_CONTROL_NAME.len()].copy_from_slice(UTUN_CONTROL_NAME);
-            if unsafe { libc::ioctl(fd, CTLIOCGINFO as _, &mut info) } < 0 {
-                let err = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(err);
+            if unsafe { libc::ioctl(fd.as_raw_fd(), CTLIOCGINFO as _, &mut info) } < 0 {
+                return Err(io::Error::last_os_error());
             }
 
             let mut connected_unit = None;
@@ -1676,7 +1811,7 @@ mod macos_tun {
                 };
                 let rc = unsafe {
                     libc::connect(
-                        fd,
+                        fd.as_raw_fd(),
                         &addr as *const _ as *const libc::sockaddr,
                         std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
                     )
@@ -1688,15 +1823,13 @@ mod macos_tun {
             }
 
             let Some(unit_idx) = connected_unit else {
-                let err = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(err);
+                return Err(io::Error::last_os_error());
             };
 
             unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0);
                 if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
                 }
             }
 
@@ -1725,7 +1858,7 @@ mod macos_tun {
                     .status();
             }
 
-            let async_fd = AsyncFd::new(fd)?;
+            let async_fd = unsafe { AsyncFd::register(fd) }?;
             Ok(Self {
                 async_fd,
                 name: if_name,
@@ -1824,10 +1957,6 @@ mod macos_tun {
                         &self.name,
                     ])
                     .status();
-            }
-            let raw_fd = *self.async_fd.get_ref();
-            unsafe {
-                libc::close(raw_fd);
             }
         }
     }
@@ -3240,6 +3369,54 @@ mod windows_tun {
                     return Err(io::Error::last_os_error());
                 }
 
+                struct WinTunOpenGuard {
+                    stop_event: usize,
+                    effective_name: String,
+                    routes_added_v4: Option<Ipv4Addr>,
+                    armed: bool,
+                }
+
+                impl Drop for WinTunOpenGuard {
+                    fn drop(&mut self) {
+                        if !self.armed {
+                            return;
+                        }
+                        if let Some(gw) = self.routes_added_v4 {
+                            let gw_str = gw.to_string();
+                            run_netsh(&[
+                                "interface",
+                                "ipv4",
+                                "delete",
+                                "route",
+                                "0.0.0.0/1",
+                                &self.effective_name,
+                                &gw_str,
+                            ]);
+                            run_netsh(&[
+                                "interface",
+                                "ipv4",
+                                "delete",
+                                "route",
+                                "128.0.0.0/1",
+                                &self.effective_name,
+                                &gw_str,
+                            ]);
+                        }
+                        if self.stop_event != 0 {
+                            unsafe {
+                                CloseHandle(self.stop_event as Handle);
+                            }
+                        }
+                    }
+                }
+
+                let mut open_guard = WinTunOpenGuard {
+                    stop_event: stop_event as usize,
+                    effective_name: effective_name.clone(),
+                    routes_added_v4: None,
+                    armed: true,
+                };
+
                 let mut ipv4_gw = None;
                 if let Some(&(ip, prefix)) = v4_addrs.first() {
                     let mask = prefix_to_ipv4_netmask(prefix);
@@ -3267,6 +3444,7 @@ mod windows_tun {
                 ]);
 
                 if auto_route && let Some(gw) = ipv4_gw {
+                    open_guard.routes_added_v4 = Some(gw);
                     let gw_str = gw.to_string();
                     run_netsh(&[
                         "interface",
@@ -3320,6 +3498,8 @@ mod windows_tun {
                         }
                     })?;
 
+                open_guard.armed = false;
+
                 Ok(Self {
                     session,
                     _adapter: adapter,
@@ -3362,6 +3542,7 @@ mod windows_tun {
 
     impl Drop for WinTunDevice {
         fn drop(&mut self) {
+            self.rx_rx.get_mut().close();
             unsafe {
                 SetEvent(self.stop_event as Handle);
             }
@@ -3407,5 +3588,196 @@ mod windows_tun {
                 CloseHandle(self.stop_event as Handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tun_stream_poll_write_completes_under_saturation() {
+        let (_to_app_tx, to_app_rx) = mpsc::channel(1);
+        let (from_app_tx, mut from_app_rx) = mpsc::channel(1);
+        from_app_tx
+            .try_send(Bytes::from_static(b"prefill"))
+            .expect("initial slot available");
+
+        let notify = Arc::new(Notify::new());
+        let mut stream = TunStream {
+            rx: to_app_rx,
+            tx: from_app_tx,
+            notify: notify.clone(),
+            peer_closed: Arc::new(AtomicBool::new(false)),
+            current: None,
+            reserve_fut: None,
+        };
+
+        let drainer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let first = from_app_rx.recv().await.expect("prefill packet");
+            tokio::task::yield_now().await;
+            let second = from_app_rx.recv().await.expect("second packet");
+            (first, second)
+        });
+
+        stream
+            .write_all(b"hello world")
+            .await
+            .expect("write_all under saturated channel must wake via reserve_owned");
+        assert!(stream.reserve_fut.is_none());
+
+        let (first, second) = drainer.await.expect("drainer task");
+        assert_eq!(&first[..], b"prefill");
+        assert_eq!(&second[..], b"hello world");
+    }
+
+    #[test]
+    fn build_tun_udp_response_ipv4_and_ipv6_valid_checksums() {
+        use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
+
+        let payload = b"\x01\x02hello-quic\xff";
+        let src4: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let dst4: SocketAddr = "10.0.0.2:54321".parse().unwrap();
+        let raw4 = build_tun_udp_response(src4, dst4, payload).expect("ipv4 udp packet");
+        let ip4 = Ipv4Packet::new_checked(&raw4[..]).expect("valid ipv4 packet");
+        assert!(ip4.verify_checksum());
+        assert_eq!(ip4.next_header(), IpProtocol::Udp);
+        assert_eq!(ip4.hop_limit(), 64);
+        let udp4 = UdpPacket::new_checked(ip4.payload()).expect("valid udp4 packet");
+        assert!(udp4.verify_checksum(
+            &IpAddress::Ipv4("1.1.1.1".parse().unwrap()),
+            &IpAddress::Ipv4("10.0.0.2".parse().unwrap()),
+        ));
+        assert_eq!(udp4.src_port(), 53);
+        assert_eq!(udp4.dst_port(), 54321);
+        assert_eq!(udp4.payload(), payload);
+
+        let src6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let dst6: SocketAddr = "[fd00::2]:40000".parse().unwrap();
+        let raw6 = build_tun_udp_response(src6, dst6, payload).expect("ipv6 udp packet");
+        let ip6 = Ipv6Packet::new_checked(&raw6[..]).expect("valid ipv6 packet");
+        assert_eq!(ip6.next_header(), IpProtocol::Udp);
+        assert_eq!(ip6.hop_limit(), 64);
+        let udp6 = UdpPacket::new_checked(ip6.payload()).expect("valid udp6 packet");
+        assert!(udp6.verify_checksum(
+            &IpAddress::Ipv6("2606:4700:4700::1111".parse().unwrap()),
+            &IpAddress::Ipv6("fd00::2".parse().unwrap()),
+        ));
+        assert_eq!(udp6.src_port(), 443);
+        assert_eq!(udp6.dst_port(), 40000);
+        assert_eq!(udp6.payload(), payload);
+
+        assert!(build_tun_udp_response(src4, dst6, payload).is_none());
+    }
+
+    #[test]
+    fn ipv6_ext_headers_and_mss_clamp_and_smoltcp_bbr() {
+        use smoltcp::wire::{
+            IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr, TcpPacket, TcpRepr, TcpSeqNumber,
+        };
+
+        // 1. Тест MssClamp на IPv4 + пересчёт TCP чексуммы (RFC 1624)
+        let mut syn4 = vec![0u8; 44];
+        syn4[0] = 0x45;
+        syn4[2..4].copy_from_slice(&44u16.to_be_bytes());
+        syn4[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        syn4[8] = 64;
+        syn4[9] = 6;
+        syn4[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        syn4[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        syn4[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        syn4[22..24].copy_from_slice(&443u16.to_be_bytes());
+        syn4[32] = 0x60; // 24 bytes TCP hdr
+        syn4[33] = 0x02; // SYN
+        syn4[40] = 0x02;
+        syn4[41] = 0x04;
+        syn4[42..44].copy_from_slice(&1460u16.to_be_bytes());
+        {
+            let mut tcp = TcpPacket::new_unchecked(&mut syn4[20..44]);
+            tcp.fill_checksum(
+                &IpAddress::Ipv4("10.0.0.2".parse().unwrap()),
+                &IpAddress::Ipv4("1.1.1.1".parse().unwrap()),
+            );
+        }
+        let clamp = MssClamp::for_mtu(1420);
+        assert!(clamp.apply_in_place(&mut syn4));
+        assert_eq!(u16::from_be_bytes([syn4[42], syn4[43]]), 1380);
+        let tcp_checked = TcpPacket::new_checked(&syn4[20..44]).unwrap();
+        assert!(tcp_checked.verify_checksum(
+            &IpAddress::Ipv4("10.0.0.2".parse().unwrap()),
+            &IpAddress::Ipv4("1.1.1.1".parse().unwrap()),
+        ));
+
+        // 2. Тест IPv6 с Hop-by-Hop заголовком (next=0) + MssClamp (1420 - 60 = 1360)
+        let mut syn6 = vec![0u8; 40 + 8 + 24];
+        let v6_src: Ipv6Addr = "fd00::2".parse().unwrap();
+        let v6_dst: Ipv6Addr = "2606:4700::1".parse().unwrap();
+        let ip6_repr = Ipv6Repr {
+            src_addr: v6_src,
+            dst_addr: v6_dst,
+            next_header: IpProtocol::HopByHop,
+            payload_len: 32,
+            hop_limit: 64,
+        };
+        {
+            let mut p = Ipv6Packet::new_unchecked(&mut syn6[..40]);
+            ip6_repr.emit(&mut p);
+        }
+        // Hop-by-Hop (8 bytes) -> Next Header = TCP (6)
+        syn6[40] = 6;
+        syn6[41] = 0;
+        let tcp_repr = TcpRepr {
+            src_port: 50000,
+            dst_port: 443,
+            control: smoltcp::wire::TcpControl::Syn,
+            seq_number: TcpSeqNumber(1),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1440),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        {
+            let mut tcp = TcpPacket::new_unchecked(&mut syn6[48..]);
+            tcp_repr.emit(
+                &mut tcp,
+                &IpAddress::Ipv6(v6_src),
+                &IpAddress::Ipv6(v6_dst),
+                &smoltcp::phy::ChecksumCapabilities::default(),
+            );
+        }
+        let (proto, src, dst, flags, l4_off) = parse_ip_packet_meta(&syn6).expect("ipv6 ext hdr");
+        assert_eq!(proto, 6);
+        assert_eq!(src.port(), 50000);
+        assert_eq!(dst.port(), 443);
+        assert_ne!(flags & 0x02, 0);
+        assert_eq!(l4_off, 48 + 24);
+        assert!(clamp.apply_in_place(&mut syn6));
+        let tcp6_after = TcpPacket::new_checked(&syn6[48..]).unwrap();
+        assert_eq!(
+            TcpRepr::parse(
+                &tcp6_after,
+                &IpAddress::Ipv6(v6_src),
+                &IpAddress::Ipv6(v6_dst),
+                &smoltcp::phy::ChecksumCapabilities::default()
+            )
+            .unwrap()
+            .max_seg_size,
+            Some(1360)
+        );
+        assert!(tcp6_after.verify_checksum(&IpAddress::Ipv6(v6_src), &IpAddress::Ipv6(v6_dst),));
+
+        // 3. Проверка целочисленного BBR в smoltcp
+        let mut s = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; 4096]),
+            TcpSocketBuffer::new(vec![0u8; 4096]),
+        );
+        s.set_congestion_control(SmolCongestionControl::Bbr);
+        assert_eq!(s.congestion_control(), SmolCongestionControl::Bbr);
     }
 }

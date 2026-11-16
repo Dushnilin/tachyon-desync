@@ -6,7 +6,6 @@ use crate::outbound::desync::packet::{compute_seven_point_offsets, find_http_hos
 use crate::outbound::desync::payload::build_fake_tls_client_hello;
 pub use crate::upstream_compat::{WIN_OUTBOUND_IF_INDEX, bind_outbound_socket};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -183,6 +182,37 @@ impl DesyncPreset {
     }
 }
 
+fn default_quic_desync() -> bool {
+    true
+}
+
+/// Встроенный пул нейтральных SNI-доменов для клонирования ClientHello из `tachyon-core`.
+#[inline]
+pub fn white_sni_pool() -> &'static [&'static str] {
+    upstream::payload::WHITE_SNI_POOL
+}
+
+/// Разобрать опциональный пользовательский `fake_payload_hex` (hex, допускаются пробелы/`0x`/`:`).
+pub fn parse_fake_payload_hex(raw: &str) -> Option<Arc<[u8]>> {
+    let clean: String = raw
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| raw.trim().strip_prefix("0X"))
+        .unwrap_or(raw.trim())
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if clean.len() < 2 || !clean.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(clean.len() / 2);
+    for pair in clean.as_bytes().as_chunks::<2>().0 {
+        let s = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(s, 16).ok()?);
+    }
+    Some(Arc::from(bytes))
+}
+
 /// Сериализуемая конфигурация десинхронизатора для GUI и профилей списков,
 /// транслируемая напрямую в апстримный `upstream::DesyncConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +230,9 @@ pub struct DesyncConfig {
     pub host_fake: bool,
     pub tlsrec_first: bool,
     pub fake_sni: String,
+    /// Опциональный пользовательский fake payload в hex (`fake_payload` в схеме `tachyon-core`).
+    #[serde(default, alias = "fake_tls")]
+    pub fake_payload_hex: String,
     pub fake_ttl: u8,
     pub repeats: u32,
     pub split_delay_ms: u64,
@@ -218,6 +251,10 @@ pub struct DesyncConfig {
     pub explicit_udp_fake_ttl: bool,
     pub udplen: usize,
     pub block_quic: bool,
+    #[serde(default = "default_quic_desync")]
+    pub quic_desync: bool,
+    #[serde(default)]
+    pub quic_repeats: u32,
 }
 
 impl Default for DesyncConfig {
@@ -232,6 +269,7 @@ impl Default for DesyncConfig {
             host_fake: false,
             tlsrec_first: true,
             fake_sni: "www.google.com".to_string(),
+            fake_payload_hex: String::new(),
             fake_ttl: 6,
             repeats: 1,
             split_delay_ms: 1,
@@ -245,7 +283,9 @@ impl Default for DesyncConfig {
             udp_fake_ttl: 6,
             explicit_udp_fake_ttl: false,
             udplen: 0,
-            block_quic: true,
+            block_quic: false,
+            quic_desync: true,
+            quic_repeats: 0,
         }
     }
 }
@@ -307,6 +347,7 @@ impl DesyncConfig {
             host_fake: r.host_fake,
             tlsrec_first: r.tlsrec_first,
             fake_sni,
+            fake_payload_hex: String::new(),
             fake_ttl: 6,
             repeats: 1,
             split_delay_ms: 1,
@@ -320,7 +361,9 @@ impl DesyncConfig {
             udp_fake_ttl: 6,
             explicit_udp_fake_ttl: false,
             udplen: 0,
-            block_quic: true,
+            block_quic: false,
+            quic_desync: true,
+            quic_repeats: 0,
         }
     }
 
@@ -361,6 +404,12 @@ impl DesyncConfig {
             }
         }
         obj.insert("fake_sni".to_string(), serde_json::json!(self.fake_sni));
+        if !self.fake_payload_hex.trim().is_empty() {
+            obj.insert(
+                "fake_payload".to_string(),
+                serde_json::json!(self.fake_payload_hex.trim()),
+            );
+        }
         obj.insert("fake_ttl".to_string(), serde_json::json!(self.fake_ttl));
         if self.repeats > 1 {
             obj.insert("repeats".to_string(), serde_json::json!(self.repeats));
@@ -398,6 +447,16 @@ impl DesyncConfig {
         if self.udplen > 0 {
             obj.insert("udplen".to_string(), serde_json::json!(self.udplen));
         }
+        obj.insert(
+            "quic_desync".to_string(),
+            serde_json::json!(self.quic_desync),
+        );
+        if self.quic_repeats > 0 {
+            obj.insert(
+                "quic_repeats".to_string(),
+                serde_json::json!(self.quic_repeats.clamp(1, 50)),
+            );
+        }
         serde_json::Value::Object(obj)
     }
     pub fn from_preset(preset: DesyncPreset) -> Self {
@@ -412,6 +471,8 @@ impl DesyncConfig {
                 c.auto = false;
                 c.block_quic = false;
                 c.udp_fake = false;
+                c.quic_desync = false;
+                c.quic_repeats = 0;
             }
             DesyncPreset::Auto => {
                 c.auto = true;
@@ -515,6 +576,9 @@ impl DesyncConfig {
             u.auto_tune = false;
             u.explicit_auto_tune = true;
             u.udp_fake = false;
+            u.quic_desync = false;
+            u.explicit_quic_desync = true;
+            u.quic_repeats = 0;
             return u;
         }
 
@@ -582,7 +646,11 @@ impl DesyncConfig {
             self.fake_sni.trim().to_string()
         };
         u.explicit_fake_sni = !self.auto;
-        u.fake_payload = None;
+        u.fake_payload = if !self.auto {
+            parse_fake_payload_hex(&self.fake_payload_hex)
+        } else {
+            None
+        };
         u.fake_ttl = self.fake_ttl.clamp(1, 64);
         u.explicit_fake_ttl = !self.auto;
         u.repeats = self.repeats.clamp(1, 10);
@@ -597,6 +665,13 @@ impl DesyncConfig {
         u.udp_fake_ttl = self.udp_fake_ttl.clamp(1, 64);
         u.explicit_udp_fake_ttl = self.explicit_udp_fake_ttl || !self.auto;
         u.udplen = self.udplen;
+        u.quic_desync = self.quic_desync && !self.block_quic;
+        u.explicit_quic_desync = true;
+        u.quic_repeats = if self.quic_repeats > 0 {
+            self.quic_repeats.clamp(1, 50)
+        } else {
+            0
+        };
         u
     }
 }
@@ -818,9 +893,13 @@ pub fn set_relearn_log_callback(cb: RelearnLogFn) {
     }
 }
 
-fn domain_fail_tracker() -> &'static Mutex<HashMap<String, (u8, Instant)>> {
-    static TRACKER: OnceLock<Mutex<HashMap<String, (u8, Instant)>>> = OnceLock::new();
-    TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+fn domain_fail_tracker() -> &'static Mutex<lru::LruCache<String, (u8, Instant)>> {
+    static TRACKER: OnceLock<Mutex<lru::LruCache<String, (u8, Instant)>>> = OnceLock::new();
+    TRACKER.get_or_init(|| {
+        Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(1024).unwrap(),
+        ))
+    })
 }
 
 pub fn notify_domain_connection_result(host: &str, ok: bool) {
@@ -832,25 +911,26 @@ pub fn notify_domain_connection_result(host: &str, ok: bool) {
         return;
     }
     let should_relearn = if let Ok(mut map) = domain_fail_tracker().lock() {
-        if map.len() > 1024 {
-            map.clear();
-            map.shrink_to(256);
+        let now = Instant::now();
+        if map.get(&clean).is_none() {
+            map.put(clean.clone(), (0, now - Duration::from_secs(120)));
         }
-        let entry = map
-            .entry(clean.clone())
-            .or_insert_with(|| (0, Instant::now() - Duration::from_secs(120)));
-        if ok {
-            entry.0 = 0;
-            false
-        } else {
-            entry.0 = entry.0.saturating_add(1);
-            if entry.0 >= 2 && entry.1.elapsed() >= Duration::from_secs(45) {
+        if let Some(entry) = map.get_mut(&clean) {
+            if ok {
                 entry.0 = 0;
-                entry.1 = Instant::now();
-                true
-            } else {
                 false
+            } else {
+                entry.0 = entry.0.saturating_add(1);
+                if entry.0 >= 2 && entry.1.elapsed() >= Duration::from_secs(45) {
+                    entry.0 = 0;
+                    entry.1 = now;
+                    true
+                } else {
+                    false
+                }
             }
+        } else {
+            false
         }
     } else {
         false
@@ -860,7 +940,8 @@ pub fn notify_domain_connection_result(host: &str, ok: bool) {
         handle.spawn(async move {
             let banned = upstream::engine::gui_get_banned_mask(&clean);
             if let Ok(report) =
-                generate_domain_strategy_with_mask(&clean, 443, false, 1600, banned, false).await
+                generate_domain_strategy_with_mask(&clean, 443, false, 1600, banned, false, false)
+                    .await
                 && let Some(best_id) = report.best_recipe_id
             {
                 let idx = (best_id as usize).min(RECIPE_TITLES.len() - 1);
@@ -895,13 +976,18 @@ pub async fn connect_and_apply_desync_auto(
         extract_hostname(first_pkt).or_else(|| known_host.map(|s| s.to_ascii_lowercase()));
 
     let mut candidate_addrs = vec![dst];
+    let allow_cross_family = crate::upstream_compat::ACTIVE_HAPPY_EYEBALLS.load(Ordering::Relaxed);
     if let Some(ref h) = host_opt
         && h.parse::<IpAddr>().is_err()
-        && let Ok(mut resolved) = crate::outbound::dial::resolve(h, dst.port()).await
+        && let Ok(resolved) = crate::outbound::dial::resolve(h, dst.port()).await
     {
-        resolved.sort_by_key(|a| upstream::peer_ip_failures(a.ip()));
-        for addr in resolved {
-            if addr != dst && addr.is_ipv4() == dst.is_ipv4() && candidate_addrs.len() < 4 {
+        let mut ordered = crate::outbound::dial::order_addrs_for_strategy(resolved, None);
+        ordered.sort_by_key(|a| upstream::peer_ip_failures(a.ip()));
+        for addr in ordered {
+            if addr != dst
+                && (allow_cross_family || addr.is_ipv4() == dst.is_ipv4())
+                && candidate_addrs.len() < 4
+            {
                 candidate_addrs.push(addr);
             }
         }
@@ -979,54 +1065,107 @@ pub async fn connect_and_apply_desync_auto(
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "TCP desync failed")))
 }
 
-/// Проверить, помечен ли целевой узел `UDP 443` как недоступный по QUIC в `AdaptiveBrain`
-/// для мгновенного отката клиента на `TCP 443`.
+/// Проверить, является ли UDP-датаграмма QUIC Long Header пакетом (`engine.rs 0.5.7`).
+#[inline]
+pub fn is_quic_long_header(datagram: &[u8]) -> bool {
+    upstream::is_quic_long_header(datagram)
+}
+
+/// Проверить, помечен ли целевой узел `UDP 443` (или его `eTLD+1`) как недоступный по QUIC в `AdaptiveBrain`.
 #[inline]
 pub fn is_quic_endpoint_dead(peer: SocketAddr) -> bool {
     upstream::is_quic_endpoint_dead(peer)
 }
 
-/// Отправить адаптивные UDP-фейки с того же самого сокета (`sock.send_to`), сохраняя точный 5-tuple потока
-/// без вызова `sock.connect(dst)`, с ротацией по 6 UDP-рецептам `0.5.0` и восстановлением исходного TTL/HopLimit.
+/// Расширенная проверка недоступности QUIC по паре `(peer, host)` (`IP` + `eTLD+1` из `0.5.7`).
+#[inline]
+pub fn is_quic_dead_for_target(peer: Option<SocketAddr>, host: Option<&str>) -> bool {
+    upstream::is_quic_dead_for_target(peer, host)
+}
+
+/// Отправить адаптивные UDP-фейки с того же самого сокета (`sock.send_to`), сохраняя точный 5-tuple потока.
 pub async fn send_udp_fakes_same_tuple(
     sock: &UdpSocket,
     dst: SocketAddr,
     cfg: &DesyncConfig,
 ) -> io::Result<()> {
-    if !cfg.enabled || !cfg.udp_fake || cfg.udp_repeats == 0 {
+    send_udp_fakes_same_tuple_with_host(sock, dst, None, cfg).await
+}
+
+/// Отправить адаптивные UDP-фейки с учётом доменного имени (`host`) для GGC кэш-узлов и QUIC SNI-ротации (`0.5.7`).
+pub async fn send_udp_fakes_same_tuple_with_host(
+    sock: &UdpSocket,
+    dst: SocketAddr,
+    target_host: Option<&str>,
+    cfg: &DesyncConfig,
+) -> io::Result<()> {
+    let port = dst.port();
+    if !cfg.enabled {
+        return Ok(());
+    }
+    if port == 443 {
+        if !cfg.quic_desync || cfg.block_quic {
+            return Ok(());
+        }
+    } else if !cfg.udp_fake || cfg.udp_repeats == 0 {
         return Ok(());
     }
     let sref = socket2::SockRef::from(sock);
     let is_ipv6 = dst.is_ipv6();
+    let is_non_loopback = !dst.ip().to_canonical().is_loopback();
     let orig_ttl = upstream::engine::get_socket_ttl_ref(&sref, is_ipv6);
 
-    let adaptive = cfg.auto && !dst.ip().is_loopback();
+    let adaptive = cfg.auto && is_non_loopback;
     let udp_recipe = if adaptive {
         upstream::current_udp_recipe(dst)
     } else {
         0
     };
 
-    let port = dst.port();
     let up_cfg = cfg.to_upstream();
-    let (base_fake_ttl, max_step_ttl, is_discord_voice, is_stun) =
+    let (mut base_fake_ttl, mut max_step_ttl, _is_discord_voice, is_stun) =
         upstream::engine::compute_udp_fake_ttl(port, adaptive, None, None, &up_cfg);
 
-    let repeats = if adaptive {
+    // Адаптация TTL для близких кэш-узлов (`*.googlevideo.com` с малым RTT из `0.5.7`).
+    if adaptive && !up_cfg.explicit_udp_fake_ttl && port == 443 {
+        let last_rtt = crate::hardware::last_connect_rtt_us();
+        let is_cache_cdn = target_host.is_some_and(|h| {
+            let low = h.trim().to_ascii_lowercase();
+            low == "googlevideo.com" || low.ends_with(".googlevideo.com")
+        });
+        if is_cache_cdn && last_rtt > 0 && last_rtt < 15_000 {
+            base_fake_ttl = base_fake_ttl.clamp(2, 3);
+            max_step_ttl = max_step_ttl.clamp(2, 4);
+        }
+    }
+
+    let repeats = if port == 443 {
+        let raw_rep = if cfg.quic_repeats > 0 {
+            cfg.quic_repeats
+        } else if cfg.udp_repeats > 0 {
+            cfg.udp_repeats
+        } else {
+            4
+        };
+        raw_rep.clamp(1, 20)
+    } else if adaptive {
         match udp_recipe {
             5 => cfg.udp_repeats.max(8),
             1 | 3 | 4 => cfg.udp_repeats.max(6),
             2 => cfg.udp_repeats.max(4),
-            _ if is_stun => cfg.udp_repeats.max(4),
+            _ if is_stun || port == 443 => cfg.udp_repeats.max(4),
             _ => cfg.udp_repeats,
         }
+        .clamp(1, 10)
     } else {
-        cfg.udp_repeats
-    }
-    .clamp(1, 10);
+        cfg.udp_repeats.clamp(1, 10)
+    };
 
     let use_opaque_blob = adaptive && matches!(udp_recipe, 1 | 4 | 5);
-    let stepped_ttl = adaptive && udp_recipe == 4 && !up_cfg.explicit_udp_fake_ttl;
+    let stepped_ttl = adaptive
+        && is_non_loopback
+        && !up_cfg.explicit_udp_fake_ttl
+        && (udp_recipe == 4 || (port == 443 && udp_recipe == 0));
     let eff_udplen = if cfg.udplen > 0 {
         cfg.udplen
     } else if adaptive {
@@ -1039,12 +1178,18 @@ pub async fn send_udp_fakes_same_tuple(
         0
     };
 
+    const NEUTRAL_QUIC_SNIS: [&str; 4] = [
+        "www.google.com",
+        "dl.google.com",
+        "fonts.googleapis.com",
+        "connectivitycheck.gstatic.com",
+    ];
     let _ = upstream::engine::set_socket_ttl_ref(&sref, base_fake_ttl, is_ipv6);
 
     let mut pad_buf = [0u8; 1328];
     for i in 0..repeats {
         if stepped_ttl {
-            let step_ttl = if is_stun {
+            let step_ttl = if is_stun || (port == 443 && max_step_ttl <= 4) {
                 (2 + (i as u8 % 3)).min(max_step_ttl).max(2)
             } else {
                 (2 + (i as u8 % 4)).min(max_step_ttl).max(2)
@@ -1070,7 +1215,7 @@ pub async fn send_udp_fakes_same_tuple(
         } else if is_stun {
             let disc_pkt;
             let stun_pkt;
-            let is_disc = (adaptive || is_discord_voice) && i % 2 == 1;
+            let is_disc = (adaptive || _is_discord_voice) && i % 2 == 1;
             let base: &[u8] = if is_disc {
                 disc_pkt = upstream::payload::build_fake_discord_ip_discovery();
                 &disc_pkt
@@ -1100,22 +1245,25 @@ pub async fn send_udp_fakes_same_tuple(
                 let _ = sock.send_to(base, dst).await;
             }
         } else if port == 443 || port == 8443 || adaptive {
-            let quic_fake = if (adaptive && i >= 2 && i % 2 == 1) || (!adaptive && (i & 1) == 1) {
-                upstream::payload::build_fake_quic_v2_initial()
+            let is_v2 = (adaptive && i >= 2 && i % 2 == 1) || (!adaptive && (i & 1) == 1);
+            let pad_len = if eff_udplen > 0 {
+                (((i as usize) + 1) * 4).min(eff_udplen).min(128)
             } else {
-                upstream::payload::build_fake_quic_initial()
+                0
             };
-            if eff_udplen > 0 {
-                let pad_len = (((i as usize) + 1) * 4).min(eff_udplen).min(128);
-                let total_len = quic_fake.len() + pad_len;
-                pad_buf[..quic_fake.len()].copy_from_slice(&quic_fake);
-                let quic_body_len = (1182 + pad_len) as u16;
-                pad_buf[16..18].copy_from_slice(&(0x4000u16 | quic_body_len).to_be_bytes());
-                let _ = getrandom::fill(&mut pad_buf[quic_fake.len()..total_len]);
-                let _ = sock.send_to(&pad_buf[..total_len], dst).await;
-            } else {
-                let _ = sock.send_to(&quic_fake, dst).await;
-            }
+            let total_len = (1200 + pad_len).min(pad_buf.len());
+            let quic_decoy_sni =
+                if cfg.fake_sni.trim().is_empty() || cfg.fake_sni.eq_ignore_ascii_case("rndsni") {
+                    NEUTRAL_QUIC_SNIS[(i as usize) % NEUTRAL_QUIC_SNIS.len()]
+                } else {
+                    cfg.fake_sni.trim()
+                };
+            let written = upstream::payload::build_fake_quic_initial_into(
+                &mut pad_buf[..total_len],
+                quic_decoy_sni,
+                is_v2,
+            );
+            let _ = sock.send_to(&pad_buf[..written], dst).await;
         } else {
             let blob = upstream::payload::build_fake_udp_opaque_blob();
             let _ = sock.send_to(&blob, dst).await;
@@ -1133,31 +1281,57 @@ pub async fn apply_desync_udp_datagram(
     payload: &[u8],
     cfg: &DesyncConfig,
 ) -> io::Result<usize> {
+    apply_desync_udp_datagram_with_host(sock, dst, None, payload, cfg).await
+}
+
+/// Применить UDP-десинхронизацию на том же 5-tuple с учётом домена цели (`host`).
+pub async fn apply_desync_udp_datagram_with_host(
+    sock: &UdpSocket,
+    dst: SocketAddr,
+    target_host: Option<&str>,
+    payload: &[u8],
+    cfg: &DesyncConfig,
+) -> io::Result<usize> {
     if !cfg.enabled {
         return sock.send_to(payload, dst).await;
     }
-    if cfg.block_quic && dst.port() == 443 && payload.len() >= 120 && (payload[0] & 0x80) != 0 {
+    if cfg.block_quic && dst.port() == 443 && is_quic_long_header(payload) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "QUIC UDP/443 blocked by profile",
         ));
     }
-    if cfg.auto && dst.port() == 443 && !dst.ip().is_loopback() && is_quic_endpoint_dead(dst) {
+    if cfg.auto
+        && crate::upstream_compat::ACTIVE_QUIC_FAST_FAILOVER.load(Ordering::Relaxed)
+        && dst.port() == 443
+        && !dst.ip().to_canonical().is_loopback()
+        && is_quic_dead_for_target(Some(dst), target_host)
+    {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "QUIC UDP/443 marked dead by AdaptiveBrain",
         ));
     }
-    let _ = send_udp_fakes_same_tuple(sock, dst, cfg).await;
+    let _ = send_udp_fakes_same_tuple_with_host(sock, dst, target_host, cfg).await;
     if payload.is_empty() {
         return Ok(0);
     }
     sock.send_to(payload, dst).await
 }
 
-/// Передать обратную связь по UDP/QUIC-потоку в апстримный `AdaptiveBrain`.
+/// Передать обратную связь по UDP/QUIC-потоку в апстримный `AdaptiveBrain` (IP + опциональный `host`).
+#[inline]
 pub fn report_udp_quic_outcome(peer: SocketAddr, got_reply: bool) {
     upstream::report_udp_quic_outcome(peer, got_reply);
+}
+
+#[inline]
+pub fn report_udp_quic_outcome_with_host(
+    peer: Option<SocketAddr>,
+    host: Option<&str>,
+    got_reply: bool,
+) {
+    upstream::report_udp_quic_outcome_with_host(peer, host, got_reply);
 }
 
 /// Передать обратную связь о передаче потока в апстримный `AdaptiveBrain` (проверка 32 KiB гейта и шейпера).
@@ -1381,10 +1555,10 @@ pub fn remove_learned_domain(host: &str) {
     if !clean.is_empty()
         && let Ok(mut map) = domain_fail_tracker().lock()
     {
-        map.remove(&clean);
+        map.pop(&clean);
         let etld = upstream::packet::extract_etld_plus_one(&clean);
         if !etld.is_empty() {
-            map.remove(etld);
+            map.pop(etld);
         }
     }
     upstream::engine::gui_remove_learned_domain(host);
@@ -1394,7 +1568,6 @@ pub fn remove_learned_domain(host: &str) {
 pub(crate) fn clear_domain_fail_tracker() {
     if let Ok(mut map) = domain_fail_tracker().lock() {
         map.clear();
-        map.shrink_to(64);
     }
 }
 
@@ -1436,6 +1609,7 @@ fn sanitize_domain_input(domain: &str) -> &str {
         .trim()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_single_probe(
     dst: SocketAddr,
     host: &str,
@@ -1444,6 +1618,7 @@ async fn execute_single_probe(
     title: String,
     gui_cfg: DesyncConfig,
     wait: Duration,
+    stream_verify: bool,
 ) -> RecipeProbeResult {
     let upstream_cfg = gui_cfg.to_upstream();
     let recipe_opt = if (rid as usize) < upstream::ADAPTIVE_RECIPES.len() {
@@ -1451,7 +1626,11 @@ async fn execute_single_probe(
     } else {
         None
     };
-    let out = upstream::probe_desync_https_32k(dst, host, recipe_opt, &upstream_cfg, wait).await;
+    let out = if stream_verify {
+        upstream::probe_desync_https_stream(dst, host, recipe_opt, &upstream_cfg, wait).await
+    } else {
+        upstream::probe_desync_https_32k(dst, host, recipe_opt, &upstream_cfg, wait).await
+    };
     RecipeProbeResult {
         recipe_id: rid,
         recipe_code: code,
@@ -1464,17 +1643,44 @@ async fn execute_single_probe(
     }
 }
 
+fn pick_best_target_addr(addrs: Vec<SocketAddr>) -> io::Result<SocketAddr> {
+    let ordered = crate::outbound::dial::order_addrs_for_strategy(addrs, None);
+    ordered
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))
+}
+
 /// Полный генератор и сканер стратегий по домену: тестирует 12 или все 24 рецепта параллельными волнами,
-/// проверяет полное чтение `> 32 КиБ` по TLS 1.3 и синтезирует оптимальную конфигурацию `DesyncConfig` + JSON `tachyon-core`.
+/// проверяет полное чтение `> 32 КиБ` (или `> 192 КиБ`) по TLS 1.3 и синтезирует оптимальную конфигурацию.
 pub async fn generate_domain_strategy(
     domain: &str,
     port: u16,
     scan_all: bool,
     timeout_ms: u64,
 ) -> io::Result<StrategyGeneratorReport> {
+    generate_domain_strategy_with_options(domain, port, scan_all, timeout_ms, false).await
+}
+
+pub async fn generate_domain_strategy_with_options(
+    domain: &str,
+    port: u16,
+    scan_all: bool,
+    timeout_ms: u64,
+    stream_verify: bool,
+) -> io::Result<StrategyGeneratorReport> {
     let clean_domain = sanitize_domain_input(domain);
     let banned = upstream::engine::gui_get_banned_mask(clean_domain);
-    generate_domain_strategy_with_mask(domain, port, scan_all, timeout_ms, banned, true).await
+    generate_domain_strategy_with_mask(
+        domain,
+        port,
+        scan_all,
+        timeout_ms,
+        banned,
+        true,
+        stream_verify,
+    )
+    .await
 }
 
 async fn generate_domain_strategy_with_mask(
@@ -1484,6 +1690,7 @@ async fn generate_domain_strategy_with_mask(
     timeout_ms: u64,
     banned_mask: u32,
     pin_verified: bool,
+    stream_verify: bool,
 ) -> io::Result<StrategyGeneratorReport> {
     let clean_domain = sanitize_domain_input(domain);
     if clean_domain.is_empty() {
@@ -1494,12 +1701,7 @@ async fn generate_domain_strategy_with_mask(
     }
 
     let addrs = crate::outbound::dial::resolve(clean_domain, port).await?;
-    let dst = addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .copied()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))?;
+    let dst = pick_best_target_addr(addrs)?;
 
     let packet_preview = inspect_client_hello_slices(clean_domain);
     let host_arc: Arc<str> = Arc::from(clean_domain);
@@ -1520,7 +1722,7 @@ async fn generate_domain_strategy_with_mask(
         base
     };
 
-    let wait = Duration::from_millis(timeout_ms.clamp(600, 4000));
+    let wait = Duration::from_millis(timeout_ms.clamp(600, 6000));
     let mut results = Vec::with_capacity(test_ids.len());
 
     // Выполняем проверку волнами по 6 рецептов параллельно для быстрого отклика
@@ -1540,6 +1742,7 @@ async fn generate_domain_strategy_with_mask(
                     title.to_string(),
                     gui_cfg,
                     wait,
+                    stream_verify,
                 )
                 .await
             }));
@@ -1563,7 +1766,7 @@ async fn generate_domain_strategy_with_mask(
     let passed_count = passed.len();
     let total_tested = results.len();
 
-    // Приоритет отдаём рецептам, которые не находятся в маске отбраковки 32 KiB гейта (`effective_banned`)
+    // Приоритет отдаём рецептам, которые не находятся в маске отбраковки гейта (`effective_banned`)
     let best = passed
         .iter()
         .copied()
@@ -1588,6 +1791,11 @@ async fn generate_domain_strategy_with_mask(
         .filter(|r| r.block_reason == "timeout")
         .count();
 
+    let depth_label = if stream_verify {
+        "192 КиБ"
+    } else {
+        "32 КиБ"
+    };
     let (best_recipe_id, recommended_config, diagnosis) = if let Some(win) = best {
         let saved_mask = if pin_verified {
             effective_banned & !(1u32 << win.recipe_id)
@@ -1602,14 +1810,14 @@ async fn generate_domain_strategy_with_mask(
         );
 
         let diag = format!(
-            "Оптимальный рецепт #{:02} ({} мс, >32 КиБ проверено). Прошло {passed_count}/{total_tested} рецептов (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}, Alert: {leaked_alerts}). Рецепт закреплён в AdaptiveBrain.",
+            "Оптимальный рецепт #{:02} ({} мс, >{depth_label} проверено). Прошло {passed_count}/{total_tested} рецептов (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}, Alert: {leaked_alerts}). Рецепт закреплён в AdaptiveBrain.",
             win.recipe_id, win.rtt_ms
         );
         (Some(win.recipe_id), win.config.clone(), diag)
     } else {
         let fallback = DesyncConfig::from_preset(DesyncPreset::SevenPointDisorder);
         let diag = format!(
-            "Ни один из {total_tested} проверенных рецептов не прошёл контроль чтения >32 КиБ для {clean_domain} ({dst}) (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}). Рекомендуется полное сканирование 24 рецептов или режим TUN."
+            "Ни один из {total_tested} проверенных рецептов не прошёл контроль чтения >{depth_label} для {clean_domain} ({dst}) (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}). Рекомендуется полное сканирование 24 рецептов или режим TUN."
         );
         (None, fallback, diag)
     };
@@ -1637,6 +1845,16 @@ pub async fn probe_custom_strategy(
     custom_cfg: &DesyncConfig,
     timeout_ms: u64,
 ) -> io::Result<StrategyGeneratorReport> {
+    probe_custom_strategy_with_options(domain, port, custom_cfg, timeout_ms, false).await
+}
+
+pub async fn probe_custom_strategy_with_options(
+    domain: &str,
+    port: u16,
+    custom_cfg: &DesyncConfig,
+    timeout_ms: u64,
+    stream_verify: bool,
+) -> io::Result<StrategyGeneratorReport> {
     let clean_domain = sanitize_domain_input(domain);
     if clean_domain.is_empty() {
         return Err(io::Error::new(
@@ -1646,15 +1864,10 @@ pub async fn probe_custom_strategy(
     }
 
     let addrs = crate::outbound::dial::resolve(clean_domain, port).await?;
-    let dst = addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .copied()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))?;
+    let dst = pick_best_target_addr(addrs)?;
 
     let packet_preview = inspect_client_hello_slices(clean_domain);
-    let wait = Duration::from_millis(timeout_ms.clamp(600, 4000));
+    let wait = Duration::from_millis(timeout_ms.clamp(600, 6000));
 
     let mut cfg = custom_cfg.clone();
     cfg.enabled = true;
@@ -1687,13 +1900,19 @@ pub async fn probe_custom_strategy(
         title,
         cfg.clone(),
         wait,
+        stream_verify,
     )
     .await;
 
+    let depth_label = if stream_verify {
+        "192 КиБ"
+    } else {
+        "32 КиБ"
+    };
     let passed_count = usize::from(res.ok);
     let diagnosis = if res.ok {
         format!(
-            "Пользовательская стратегия успешно прошла проверку чтения >32 КиБ на {clean_domain} ({dst}) за {} мс: {}",
+            "Пользовательская стратегия успешно прошла проверку чтения >{depth_label} на {clean_domain} ({dst}) за {} мс: {}",
             res.rtt_ms, res.detail
         )
     } else {
@@ -2038,6 +2257,7 @@ mod tests {
             "#17 Disoob".to_string(),
             DesyncConfig::from_recipe_id(17),
             Duration::from_millis(900),
+            false,
         )
         .await;
         assert!(
@@ -2078,14 +2298,14 @@ mod tests {
             domain_fail_tracker()
                 .lock()
                 .unwrap()
-                .contains_key("stuck-cache-test.discord-desync-unit.gg")
+                .contains("stuck-cache-test.discord-desync-unit.gg")
         );
         remove_learned_domain(host);
         assert!(
             !domain_fail_tracker()
                 .lock()
                 .unwrap()
-                .contains_key("stuck-cache-test.discord-desync-unit.gg")
+                .contains("stuck-cache-test.discord-desync-unit.gg")
         );
         assert!(
             get_learned_domains_snapshot()
@@ -2135,5 +2355,93 @@ mod tests {
             }
         }
         assert!(received_real);
+    }
+
+    #[tokio::test]
+    async fn tdd_desync_config_defaults_enable_http3_and_allow_quic_initial_443() {
+        assert!(!DesyncConfig::default().block_quic);
+        assert!(!DesyncConfig::from_preset(DesyncPreset::Auto).block_quic);
+        assert!(!DesyncConfig::from_recipe_id(0).block_quic);
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let cfg = DesyncConfig::default();
+        let mut fake_quic_initial = vec![0u8; 1200];
+        fake_quic_initial[0] = 0xc3; // Long header (QUIC Initial)
+        let res = apply_desync_udp_datagram(&client, server_addr, &fake_quic_initial, &cfg).await;
+        assert!(
+            res.is_ok(),
+            "Default DesyncConfig must not block QUIC Initial UDP datagram: {res:?}"
+        );
+    }
+
+    #[test]
+    fn extract_hostname_sniffs_discord_media_tls_sni() {
+        let ch = upstream::payload::build_fake_tls_client_hello("cdn.discord.media");
+        assert_eq!(extract_hostname(&ch).as_deref(), Some("cdn.discord.media"));
+    }
+
+    #[tokio::test]
+    async fn quic_desync_wiring_honors_repeats_and_toggle() {
+        let mut cfg = DesyncConfig {
+            enabled: true,
+            auto: false,
+            udp_fake: false,
+            quic_desync: true,
+            quic_repeats: 3,
+            block_quic: false,
+            ..Default::default()
+        };
+        let up = cfg.to_upstream();
+        assert!(up.quic_desync);
+        assert!(up.explicit_quic_desync);
+        assert_eq!(up.quic_repeats, 3);
+        let json = cfg.to_core_outbound_json();
+        assert_eq!(
+            json.get("quic_desync").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(json.get("quic_repeats").and_then(|v| v.as_u64()), Some(3));
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_443 = SocketAddr::new(server.local_addr().unwrap().ip(), 443);
+
+        // With quic_desync = false, to_upstream must disable quic_desync and send_udp_fakes_same_tuple emits 0 packets
+        cfg.quic_desync = false;
+        assert!(!cfg.to_upstream().quic_desync);
+        send_udp_fakes_same_tuple(&client, target_443, &cfg)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let recv =
+            tokio::time::timeout(Duration::from_millis(60), server.recv_from(&mut buf)).await;
+        assert!(recv.is_err(), "quic_desync=false must emit zero fakes");
+    }
+
+    #[test]
+    fn fake_payload_hex_parses_and_propagates_to_upstream_and_json() {
+        let mut cfg = DesyncConfig {
+            auto: false,
+            fake_payload_hex: "0x16 03:01 00 05 01".to_string(),
+            ..Default::default()
+        };
+        let parsed = parse_fake_payload_hex(&cfg.fake_payload_hex).expect("hex payload");
+        assert_eq!(&*parsed, &[0x16, 0x03, 0x01, 0x00, 0x05, 0x01]);
+        let up = cfg.to_upstream();
+        assert_eq!(
+            up.fake_payload.as_deref(),
+            Some(&[0x16u8, 0x03, 0x01, 0x00, 0x05, 0x01][..])
+        );
+        let json = cfg.to_core_outbound_json();
+        assert!(json.get("fake_payload").is_some());
+
+        cfg.fake_payload_hex = "invalid-hex".to_string();
+        assert!(cfg.to_upstream().fake_payload.is_none());
+        assert!(!white_sni_pool().is_empty());
+        assert!(is_quic_long_header(&[0xc3u8; 32]));
+        assert!(!is_quic_long_header(&[0x40u8; 32]));
     }
 }

@@ -193,7 +193,7 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
-    #[cfg(feature = "socket-tcp-cubic")]
+    #[cfg(any(feature = "socket-tcp-cubic", feature = "socket-tcp-bbr"))]
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
     }
@@ -452,6 +452,9 @@ impl Display for Tuple {
 pub enum CongestionControl {
     None,
 
+    #[cfg(feature = "socket-tcp-bbr")]
+    Bbr,
+
     #[cfg(feature = "socket-tcp-reno")]
     Reno,
 
@@ -680,6 +683,9 @@ impl<'a> Socket<'a> {
         self.congestion_controller = match congestion_control {
             CongestionControl::None => AnyController::None(no_control::NoControl),
 
+            #[cfg(feature = "socket-tcp-bbr")]
+            CongestionControl::Bbr => AnyController::Bbr(bbr::Bbr::new()),
+
             #[cfg(feature = "socket-tcp-reno")]
             CongestionControl::Reno => AnyController::Reno(reno::Reno::new()),
 
@@ -695,11 +701,23 @@ impl<'a> Socket<'a> {
         match self.congestion_controller {
             AnyController::None(_) => CongestionControl::None,
 
+            #[cfg(feature = "socket-tcp-bbr")]
+            AnyController::Bbr(_) => CongestionControl::Bbr,
+
             #[cfg(feature = "socket-tcp-reno")]
             AnyController::Reno(_) => CongestionControl::Reno,
 
             #[cfg(feature = "socket-tcp-cubic")]
             AnyController::Cubic(_) => CongestionControl::Cubic,
+        }
+    }
+
+    /// Return the current BBR bottleneck bandwidth estimate in bytes/sec, if BBR is active.
+    #[cfg(feature = "socket-tcp-bbr")]
+    pub fn congestion_max_bw_bps(&self) -> Option<u64> {
+        match &self.congestion_controller {
+            congestion::AnyController::Bbr(b) => Some(b.max_bw_bps()),
+            _ => None,
         }
     }
 
@@ -915,7 +933,8 @@ impl<'a> Socket<'a> {
 
     fn reset(&mut self) {
         let effective_max = self.rx_buffer.capacity().max(self.auto_tune_max);
-        let rx_cap_log2 = mem::size_of::<usize>() * 8 - effective_max.leading_zeros() as usize;
+        let rx_cap_log2 =
+            mem::size_of::<usize>() * 8 - effective_max.leading_zeros() as usize;
 
         self.state = State::Closed;
         self.timer = Timer::new();
@@ -1255,7 +1274,8 @@ impl<'a> Socket<'a> {
         let clamped = max_cap.min(1 << 30);
         self.auto_tune_max = clamped;
         let effective_max = self.rx_buffer.capacity().max(clamped);
-        let rx_cap_log2 = mem::size_of::<usize>() * 8 - effective_max.leading_zeros() as usize;
+        let rx_cap_log2 =
+            mem::size_of::<usize>() * 8 - effective_max.leading_zeros() as usize;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
     }
 
@@ -1340,7 +1360,10 @@ impl<'a> Socket<'a> {
         } else {
             current_cap.saturating_mul(8)
         };
-        let desired = bdp_target.max(vol_target).min(rtt_ceiling).min(step_cap);
+        let desired = bdp_target
+            .max(vol_target)
+            .min(rtt_ceiling)
+            .min(step_cap);
         desired.clamp(current_cap, self.auto_tune_max)
     }
 
@@ -2348,9 +2371,7 @@ impl<'a> Socket<'a> {
 
         // Sample RTT from echo replies or incoming data segments when the socket
         // is primarily a receiver (so srtt is populated even when tx_buffer is idle).
-        if !self.rtte.have_measurement
-            && (!repr.payload.is_empty() || repr.control == TcpControl::Syn)
-        {
+        if !self.rtte.have_measurement && (!repr.payload.is_empty() || repr.control == TcpControl::Syn) {
             if let Some(prev_ts) = prev_remote_ts {
                 let delta_ms = (cx.now() - prev_ts).total_millis() as u32;
                 if (1..=2000).contains(&delta_ms) {
@@ -9818,6 +9839,12 @@ mod test {
     #[test]
     fn test_set_get_congestion_control() {
         let mut s = socket_established();
+
+        #[cfg(feature = "socket-tcp-bbr")]
+        {
+            s.set_congestion_control(CongestionControl::Bbr);
+            assert_eq!(s.congestion_control(), CongestionControl::Bbr);
+        }
 
         #[cfg(feature = "socket-tcp-reno")]
         {

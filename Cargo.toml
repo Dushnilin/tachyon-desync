@@ -1,6 +1,6 @@
 [package]
 name = "tachyon-desync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Standalone Adaptive Packet Desynchronization Client with Per-List Profiles and Wintun/Proxy Capture"
 license = "LicenseRef-Proprietary"
@@ -11,6 +11,7 @@ name = "tachyon-desync"
 path = "src/main.rs"
 
 [dependencies]
+aes = { version = "0.8", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 anyhow = "1"
 bytes = "1"
@@ -30,7 +31,9 @@ smoltcp = { path = "vendor/smoltcp", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
+    "socket-tcp-bbr",
     "socket-tcp-cubic",
+    "socket-tcp-reno",
     "socket-udp",
     "assembler-max-segment-count-32",
 ] }
@@ -53,8 +56,21 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_Networking_WinSock",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinInet",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.dev]

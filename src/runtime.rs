@@ -5,8 +5,9 @@ use crate::apps::{RunningAppInfo, list_running_apps, normalize_app_name};
 use crate::desync::{
     DesyncConfig, DesyncPreset, LearnedDomainView, RecipeProbeResult, RecipeScoreView,
     all_recipe_summaries, attach_persistent_cache, clear_brain_cache, flush_persistent_cache,
-    generate_domain_strategy, get_isp_scoreboard, get_learned_domains_snapshot,
-    inspect_client_hello_slices, pin_domain_recipe, probe_custom_strategy, remove_learned_domain,
+    generate_domain_strategy_with_options, get_isp_scoreboard, get_learned_domains_snapshot,
+    inspect_client_hello_slices, pin_domain_recipe, probe_custom_strategy_with_options,
+    remove_learned_domain,
 };
 use crate::lists::{
     AppFilterMode, CompiledMatcher, ListProfile, ListStrategy, NamedCustomProfile,
@@ -41,12 +42,22 @@ pub enum CaptureMode {
 }
 
 /// Сохраняемая на диск конфигурация приложения (`state.json`).
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 4;
+
+fn legacy_schema_version() -> u32 {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppStateConfig {
+    #[serde(default = "legacy_schema_version")]
+    pub config_schema_version: u32,
     pub language: String,
     pub minimize_to_tray: bool,
     pub dns_mode: String,
+    pub dns: crate::dns_resolver::DnsSettings,
+    pub network: crate::upstream_compat::NetworkTuningConfig,
     pub auto_relearn: bool,
     pub upstream_proxy: String,
     pub app_strategies: std::collections::BTreeMap<String, String>,
@@ -67,9 +78,12 @@ pub struct AppStateConfig {
 impl Default for AppStateConfig {
     fn default() -> Self {
         Self {
+            config_schema_version: CURRENT_CONFIG_SCHEMA_VERSION,
             language: "ru".to_string(),
             minimize_to_tray: true,
             dns_mode: "auto".to_string(),
+            dns: crate::dns_resolver::DnsSettings::default(),
+            network: crate::upstream_compat::NetworkTuningConfig::default(),
             auto_relearn: true,
             upstream_proxy: String::new(),
             app_strategies: std::collections::BTreeMap::new(),
@@ -120,6 +134,7 @@ pub struct UiSnapshot {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     pub config: AppStateConfig,
+    pub dns_status: crate::dns_resolver::DnsRuntimeStatus,
     pub running_apps: Vec<RunningAppInfo>,
     pub live_flows: Vec<crate::flows::LiveFlowSnapshot>,
     pub learned_domains: Vec<LearnedDomainView>,
@@ -133,6 +148,7 @@ pub struct DesyncRuntime {
     data_dir: PathBuf,
     running: AtomicBool,
     stop_flag: Mutex<Arc<AtomicBool>>,
+    bg_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     active_mode_label: RwLock<String>,
     started_at: Mutex<Option<Instant>>,
     config: RwLock<AppStateConfig>,
@@ -180,44 +196,20 @@ impl DesyncRuntime {
             AppStateConfig::default()
         };
 
-        // Repair builtin list names/descriptions and migrate Discord Voice UDP ports/TTL on existing state.json
-        let defaults = default_builtin_lists();
-        for item in &mut cfg.lists {
-            if item.builtin
-                && (item.description.contains("???") || item.name.contains("???"))
-                && let Some(def) = defaults.iter().find(|d| d.id == item.id)
-            {
-                item.name = def.name.clone();
-                item.description = def.description.clone();
-            }
-            if item.id == "discord" {
-                if item.udp_ports.trim().is_empty() {
-                    item.udp_ports = "19294-19344, 50000-50100".to_string();
-                }
-                if item.udp_fake_ttl == 0 || item.udp_fake_ttl == 6 {
-                    item.udp_fake_ttl = 3;
-                }
-            }
+        let (config_changed, startup_warnings) = Self::migrate_and_sanitize_config(&mut cfg);
+        if use_persistent_files
+            && config_changed
+            && let Ok(pretty) = serde_json::to_string_pretty(&cfg)
+        {
+            let _ = std::fs::write(&state_path, pretty);
         }
 
         crate::upstream_compat::set_clean_dns_mode_from_str(&cfg.dns_mode);
+        crate::dns_resolver::apply_dns_settings(&cfg.dns);
+        crate::upstream_compat::apply_network_tuning(&cfg.network);
         crate::desync::AUTO_RELEARN_ENABLED.store(cfg.auto_relearn, Ordering::Relaxed);
 
-        let compiled = Arc::new(
-            CompiledMatcher::build_full(
-                &cfg.lists,
-                cfg.default_strategy.clone(),
-                cfg.custom_global_config.clone(),
-                cfg.app_filter_mode,
-                cfg.selected_apps.clone(),
-                cfg.force_desync_selected_apps,
-                cfg.upstream_proxy.clone(),
-                &cfg.app_strategies,
-                &cfg.dns_overrides,
-            )
-            .with_custom_profiles(&cfg.custom_profiles)
-            .with_lists_override_game_bypass(cfg.lists_override_game_bypass),
-        );
+        let compiled = Self::compile_matcher(&cfg);
 
         let initial_apps = if use_persistent_files {
             list_running_apps()
@@ -229,6 +221,7 @@ impl DesyncRuntime {
             data_dir,
             running: AtomicBool::new(false),
             stop_flag: Mutex::new(Arc::new(AtomicBool::new(false))),
+            bg_tasks: Mutex::new(Vec::new()),
             active_mode_label: RwLock::new("Остановлен".to_string()),
             started_at: Mutex::new(None),
             config: RwLock::new(cfg),
@@ -245,63 +238,148 @@ impl DesyncRuntime {
             "system",
             "Движок десинхронизации Tachyon Desync инициализирован (апстрим tachyon-core, 24 адаптивных рецепта)",
         );
+        for w in startup_warnings {
+            rt.push_log("warn", "config", &w);
+        }
         rt
     }
 
-    /// Быстрое чтение атомарных счётчиков трафика `(rx_bytes, tx_bytes)` для тултипа системного трея.
-    pub fn traffic_bytes(&self) -> (u64, u64) {
-        (
-            self.counters.rx_bytes.load(Ordering::Relaxed),
-            self.counters.tx_bytes.load(Ordering::Relaxed),
-        )
-    }
+    /// Мигрирует устаревший `state.json` (не перезаписывая явные настройки актуальной схемы)
+    /// и сбрасывает несуществующие ссылки `profile:<id>` в `Auto`. Возвращает `(changed, warnings)`.
+    fn migrate_and_sanitize_config(cfg: &mut AppStateConfig) -> (bool, Vec<String>) {
+        let mut changed = false;
+        let mut warnings = Vec::new();
+        let defaults = default_builtin_lists();
 
-    pub fn push_log(&self, level: &str, category: &str, message: &str) {
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        if let Ok(mut q) = self.logs.lock() {
-            if q.len() >= MAX_LOG_ENTRIES {
-                q.pop_front();
+        if cfg.config_schema_version < 2 {
+            if cfg.custom_global_config.block_quic {
+                cfg.custom_global_config.block_quic = false;
             }
-            q.push_back(LogEntry {
-                ts_ms,
-                level: level.to_string(),
-                category: category.to_string(),
-                message: message.to_string(),
-            });
+            if let Some(yt) = cfg.lists.iter_mut().find(|l| l.id == "youtube")
+                && yt.block_quic
+            {
+                yt.block_quic = false;
+                yt.udp_fake = true;
+            }
         }
-    }
-
-    fn make_log_callback(self: &Arc<Self>) -> LogCallback {
-        let logs = self.logs.clone();
-        Arc::new(move |level: &str, category: &str, message: &str| {
-            let ts_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            if let Ok(mut q) = logs.lock() {
-                if q.len() >= MAX_LOG_ENTRIES {
-                    q.pop_front();
+        if cfg.config_schema_version < 3 {
+            match cfg.dns_mode.trim().to_ascii_lowercase().as_str() {
+                "system" | "off" => {
+                    cfg.dns.enabled = false;
                 }
-                q.push_back(LogEntry {
-                    ts_ms,
-                    level: level.to_string(),
-                    category: category.to_string(),
-                    message: message.to_string(),
-                });
+                "cloudflare" | "cf" => {
+                    cfg.dns.enabled = true;
+                    cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                    cfg.dns.servers = vec![
+                        "1.1.1.1".to_string(),
+                        "1.0.0.1".to_string(),
+                        "208.67.222.222:5353".to_string(),
+                    ];
+                }
+                "google" => {
+                    cfg.dns.enabled = true;
+                    cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                    cfg.dns.servers = vec![
+                        "8.8.8.8".to_string(),
+                        "8.8.4.4".to_string(),
+                        "77.88.8.8:1253".to_string(),
+                    ];
+                }
+                "port1253" | "altport" => {
+                    cfg.dns.enabled = true;
+                    cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                    cfg.dns.servers = vec![
+                        "77.88.8.8:1253".to_string(),
+                        "208.67.222.222:5353".to_string(),
+                        "208.67.220.220:5353".to_string(),
+                    ];
+                }
+                _ => {}
             }
-        })
+        }
+        if cfg.config_schema_version < CURRENT_CONFIG_SCHEMA_VERSION {
+            cfg.config_schema_version = CURRENT_CONFIG_SCHEMA_VERSION;
+            changed = true;
+        }
+        if crate::dns_resolver::sanitize_dns_settings(&mut cfg.dns) {
+            changed = true;
+        }
+        if crate::upstream_compat::sanitize_network_tuning(&mut cfg.network) {
+            changed = true;
+        }
+
+        for item in &mut cfg.lists {
+            if item.builtin
+                && (item.description.contains("???") || item.name.contains("???"))
+                && let Some(def) = defaults.iter().find(|d| d.id == item.id)
+            {
+                item.name = def.name.clone();
+                item.description = def.description.clone();
+                changed = true;
+            }
+            if item.id == "discord" {
+                if item.udp_ports.trim().is_empty() {
+                    item.udp_ports = "19294-19344, 50000-50100".to_string();
+                    changed = true;
+                }
+                if item.udp_fake_ttl == 0 || item.udp_fake_ttl == 6 {
+                    item.udp_fake_ttl = 3;
+                    changed = true;
+                }
+                for cidr in ["udp:104.16.0.0/12", "udp:35.217.0.0/16"] {
+                    let ip_part = cidr.strip_prefix("udp:").unwrap_or(cidr);
+                    if !item.entries.iter().any(|e| e.contains(ip_part)) {
+                        item.entries.push(cidr.to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        let has_profile = |pid: &str, profiles: &[crate::lists::NamedCustomProfile]| {
+            profiles.iter().any(|p| p.id.eq_ignore_ascii_case(pid))
+        };
+
+        if let ListStrategy::CustomProfile(ref pid) = cfg.default_strategy
+            && !has_profile(pid, &cfg.custom_profiles)
+        {
+            warnings.push(format!(
+                "Профиль по умолчанию «profile:{pid}» не найден в custom_profiles — выполнен откат на Auto"
+            ));
+            cfg.default_strategy = ListStrategy::Auto;
+            changed = true;
+        }
+
+        for list in &mut cfg.lists {
+            if let ListStrategy::CustomProfile(ref pid) = list.strategy
+                && !has_profile(pid, &cfg.custom_profiles)
+            {
+                warnings.push(format!(
+                    "Профиль «profile:{pid}» для списка «{}» не найден — выполнен откат на Auto",
+                    list.name
+                ));
+                list.strategy = ListStrategy::Auto;
+                changed = true;
+            }
+        }
+
+        for (app_key, strat_val) in &mut cfg.app_strategies {
+            if let ListStrategy::CustomProfile(pid) = ListStrategy::from_code(strat_val)
+                && !has_profile(&pid, &cfg.custom_profiles)
+            {
+                warnings.push(format!(
+                    "Профиль «profile:{pid}» для приложения «{app_key}» не найден — выполнен откат на Auto"
+                ));
+                *strat_val = "auto".to_string();
+                changed = true;
+            }
+        }
+
+        (changed, warnings)
     }
 
-    /// Сохранить `state.json` и `adaptive_cache.json` и пересобрать `CompiledMatcher`.
-    pub async fn persist_and_recompile(&self) {
-        let cfg = self.config.read().await.clone();
-        crate::upstream_compat::set_clean_dns_mode_from_str(&cfg.dns_mode);
-        crate::desync::AUTO_RELEARN_ENABLED.store(cfg.auto_relearn, Ordering::Relaxed);
-
-        let compiled = Arc::new(
+    fn compile_matcher(cfg: &AppStateConfig) -> Arc<CompiledMatcher> {
+        Arc::new(
             CompiledMatcher::build_full(
                 &cfg.lists,
                 cfg.default_strategy.clone(),
@@ -315,8 +393,78 @@ impl DesyncRuntime {
             )
             .with_custom_profiles(&cfg.custom_profiles)
             .with_lists_override_game_bypass(cfg.lists_override_game_bypass),
-        );
-        *self.matcher.write().await = compiled;
+        )
+    }
+
+    fn push_log_entry(
+        logs: &Mutex<VecDeque<LogEntry>>,
+        level: &str,
+        category: &str,
+        message: &str,
+    ) {
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Ok(mut q) = logs.lock() {
+            if q.len() >= MAX_LOG_ENTRIES {
+                q.pop_front();
+            }
+            q.push_back(LogEntry {
+                ts_ms,
+                level: level.to_string(),
+                category: category.to_string(),
+                message: message.to_string(),
+            });
+        }
+    }
+
+    fn track_bg_task(&self, handle: tokio::task::JoinHandle<()>) {
+        if let Ok(mut tasks) = self.bg_tasks.lock() {
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
+        }
+    }
+
+    fn abort_bg_tasks(&self) {
+        if let Ok(mut tasks) = self.bg_tasks.lock() {
+            for h in tasks.drain(..) {
+                h.abort();
+            }
+        }
+    }
+
+    /// Быстрое чтение атомарных счётчиков трафика `(rx_bytes, tx_bytes)` для тултипа системного трея.
+    pub fn traffic_bytes(&self) -> (u64, u64) {
+        (
+            self.counters.rx_bytes.load(Ordering::Relaxed),
+            self.counters.tx_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn push_log(&self, level: &str, category: &str, message: &str) {
+        Self::push_log_entry(&self.logs, level, category, message);
+    }
+
+    fn make_log_callback(self: &Arc<Self>) -> LogCallback {
+        let logs = self.logs.clone();
+        Arc::new(move |level: &str, category: &str, message: &str| {
+            Self::push_log_entry(&logs, level, category, message);
+        })
+    }
+
+    /// Сохранить `state.json` и `adaptive_cache.json` и пересобрать `CompiledMatcher`.
+    pub async fn persist_and_recompile(&self) {
+        let cfg = self.config.read().await.clone();
+        crate::upstream_compat::set_clean_dns_mode_from_str(&cfg.dns_mode);
+        crate::dns_resolver::apply_dns_settings(&cfg.dns);
+        crate::upstream_compat::apply_network_tuning(&cfg.network);
+        if self.running.load(Ordering::Relaxed) {
+            crate::dns_resolver::set_dns_service_active(cfg.dns.enabled);
+        }
+        crate::desync::AUTO_RELEARN_ENABLED.store(cfg.auto_relearn, Ordering::Relaxed);
+
+        *self.matcher.write().await = Self::compile_matcher(&cfg);
 
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(self.data_dir.join("state.json"), json);
@@ -339,13 +487,21 @@ impl DesyncRuntime {
         }
 
         let cfg = self.config.read().await.clone();
+        crate::dns_resolver::apply_dns_settings(&cfg.dns);
+        crate::upstream_compat::apply_network_tuning(&cfg.network);
+        crate::dns_resolver::set_dns_service_active(cfg.dns.enabled);
+        for dns_handle in
+            crate::dns_resolver::spawn_dns_background_tasks(stop.clone(), cfg.lists.clone())
+        {
+            self.track_bg_task(dns_handle);
+        }
         let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cfg.listen_port);
         let matcher_proxy = self.matcher.clone();
         let counters_proxy = self.counters.clone();
         let log_proxy = self.make_log_callback();
         let stop_proxy = stop.clone();
 
-        tokio::spawn(async move {
+        let proxy_handle = tokio::spawn(async move {
             if let Err(e) = run_local_proxy_server(
                 listen_addr,
                 matcher_proxy,
@@ -362,6 +518,7 @@ impl DesyncRuntime {
                 );
             }
         });
+        self.track_bg_task(proxy_handle);
 
         match cfg.capture_mode {
             CaptureMode::Tun => {
@@ -377,7 +534,7 @@ impl DesyncRuntime {
                 let rt_clone = self.clone();
                 let port = cfg.listen_port;
 
-                tokio::spawn(async move {
+                let tun_handle = tokio::spawn(async move {
                     if let Err(e) = run_tun_capture(
                         &iface_name,
                         matcher_tun,
@@ -399,6 +556,7 @@ impl DesyncRuntime {
                             format!("Системный прокси 127.0.0.1:{port} (фоллбэк без прав админа)");
                     }
                 });
+                self.track_bg_task(tun_handle);
             }
             CaptureMode::SystemProxy => {
                 let _ = set_os_system_proxy(true, cfg.listen_port);
@@ -435,8 +593,22 @@ impl DesyncRuntime {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
+        crate::dns_resolver::set_dns_service_active(false);
         if let Ok(g) = self.stop_flag.lock() {
             g.store(true, Ordering::SeqCst);
+        }
+        let handles = self
+            .bg_tasks
+            .lock()
+            .map(|mut tasks| std::mem::take(&mut *tasks))
+            .unwrap_or_default();
+        for mut h in handles {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut h)
+                .await
+                .is_err()
+            {
+                h.abort();
+            }
         }
         if let Ok(mut st) = self.started_at.lock() {
             *st = None;
@@ -454,6 +626,7 @@ impl DesyncRuntime {
         if let Ok(g) = self.stop_flag.lock() {
             g.store(true, Ordering::SeqCst);
         }
+        self.abort_bg_tasks();
         let _ = set_os_system_proxy(false, 7897);
         flush_persistent_cache();
     }
@@ -501,6 +674,7 @@ impl DesyncRuntime {
             tx_bytes: self.counters.tx_bytes.load(Ordering::Relaxed),
             rx_bytes: self.counters.rx_bytes.load(Ordering::Relaxed),
             config,
+            dns_status: crate::dns_resolver::current_dns_status(),
             running_apps,
             live_flows: crate::flows::snapshot_flows(),
             learned_domains: get_learned_domains_snapshot(),
@@ -543,7 +717,47 @@ impl DesyncRuntime {
                 if let Some(m) = payload.get("dns_mode").and_then(|v| v.as_str()) {
                     let norm = m.trim().to_ascii_lowercase();
                     crate::upstream_compat::set_clean_dns_mode_from_str(&norm);
-                    self.config.write().await.dns_mode = norm.clone();
+                    {
+                        let mut cfg = self.config.write().await;
+                        cfg.dns_mode = norm.clone();
+                        match norm.as_str() {
+                            "system" | "off" => cfg.dns.enabled = false,
+                            "cloudflare" | "cf" => {
+                                cfg.dns.enabled = true;
+                                cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                                cfg.dns.servers = vec![
+                                    "1.1.1.1".to_string(),
+                                    "1.0.0.1".to_string(),
+                                    "208.67.222.222:5353".to_string(),
+                                ];
+                            }
+                            "google" => {
+                                cfg.dns.enabled = true;
+                                cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                                cfg.dns.servers = vec![
+                                    "8.8.8.8".to_string(),
+                                    "8.8.4.4".to_string(),
+                                    "77.88.8.8:1253".to_string(),
+                                ];
+                            }
+                            "port1253" | "altport" => {
+                                cfg.dns.enabled = true;
+                                cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                                cfg.dns.servers = vec![
+                                    "77.88.8.8:1253".to_string(),
+                                    "208.67.222.222:5353".to_string(),
+                                    "208.67.220.220:5353".to_string(),
+                                ];
+                            }
+                            _ => {
+                                cfg.dns.enabled = true;
+                                cfg.dns.protocol = crate::dns_resolver::DnsProtocol::Udp;
+                                cfg.dns.servers =
+                                    crate::dns_resolver::DnsSettings::default().servers;
+                            }
+                        }
+                        crate::dns_resolver::sanitize_dns_settings(&mut cfg.dns);
+                    }
                     self.persist_and_recompile().await;
                     self.push_log(
                         "info",
@@ -612,8 +826,12 @@ impl DesyncRuntime {
                 }
                 serde_json::to_value(self.snapshot().await).unwrap_or_default()
             }
-            "set_dns_overrides_text" => {
-                if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+            "set_dns_overrides_text" | "set_dns_overrides" => {
+                if let Some(text) = payload
+                    .get("text")
+                    .or_else(|| payload.get("overrides"))
+                    .and_then(|v| v.as_str())
+                {
                     let mut map = std::collections::BTreeMap::new();
                     for raw_line in text.lines() {
                         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -636,6 +854,7 @@ impl DesyncRuntime {
                     }
                     let count = map.len();
                     self.config.write().await.dns_overrides = map;
+                    crate::dns_resolver::flush_dns_caches();
                     self.persist_and_recompile().await;
                     self.push_log(
                         "info",
@@ -731,11 +950,17 @@ impl DesyncRuntime {
             }
             "import_backup_json" => {
                 if let Some(raw) = payload.get("json").and_then(|v| v.as_str())
-                    && let Ok(imported) = serde_json::from_str::<AppStateConfig>(raw)
+                    && let Ok(mut imported) = serde_json::from_str::<AppStateConfig>(raw)
                 {
+                    let (_, warnings) = Self::migrate_and_sanitize_config(&mut imported);
                     crate::upstream_compat::set_clean_dns_mode_from_str(&imported.dns_mode);
+                    crate::dns_resolver::apply_dns_settings(&imported.dns);
+                    crate::upstream_compat::apply_network_tuning(&imported.network);
                     *self.config.write().await = imported;
                     self.persist_and_recompile().await;
+                    for w in warnings {
+                        self.push_log("warn", "config", &w);
+                    }
                     self.push_log(
                         "info",
                         "config",
@@ -900,7 +1125,10 @@ impl DesyncRuntime {
                         builtin: false,
                         enabled: true,
                         strategy: ListStrategy::from_code(strategy_str),
-                        block_quic: true,
+                        block_quic: payload
+                            .get("block_quic")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         udp_fake: true,
                         udp_ports,
                         udp_fake_ttl,
@@ -1223,19 +1451,37 @@ impl DesyncRuntime {
                     .get("apply_global")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let default_stream = self.config.read().await.network.stream_verify_192k;
+                let stream_verify = payload
+                    .get("stream_verify")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(default_stream);
                 self.push_log(
                     "info",
                     "probe",
                     &format!(
-                        "Запущена генерация стратегии ({}) для {domain}:{port}...",
+                        "Запущена генерация стратегии ({}, {}) для {domain}:{port}...",
                         if scan_all {
                             "24 рецепта"
                         } else {
                             "12 рецептов"
-                        }
+                        },
+                        if stream_verify {
+                            "192 КиБ"
+                        } else {
+                            "32 КиБ"
+                        },
                     ),
                 );
-                match generate_domain_strategy(domain, port, scan_all, 1800).await {
+                match generate_domain_strategy_with_options(
+                    domain,
+                    port,
+                    scan_all,
+                    1800,
+                    stream_verify,
+                )
+                .await
+                {
                     Ok(report) => {
                         if apply_global {
                             self.config.write().await.custom_global_config =
@@ -1283,15 +1529,35 @@ impl DesyncRuntime {
                     .unwrap_or_else(|| {
                         serde_json::from_value::<DesyncConfig>(payload.clone()).unwrap_or_default()
                     });
+                let default_stream = self.config.read().await.network.stream_verify_192k;
+                let stream_verify = payload
+                    .get("stream_verify")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(default_stream);
                 self.push_log(
                     "info",
                     "probe",
                     &format!(
-                        "Тест конструктора ({} + {}, split={}) на {domain}:{port}...",
-                        custom_cfg.mode, custom_cfg.fooling, custom_cfg.split_pos
+                        "Тест конструктора ({} + {}, split={}, {}) на {domain}:{port}...",
+                        custom_cfg.mode,
+                        custom_cfg.fooling,
+                        custom_cfg.split_pos,
+                        if stream_verify {
+                            "192 КиБ"
+                        } else {
+                            "32 КиБ"
+                        },
                     ),
                 );
-                match probe_custom_strategy(domain, port, &custom_cfg, 1800).await {
+                match probe_custom_strategy_with_options(
+                    domain,
+                    port,
+                    &custom_cfg,
+                    1800,
+                    stream_verify,
+                )
+                .await
+                {
                     Ok(report) => {
                         self.push_log("info", "probe", &report.diagnosis);
                         serde_json::json!({
@@ -1333,6 +1599,117 @@ impl DesyncRuntime {
                     "core_outbound_json": outbound_json,
                 })
             }
+            "update_dns_settings" => {
+                let raw_val = payload.get("dns").cloned().unwrap_or(payload);
+                match serde_json::from_value::<crate::dns_resolver::DnsSettings>(raw_val) {
+                    Ok(mut dns_cfg) => {
+                        crate::dns_resolver::sanitize_dns_settings(&mut dns_cfg);
+                        {
+                            let mut cfg = self.config.write().await;
+                            cfg.dns = dns_cfg.clone();
+                        }
+                        self.persist_and_recompile().await;
+                        self.push_log(
+                            "info",
+                            "dns",
+                            &format!(
+                                "Параметры DNS обновлены ({:?}, {:?}, серверов: {})",
+                                dns_cfg.protocol,
+                                dns_cfg.upstream_mode,
+                                dns_cfg.servers.len()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        self.push_log(
+                            "warn",
+                            "dns",
+                            &format!("Некорректный формат параметров DNS: {e}"),
+                        );
+                    }
+                }
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
+            "apply_dns_recommendation" => {
+                let raw_val = payload.get("recommendation").cloned().unwrap_or(payload);
+                match serde_json::from_value::<crate::dns_resolver::DnsRecommendation>(raw_val) {
+                    Ok(rec) => {
+                        {
+                            let mut cfg = self.config.write().await;
+                            cfg.dns.enabled = true;
+                            cfg.dns.protocol = rec.protocol;
+                            cfg.dns.upstream_mode = rec.upstream_mode;
+                            cfg.dns.servers = rec.servers;
+                            cfg.dns.bootstrap_servers = rec.bootstrap_servers;
+                            cfg.dns.fallback_servers = rec.fallback_servers;
+                            crate::dns_resolver::sanitize_dns_settings(&mut cfg.dns);
+                        }
+                        self.persist_and_recompile().await;
+                        self.push_log(
+                            "info",
+                            "dns",
+                            &format!("Применена рекомендация DNS: {}", rec.reason_ru),
+                        );
+                    }
+                    Err(e) => {
+                        self.push_log(
+                            "warn",
+                            "dns",
+                            &format!("Некорректный формат рекомендации DNS: {e}"),
+                        );
+                    }
+                }
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
+            "flush_dns_cache" => {
+                crate::dns_resolver::flush_dns_caches();
+                self.push_log("info", "dns", "Кэш DNS и таблица соответствия IP очищены");
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
+            "update_network_tuning" => {
+                let raw_val = payload.get("network").cloned().unwrap_or(payload);
+                match serde_json::from_value::<crate::upstream_compat::NetworkTuningConfig>(raw_val)
+                {
+                    Ok(mut net_cfg) => {
+                        crate::upstream_compat::sanitize_network_tuning(&mut net_cfg);
+                        let (need_tun_restart, was_running) = {
+                            let mut cfg = self.config.write().await;
+                            let tun_iface_changed = cfg.capture_mode == CaptureMode::Tun
+                                && (cfg.network.tun_mtu != net_cfg.tun_mtu
+                                    || cfg.network.tun_ipv6 != net_cfg.tun_ipv6);
+                            cfg.network = net_cfg.clone();
+                            (tun_iface_changed, self.running.load(Ordering::Relaxed))
+                        };
+                        if need_tun_restart && was_running {
+                            self.stop().await;
+                            self.persist_and_recompile().await;
+                            let _ = self.start().await;
+                        } else {
+                            self.persist_and_recompile().await;
+                        }
+                        self.push_log(
+                            "info",
+                            "system",
+                            &format!(
+                                "Параметры сетевого стека обновлены (CC={}, TUN={}, MTU={}, MSS Clamp={}, HappyEyeballs={})",
+                                net_cfg.tcp_congestion.as_str(),
+                                net_cfg.tun_buffer_mode.label_en(),
+                                net_cfg.tun_mtu,
+                                net_cfg.tun_mss_clamp,
+                                net_cfg.happy_eyeballs,
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        self.push_log(
+                            "warn",
+                            "system",
+                            &format!("Некорректный формат параметров сетевого стека: {e}"),
+                        );
+                    }
+                }
+                serde_json::to_value(self.snapshot().await).unwrap_or_default()
+            }
             _ => serde_json::json!({ "error": format!("Неизвестная команда: {action}") }),
         }
     }
@@ -1341,11 +1718,15 @@ impl DesyncRuntime {
 impl Drop for DesyncRuntime {
     fn drop(&mut self) {
         if self.running.swap(false, Ordering::Relaxed) {
+            crate::dns_resolver::set_dns_service_active(false);
             if let Ok(flag) = self.stop_flag.lock() {
                 flag.store(true, Ordering::Relaxed);
             }
+            self.abort_bg_tasks();
             let _ = set_os_system_proxy(false, 7897);
             flush_persistent_cache();
+        } else {
+            self.abort_bg_tasks();
         }
     }
 }
@@ -1374,6 +1755,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
             let s0 = app
                 .handle_ipc_action("get_state", serde_json::json!({}))
@@ -1398,6 +1780,10 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some("local_proxy")
             );
+
+            // Не активируем глобальную DNS-стратегию на период start/stop, чтобы параллельный
+            // Happy Eyeballs тест из core-runtime не менял порядок адресов.
+            app.config.write().await.dns.enabled = false;
 
             // Запускаем через toggle_running
             let s1 = app
@@ -1426,6 +1812,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
             let mut c1 = DesyncConfig::from_preset(DesyncPreset::FakeSplit);
             c1.fake_ttl = 5;
@@ -1485,6 +1872,289 @@ mod tests {
                 .and_then(|x| x.get("strategy"))
                 .and_then(|v| v.as_str());
             assert_eq!(yt_strat, Some("profile:p_yt"));
+        });
+    }
+
+    #[test]
+    fn tdd_runtime_migrates_youtube_discord_and_sanitizes_missing_profiles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let app = DesyncRuntime::new_for_test();
+            let mut legacy_cfg = AppStateConfig {
+                default_strategy: ListStrategy::CustomProfile("missing_def".to_string()),
+                ..Default::default()
+            };
+            legacy_cfg
+                .app_strategies
+                .insert("foo.exe".to_string(), "profile:missing_app".to_string());
+            if let Some(yt) = legacy_cfg.lists.iter_mut().find(|l| l.id == "youtube") {
+                yt.block_quic = true;
+                yt.udp_fake = false;
+                yt.strategy = ListStrategy::CustomProfile("missing_yt".to_string());
+            }
+            if let Some(dc) = legacy_cfg.lists.iter_mut().find(|l| l.id == "discord") {
+                dc.udp_ports.clear();
+                dc.udp_fake_ttl = 6;
+                dc.entries = vec!["discord.com".to_string()];
+            }
+
+            let mut val = serde_json::to_value(&legacy_cfg).unwrap();
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("config_schema_version");
+            }
+            let legacy_json = serde_json::to_string(&val).unwrap();
+
+            let snap = app
+                .handle_ipc_action(
+                    "import_backup_json",
+                    serde_json::json!({ "json": legacy_json }),
+                )
+                .await;
+
+            assert_eq!(
+                snap.pointer("/config/default_strategy")
+                    .and_then(|v| v.as_str()),
+                Some("auto")
+            );
+            assert!(
+                matches!(
+                    snap.pointer("/config/app_strategies/foo.exe")
+                        .and_then(|v| v.as_str()),
+                    None | Some("auto")
+                ),
+                "missing per-app profile must be removed/reset cleanly"
+            );
+
+            let lists = snap
+                .pointer("/config/lists")
+                .and_then(|v| v.as_array())
+                .expect("lists array");
+            let yt = lists
+                .iter()
+                .find(|l| l.get("id").and_then(|x| x.as_str()) == Some("youtube"))
+                .expect("youtube list");
+            assert_eq!(yt.get("block_quic").and_then(|x| x.as_bool()), Some(false));
+            assert_eq!(yt.get("udp_fake").and_then(|x| x.as_bool()), Some(true));
+            assert_eq!(yt.get("strategy").and_then(|x| x.as_str()), Some("auto"));
+
+            let dc = lists
+                .iter()
+                .find(|l| l.get("id").and_then(|x| x.as_str()) == Some("discord"))
+                .expect("discord list");
+            assert_eq!(
+                dc.get("udp_ports").and_then(|x| x.as_str()),
+                Some("19294-19344, 50000-50100")
+            );
+            assert_eq!(dc.get("udp_fake_ttl").and_then(|x| x.as_u64()), Some(3));
+            let dc_entries: Vec<&str> = dc
+                .get("entries")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(
+                dc_entries.iter().any(|e| e.contains("104.16.0.0/12")),
+                "migrated discord entries must include 104.16.0.0/12: {dc_entries:?}"
+            );
+            assert!(
+                dc_entries.iter().any(|e| e.contains("35.217.0.0/16")),
+                "migrated discord entries must include 35.217.0.0/16: {dc_entries:?}"
+            );
+
+            let has_warn = snap
+                .pointer("/logs")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|e| e.get("level").and_then(|l| l.as_str()) == Some("warn"))
+                });
+            assert!(
+                has_warn,
+                "missing custom profile fallback must log a warning"
+            );
+
+            // Explicit post-migration user opt-in to youtube.block_quic = true must NOT be overwritten
+            let snap_opt_in = app
+                .handle_ipc_action(
+                    "update_list",
+                    serde_json::json!({ "id": "youtube", "block_quic": true }),
+                )
+                .await;
+            let cfg_json = serde_json::to_string(snap_opt_in.get("config").unwrap()).unwrap();
+            let snap_reimported = app
+                .handle_ipc_action(
+                    "import_backup_json",
+                    serde_json::json!({ "json": cfg_json }),
+                )
+                .await;
+            let yt2 = snap_reimported
+                .pointer("/config/lists")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .find(|l| l.get("id").and_then(|x| x.as_str()) == Some("youtube"))
+                .unwrap();
+            assert_eq!(
+                yt2.get("block_quic").and_then(|x| x.as_bool()),
+                Some(true),
+                "explicit post-migration youtube.block_quic = true must be preserved"
+            );
+        });
+    }
+
+    #[test]
+    fn test_dns_settings_migration_and_ipc_actions() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let app = DesyncRuntime::new_for_test();
+
+            // 1. Схема v2 с explicit youtube.block_quic = true и dns_mode = "cloudflare"
+            // должна мигрировать dns в cloudflare, не трогая youtube.block_quic.
+            let mut v2_cfg = AppStateConfig {
+                config_schema_version: 2,
+                dns_mode: "cloudflare".to_string(),
+                ..Default::default()
+            };
+            if let Some(yt) = v2_cfg.lists.iter_mut().find(|l| l.id == "youtube") {
+                yt.block_quic = true;
+            }
+            let mut val = serde_json::to_value(&v2_cfg).unwrap();
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("dns");
+            }
+            let snap_mig = app
+                .handle_ipc_action(
+                    "import_backup_json",
+                    serde_json::json!({ "json": serde_json::to_string(&val).unwrap() }),
+                )
+                .await;
+            assert_eq!(
+                snap_mig
+                    .pointer("/config/config_schema_version")
+                    .and_then(|v| v.as_u64()),
+                Some(CURRENT_CONFIG_SCHEMA_VERSION as u64)
+            );
+            assert_eq!(
+                snap_mig
+                    .pointer("/config/dns/servers/0")
+                    .and_then(|v| v.as_str()),
+                Some("1.1.1.1")
+            );
+            let yt_bq = snap_mig
+                .pointer("/config/lists")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|l| l.get("id").and_then(|x| x.as_str()) == Some("youtube"))
+                })
+                .and_then(|l| l.get("block_quic"))
+                .and_then(|b| b.as_bool());
+            assert_eq!(yt_bq, Some(true));
+
+            // 2. update_dns_settings + flush_dns_cache + set_dns_overrides alias + apply_dns_recommendation
+            let new_dns = crate::dns_resolver::DnsSettings {
+                protocol: crate::dns_resolver::DnsProtocol::Doh,
+                upstream_mode: crate::dns_resolver::DnsUpstreamMode::Sequential,
+                servers: vec!["https://dns.quad9.net/dns-query".to_string()],
+                ..Default::default()
+            };
+            let snap_upd = app
+                .handle_ipc_action("update_dns_settings", serde_json::json!(new_dns))
+                .await;
+            assert_eq!(
+                snap_upd
+                    .pointer("/config/dns/protocol")
+                    .and_then(|v| v.as_str()),
+                Some("doh")
+            );
+            assert_eq!(
+                snap_upd
+                    .pointer("/dns_status/protocol")
+                    .and_then(|v| v.as_str()),
+                Some("doh")
+            );
+
+            let rec = crate::dns_resolver::DnsRecommendation {
+                protocol: crate::dns_resolver::DnsProtocol::Dot,
+                upstream_mode: crate::dns_resolver::DnsUpstreamMode::Parallel,
+                servers: vec!["dns.adguard-dns.com:853".to_string()],
+                bootstrap_servers: vec!["77.88.8.8:1253".to_string()],
+                fallback_servers: vec!["1.1.1.1".to_string()],
+                reason_ru: "test".to_string(),
+                reason_en: "test".to_string(),
+            };
+            let snap_rec = app
+                .handle_ipc_action("apply_dns_recommendation", serde_json::json!(rec))
+                .await;
+            assert_eq!(
+                snap_rec
+                    .pointer("/config/dns/protocol")
+                    .and_then(|v| v.as_str()),
+                Some("dot")
+            );
+
+            let snap_ov = app
+                .handle_ipc_action(
+                    "set_dns_overrides",
+                    serde_json::json!({ "overrides": "example.org=93.184.216.34" }),
+                )
+                .await;
+            assert_eq!(
+                snap_ov
+                    .pointer("/config/dns_overrides/example.org")
+                    .and_then(|v| v.as_str()),
+                Some("93.184.216.34")
+            );
+
+            let snap_flush = app
+                .handle_ipc_action("flush_dns_cache", serde_json::json!({}))
+                .await;
+            assert!(snap_flush.get("dns_status").is_some());
+
+            // 3. update_network_tuning (BBR/Cubic, MTU clamp, Happy Eyeballs, 192K stream verify)
+            let net_req = crate::upstream_compat::NetworkTuningConfig {
+                tcp_congestion: crate::upstream_compat::TcpCongestionMode::Cubic,
+                tun_buffer_mode: crate::upstream_compat::TunBufferMode::Turbo2m,
+                tun_mss_clamp: true,
+                tun_mtu: 25000, // должен зажаться до 9000
+                tun_ipv6: true,
+                happy_eyeballs: false,
+                quic_fast_failover: true,
+                stream_verify_192k: true,
+            };
+            let snap_net = app
+                .handle_ipc_action("update_network_tuning", serde_json::json!(net_req))
+                .await;
+            assert_eq!(
+                snap_net
+                    .pointer("/config/network/tcp_congestion")
+                    .and_then(|v| v.as_str()),
+                Some("cubic")
+            );
+            assert_eq!(
+                snap_net
+                    .pointer("/config/network/tun_mtu")
+                    .and_then(|v| v.as_u64()),
+                Some(9000)
+            );
+            assert_eq!(
+                crate::upstream_compat::active_tcp_congestion_mode(),
+                crate::upstream_compat::TcpCongestionMode::Cubic
+            );
+            assert_eq!(
+                crate::upstream_compat::active_tun_buffer_mode(),
+                crate::upstream_compat::TunBufferMode::Turbo2m
+            );
+            crate::upstream_compat::apply_network_tuning(
+                &crate::upstream_compat::NetworkTuningConfig::default(),
+            );
         });
     }
 }

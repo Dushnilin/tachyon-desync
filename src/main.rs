@@ -5,6 +5,7 @@ pub use upstream_compat::{cache_file, core_tls, dns, hardware, inbound, logging,
 
 pub mod apps;
 pub mod desync;
+pub mod dns_resolver;
 pub mod flows;
 pub mod gui;
 pub mod lists;
@@ -49,31 +50,10 @@ fn build_app_icon_data() -> egui::IconData {
 /// через окно трея и дожидаемся освобождения мьютекса, чтобы всегда запускалась актуальная сборка.
 #[cfg(target_os = "windows")]
 fn ensure_single_instance_or_focus(start_minimized: bool) -> bool {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateMutexW(
-            lp_mutex_attributes: *const core::ffi::c_void,
-            b_initial_owner: i32,
-            lp_name: *const u16,
-        ) -> *mut core::ffi::c_void;
-        fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn FindWindowW(
-            lp_class_name: *const u16,
-            lp_window_name: *const u16,
-        ) -> *mut core::ffi::c_void;
-        fn PostMessageW(
-            h_wnd: *mut core::ffi::c_void,
-            msg: u32,
-            w_param: usize,
-            l_param: isize,
-        ) -> i32;
-    }
-    const ERROR_ALREADY_EXISTS: u32 = 183;
-    const WM_COMMAND: u32 = 0x0111;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_COMMAND};
+
     const IDM_EXIT: usize = 1006;
 
     let name: Vec<u16> = "Local\\TachyonDesyncSingleInstanceMutex"

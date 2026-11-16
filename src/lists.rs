@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Действие, назначаемое списку доменов/подсетей.
@@ -177,6 +178,7 @@ pub struct CompiledListRule {
     pub domain_suffixes: Vec<String>,
     pub keywords: Vec<String>,
     pub subnets: Vec<(IpAddr, u8)>,
+    pub udp_subnets: Vec<(IpAddr, u8)>,
 }
 
 impl CompiledListRule {
@@ -185,6 +187,7 @@ impl CompiledListRule {
         let mut domain_suffixes = Vec::new();
         let mut keywords = Vec::new();
         let mut subnets = Vec::new();
+        let mut udp_subnets = Vec::new();
         let mut udp_port_ranges = parse_port_ranges(&profile.udp_ports);
 
         for raw in &profile.entries {
@@ -197,9 +200,16 @@ impl CompiledListRule {
             if line.is_empty() {
                 continue;
             }
+            if let Some(udp_spec) = line.strip_prefix("udp:") {
+                if let Some((ip_net, prefix)) = parse_cidr_or_ip(udp_spec) {
+                    udp_subnets.push((ip_net, prefix));
+                } else {
+                    udp_port_ranges.extend(parse_port_ranges(udp_spec));
+                }
+                continue;
+            }
             if let Some(port_spec) = line
-                .strip_prefix("udp:")
-                .or_else(|| line.strip_prefix("udp_ports:"))
+                .strip_prefix("udp_ports:")
                 .or_else(|| line.strip_prefix("ports:"))
             {
                 udp_port_ranges.extend(parse_port_ranges(port_spec));
@@ -263,6 +273,7 @@ impl CompiledListRule {
             domain_suffixes,
             keywords,
             subnets,
+            udp_subnets,
         }
     }
 
@@ -306,6 +317,12 @@ impl CompiledListRule {
         self.matches_domain_or_ip(host, dst_ip)
     }
 
+    pub fn matches_udp_subnet(&self, dst_ip: IpAddr) -> bool {
+        self.udp_subnets
+            .iter()
+            .any(|&(net, prefix)| ip_in_subnet(dst_ip, net, prefix))
+    }
+
     pub fn matches_packet(
         &self,
         host: Option<&str>,
@@ -313,16 +330,27 @@ impl CompiledListRule {
         dst_port: u16,
         is_udp: bool,
     ) -> bool {
-        if self.matches_domain_or_ip(host, dst_ip) {
-            return true;
+        if !is_udp {
+            return self.matches_domain_or_ip(host, dst_ip);
         }
-        if is_udp && !self.udp_port_ranges.is_empty() {
-            return self
+        if !self.udp_port_ranges.is_empty() {
+            let in_port_range = self
                 .udp_port_ranges
                 .iter()
                 .any(|&(lo, hi)| (lo..=hi).contains(&dst_port));
+            if in_port_range {
+                if self.matches_udp_subnet(dst_ip) || self.matches_domain_or_ip(host, dst_ip) {
+                    return true;
+                }
+                return self.exact_domains.is_empty()
+                    && self.domain_suffixes.is_empty()
+                    && self.keywords.is_empty()
+                    && self.subnets.is_empty()
+                    && self.udp_subnets.is_empty();
+            }
+            return dst_port == 443 && self.matches_domain_or_ip(host, dst_ip);
         }
-        false
+        self.matches_udp_subnet(dst_ip) || self.matches_domain_or_ip(host, dst_ip)
     }
 }
 
@@ -362,6 +390,20 @@ pub struct CompiledMatcher {
     pub lists_override_game_bypass: bool,
     pub upstream_proxy: String,
     pub app_strategies: Vec<(String, ListStrategy)>,
+}
+
+fn log_missing_custom_profile_once(profile_id: &str, list_name: &str) {
+    static WARNED: OnceLock<Mutex<LruCache<String, ()>>> = OnceLock::new();
+    let cache =
+        WARNED.get_or_init(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap())));
+    if let Ok(mut guard) = cache.lock()
+        && guard.get(profile_id).is_none()
+    {
+        guard.put(profile_id.to_string(), ());
+        eprintln!(
+            "[warn] custom profile 'profile:{profile_id}' not found for '{list_name}', falling back to Auto"
+        );
+    }
 }
 
 impl CompiledMatcher {
@@ -473,11 +515,10 @@ impl CompiledMatcher {
         self
     }
 
-    fn lookup_custom_profile(&self, profile_id: &str) -> &DesyncConfig {
+    fn lookup_custom_profile(&self, profile_id: &str) -> Option<&DesyncConfig> {
         self.custom_profiles
             .get(profile_id)
             .or_else(|| self.custom_profiles.get(&profile_id.to_lowercase()))
-            .unwrap_or(&self.custom_global_config)
     }
 
     fn find_app_strategy<'a>(
@@ -531,12 +572,21 @@ impl CompiledMatcher {
 
         // 1. Индивидуальная стратегия для конкретного .exe (Per-App Strategy Override)
         if let Some((app_label, app_strat)) = self.find_app_strategy(app_name) {
-            let app_block_quic = match app_strat {
-                ListStrategy::CustomProfile(pid) => self.lookup_custom_profile(pid).block_quic,
-                _ => self.custom_global_config.block_quic,
+            let (effective_strat, app_block_quic) = match app_strat {
+                ListStrategy::CustomProfile(pid) => {
+                    if let Some(prof) = self.lookup_custom_profile(pid) {
+                        (app_strat, prof.block_quic)
+                    } else {
+                        eprintln!(
+                            "[warn] custom profile 'profile:{pid}' not found for app '{app_label}', falling back to Auto"
+                        );
+                        (&ListStrategy::Auto, false)
+                    }
+                }
+                _ => (app_strat, self.custom_global_config.block_quic),
             };
             return self.strategy_to_decision_ext(
-                app_strat,
+                effective_strat,
                 app_block_quic,
                 true, // для выделенных .exe (Discord.exe, игры) включаем UDP Fake по умолчанию
                 0,
@@ -572,7 +622,9 @@ impl CompiledMatcher {
         if is_anticheat_or_protected_game_process(app_name) {
             if self.lists_override_game_bypass {
                 for rule in &self.rules {
-                    if rule.matches_domain_or_ip(effective_host, dst_ip) {
+                    let allowed_for_game = (!is_udp || dst_port == 443)
+                        && rule.matches_domain_or_ip(effective_host, dst_ip);
+                    if allowed_for_game {
                         return self.strategy_to_decision_ext(
                             &rule.strategy,
                             rule.block_quic,
@@ -648,10 +700,29 @@ impl CompiledMatcher {
         // Для произвольных UDP-портов вне списков (например, игровые UDP-порты 3074, 27015..27050, STUN)
         // никогда не инжектируем фейковые UDP-пакеты по умолчанию, если пакет не попал в целевой список
         // (Discord / YouTube) и пользователь явно не выбрал CustomGlobal / CustomProfile.
+        let (effective_default, default_block_quic, default_udp_fake) = match &self.default_strategy
+        {
+            ListStrategy::CustomProfile(pid) => {
+                if let Some(prof) = self.lookup_custom_profile(pid) {
+                    (&self.default_strategy, prof.block_quic, prof.udp_fake)
+                } else {
+                    eprintln!(
+                        "[warn] custom profile 'profile:{pid}' not found for default_strategy, falling back to Auto"
+                    );
+                    (&ListStrategy::Auto, false, true)
+                }
+            }
+            other => (
+                other,
+                self.custom_global_config.block_quic,
+                self.custom_global_config.udp_fake,
+            ),
+        };
+
         if is_udp
             && dst_port != 443
             && !matches!(
-                self.default_strategy,
+                effective_default,
                 ListStrategy::CustomGlobal | ListStrategy::CustomProfile(_)
             )
         {
@@ -661,18 +732,8 @@ impl CompiledMatcher {
         }
 
         // Правило по умолчанию для трафика вне списков
-        let (default_block_quic, default_udp_fake) = match &self.default_strategy {
-            ListStrategy::CustomProfile(pid) => {
-                let prof = self.lookup_custom_profile(pid);
-                (prof.block_quic, prof.udp_fake)
-            }
-            _ => (
-                self.custom_global_config.block_quic,
-                self.custom_global_config.udp_fake,
-            ),
-        };
         self.strategy_to_decision_ext(
-            &self.default_strategy,
+            effective_default,
             default_block_quic,
             default_udp_fake,
             0,
@@ -709,119 +770,85 @@ impl CompiledMatcher {
             }
         };
         match strategy {
-            ListStrategy::Direct => MatchDecision::Direct {
-                matched_list: Some(list_name.to_string()),
-            },
-            ListStrategy::Block => MatchDecision::Block {
-                reason: format!("Заблокировано правилом «{list_name}»"),
-            },
-            ListStrategy::UpstreamProxy => {
-                if !is_udp && !self.upstream_proxy.is_empty() {
-                    return MatchDecision::UpstreamProxy {
-                        proxy_url: self.upstream_proxy.clone(),
-                        matched_list: list_name.to_string(),
-                    };
-                }
-                if is_udp && block_quic && dst_port == 443 {
-                    return MatchDecision::Block {
-                        reason: format!(
-                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
-                        ),
-                    };
-                }
-                let mut cfg = DesyncConfig::from_preset(DesyncPreset::Auto);
-                cfg.block_quic = block_quic;
-                cfg.udp_fake = udp_fake;
-                cfg.fake_sni = self.custom_global_config.fake_sni.clone();
-                cfg.fake_ttl = self.custom_global_config.fake_ttl;
-                cfg.repeats = self.custom_global_config.repeats;
-                apply_udp_ttl(&mut cfg);
-                MatchDecision::Desync {
-                    config: cfg,
-                    matched_list: list_name.to_string(),
-                }
+            ListStrategy::Direct => {
+                return MatchDecision::Direct {
+                    matched_list: Some(list_name.to_string()),
+                };
             }
-            ListStrategy::Auto => {
-                if is_udp && block_quic && dst_port == 443 {
-                    return MatchDecision::Block {
-                        reason: format!(
-                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
-                        ),
-                    };
-                }
+            ListStrategy::Block => {
+                return MatchDecision::Block {
+                    reason: format!("Заблокировано правилом «{list_name}»"),
+                };
+            }
+            ListStrategy::UpstreamProxy if !is_udp && !self.upstream_proxy.is_empty() => {
+                return MatchDecision::UpstreamProxy {
+                    proxy_url: self.upstream_proxy.clone(),
+                    matched_list: list_name.to_string(),
+                };
+            }
+            ListStrategy::CustomProfile(profile_id)
+                if self.lookup_custom_profile(profile_id).is_none() =>
+            {
+                log_missing_custom_profile_once(profile_id, list_name);
                 let mut cfg = DesyncConfig::from_preset(DesyncPreset::Auto);
-                cfg.block_quic = block_quic;
+                cfg.block_quic = false;
                 cfg.udp_fake = udp_fake;
-                cfg.fake_sni = self.custom_global_config.fake_sni.clone();
-                cfg.fake_ttl = self.custom_global_config.fake_ttl;
-                cfg.repeats = self.custom_global_config.repeats;
                 apply_udp_ttl(&mut cfg);
-                MatchDecision::Desync {
+                return MatchDecision::Desync {
                     config: cfg,
                     matched_list: list_name.to_string(),
-                }
+                };
+            }
+            _ => {}
+        }
+
+        if is_udp && block_quic && dst_port == 443 {
+            return MatchDecision::Block {
+                reason: format!("QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"),
+            };
+        }
+
+        let mut cfg = match strategy {
+            ListStrategy::UpstreamProxy | ListStrategy::Auto => {
+                let mut c = DesyncConfig::from_preset(DesyncPreset::Auto);
+                c.fake_sni = self.custom_global_config.fake_sni.clone();
+                c.fake_ttl = self.custom_global_config.fake_ttl;
+                c.repeats = self.custom_global_config.repeats;
+                c
             }
             ListStrategy::Preset(code) => {
-                if is_udp && block_quic && dst_port == 443 {
-                    return MatchDecision::Block {
-                        reason: format!(
-                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
-                        ),
-                    };
-                }
                 let preset = DesyncPreset::from_name(code).unwrap_or(DesyncPreset::FakeSplit);
                 if preset == DesyncPreset::None {
                     return MatchDecision::Direct {
                         matched_list: Some(list_name.to_string()),
                     };
                 }
-                let mut cfg = DesyncConfig::from_preset(preset);
-                cfg.block_quic = block_quic;
-                cfg.udp_fake = udp_fake;
-                cfg.fake_sni = self.custom_global_config.fake_sni.clone();
-                cfg.fake_ttl = self.custom_global_config.fake_ttl;
-                apply_udp_ttl(&mut cfg);
-                MatchDecision::Desync {
-                    config: cfg,
-                    matched_list: list_name.to_string(),
-                }
+                let mut c = DesyncConfig::from_preset(preset);
+                c.fake_sni = self.custom_global_config.fake_sni.clone();
+                c.fake_ttl = self.custom_global_config.fake_ttl;
+                c
             }
             ListStrategy::CustomGlobal => {
-                if is_udp && block_quic && dst_port == 443 {
-                    return MatchDecision::Block {
-                        reason: format!(
-                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
-                        ),
-                    };
-                }
-                let mut cfg = self.custom_global_config.clone();
-                cfg.enabled = true;
-                cfg.block_quic = block_quic;
-                cfg.udp_fake = udp_fake;
-                apply_udp_ttl(&mut cfg);
-                MatchDecision::Desync {
-                    config: cfg,
-                    matched_list: list_name.to_string(),
-                }
+                let mut c = self.custom_global_config.clone();
+                c.enabled = true;
+                c
             }
             ListStrategy::CustomProfile(profile_id) => {
-                if is_udp && block_quic && dst_port == 443 {
-                    return MatchDecision::Block {
-                        reason: format!(
-                            "QUIC UDP/443 отключён профилем «{list_name}» (переход на TCP)"
-                        ),
-                    };
-                }
-                let mut cfg = self.lookup_custom_profile(profile_id).clone();
-                cfg.enabled = true;
-                cfg.block_quic = block_quic;
-                cfg.udp_fake = udp_fake;
-                apply_udp_ttl(&mut cfg);
-                MatchDecision::Desync {
-                    config: cfg,
-                    matched_list: list_name.to_string(),
-                }
+                let mut c = self
+                    .lookup_custom_profile(profile_id)
+                    .cloned()
+                    .unwrap_or_else(|| DesyncConfig::from_preset(DesyncPreset::Auto));
+                c.enabled = true;
+                c
             }
+            ListStrategy::Direct | ListStrategy::Block => unreachable!(),
+        };
+        cfg.block_quic = block_quic;
+        cfg.udp_fake = udp_fake;
+        apply_udp_ttl(&mut cfg);
+        MatchDecision::Desync {
+            config: cfg,
+            matched_list: list_name.to_string(),
         }
     }
 }
@@ -1044,6 +1071,20 @@ pub fn lookup_custom_dns_override(host: &str) -> Option<IpAddr> {
     None
 }
 
+static REVERSE_MAPPING_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Включить или выключить запись обратного отображения `IP -> Домен`.
+pub fn set_reverse_mapping_enabled(enabled: bool) {
+    REVERSE_MAPPING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Очистить кэш обратного отображения `IP -> Домен`.
+pub fn clear_dns_mapping_cache() {
+    if let Ok(mut c) = dns_ip_cache().lock() {
+        c.clear();
+    }
+}
+
 fn dns_ip_cache() -> &'static Mutex<LruCache<IpAddr, String>> {
     static DNS_CACHE: OnceLock<Mutex<LruCache<IpAddr, String>>> = OnceLock::new();
     DNS_CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())))
@@ -1051,6 +1092,9 @@ fn dns_ip_cache() -> &'static Mutex<LruCache<IpAddr, String>> {
 
 /// Записать соответствие `IP -> домен` в DNS-кэш.
 pub fn record_dns_mapping(ip: IpAddr, domain: &str) {
+    if !REVERSE_MAPPING_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let clean = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     if clean.is_empty() {
         return;
@@ -1070,6 +1114,9 @@ pub fn lookup_dns_mapping(ip: IpAddr) -> Option<String> {
 
 /// Разобрать UDP-пакет DNS-ответа (RFC 1035) и сохранить все записи `A` и `AAAA` в кэш `IP -> QNAME`.
 pub fn snoop_dns_response_packet(udp_payload: &[u8]) -> usize {
+    if !REVERSE_MAPPING_ENABLED.load(Ordering::Relaxed) {
+        return 0;
+    }
     if udp_payload.len() < 12 {
         return 0;
     }
@@ -1197,7 +1244,7 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
             builtin: true,
             enabled: true,
             strategy: ListStrategy::Auto,
-            block_quic: true,
+            block_quic: false,
             udp_fake: true,
             udp_ports: String::new(),
             udp_fake_ttl: 0,
@@ -1243,6 +1290,8 @@ pub fn default_builtin_lists() -> Vec<ListProfile> {
                 "discord.co",
                 "airhorn.solutions",
                 "kw:discord",
+                "udp:104.16.0.0/12",
+                "udp:35.217.0.0/16",
             ]
             .into_iter()
             .map(String::from)
@@ -1564,14 +1613,20 @@ mod tests {
         let lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
 
-        // 1. YouTube по SNI должен матчиться в профиль YouTube и блокировать QUIC UDP/443
+        // 1. YouTube по SNI по умолчанию разрешает QUIC UDP/443 с UDP-десинком (block_quic = false)
         let d_quic = matcher.evaluate(
             Some("rr1---sn-abc.googlevideo.com"),
             "142.250.74.110".parse().unwrap(),
             443,
             true,
         );
-        assert!(matches!(d_quic, MatchDecision::Block { .. }));
+        match d_quic {
+            MatchDecision::Desync { config, .. } => {
+                assert!(!config.block_quic);
+                assert!(config.udp_fake);
+            }
+            other => panic!("Expected Desync for YouTube UDP/443, got {other:?}"),
+        }
 
         // 2. YouTube по TCP/443 должен получать Desync
         let d_tcp = matcher.evaluate(
@@ -2006,5 +2061,258 @@ mod tests {
             Some("cod.exe"),
         );
         assert!(matches!(d_patch_off, MatchDecision::Direct { .. }));
+    }
+
+    #[test]
+    fn tdd_youtube_default_allows_quic_udp443_with_udp_fake() {
+        let mut lists = default_builtin_lists();
+        let yt = lists
+            .iter()
+            .find(|l| l.id == "youtube")
+            .expect("youtube builtin list");
+        assert!(
+            !yt.block_quic,
+            "YouTube builtin default must have block_quic = false so HTTP/3 works"
+        );
+        assert!(yt.udp_fake, "YouTube builtin default must enable udp_fake");
+
+        let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        let d_quic = matcher.evaluate(
+            Some("rr1---sn-abc.googlevideo.com"),
+            "142.250.74.110".parse().unwrap(),
+            443,
+            true,
+        );
+        match d_quic {
+            MatchDecision::Desync {
+                config,
+                matched_list,
+            } => {
+                assert!(matched_list.contains("YouTube"));
+                assert!(!config.block_quic);
+                assert!(config.udp_fake);
+            }
+            other => panic!("Expected Desync for YouTube UDP/443, got {other:?}"),
+        }
+
+        // Explicit user opt-in block_quic = true must still block QUIC UDP/443
+        if let Some(yt_mut) = lists.iter_mut().find(|l| l.id == "youtube") {
+            yt_mut.block_quic = true;
+        }
+        let matcher_blocked =
+            CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        let d_blocked = matcher_blocked.evaluate(
+            Some("rr1---sn-abc.googlevideo.com"),
+            "142.250.74.110".parse().unwrap(),
+            443,
+            true,
+        );
+        assert!(matches!(d_blocked, MatchDecision::Block { .. }));
+    }
+
+    #[test]
+    fn tdd_missing_custom_profile_falls_back_to_auto_never_block_or_poisoned_global() {
+        let mut poisoned_global = DesyncConfig::from_preset(DesyncPreset::None);
+        poisoned_global.enabled = false;
+        poisoned_global.auto = false;
+        poisoned_global.block_quic = true;
+
+        // 1. Missing profile on a list rule
+        let mut lists = default_builtin_lists();
+        if let Some(yt) = lists.iter_mut().find(|l| l.id == "youtube") {
+            yt.strategy = ListStrategy::CustomProfile("missing_list_prof".to_string());
+        }
+        let mut app_strats = std::collections::BTreeMap::new();
+        app_strats.insert(
+            "customapp.exe".to_string(),
+            "profile:missing_app_prof".to_string(),
+        );
+
+        let matcher = CompiledMatcher::build_full(
+            &lists,
+            ListStrategy::CustomProfile("missing_default_prof".to_string()),
+            poisoned_global,
+            AppFilterMode::All,
+            Vec::new(),
+            true,
+            String::new(),
+            &app_strats,
+            &std::collections::BTreeMap::new(),
+        );
+
+        for is_udp in [false, true] {
+            let dec = matcher.evaluate(
+                Some("www.youtube.com"),
+                "142.250.74.110".parse().unwrap(),
+                443,
+                is_udp,
+            );
+            match dec {
+                MatchDecision::Desync { config, .. } => {
+                    assert!(config.enabled, "is_udp={is_udp}");
+                    assert!(config.auto, "missing list profile must fall back to Auto");
+                    assert!(
+                        !config.block_quic,
+                        "missing list profile must not inherit poisoned block_quic"
+                    );
+                }
+                other => panic!(
+                    "Expected Auto Desync fallback for missing list profile (is_udp={is_udp}), got {other:?}"
+                ),
+            }
+        }
+
+        // 2. Missing profile on per-app strategy
+        let d_app = matcher.evaluate_with_app(
+            Some("example.org"),
+            "93.184.216.34".parse().unwrap(),
+            443,
+            false,
+            Some("customapp.exe"),
+        );
+        match d_app {
+            MatchDecision::Desync { config, .. } => {
+                assert!(config.enabled);
+                assert!(config.auto, "missing app profile must fall back to Auto");
+            }
+            other => panic!("Expected Auto Desync fallback for missing app profile, got {other:?}"),
+        }
+
+        // 3. Missing profile on default_strategy: TCP/UDP 443 -> Auto Desync, non-443 UDP -> Direct
+        let d_def_tcp = matcher.evaluate(
+            Some("unknown-domain.example.net"),
+            "93.184.216.34".parse().unwrap(),
+            443,
+            false,
+        );
+        match d_def_tcp {
+            MatchDecision::Desync { config, .. } => {
+                assert!(config.enabled);
+                assert!(
+                    config.auto,
+                    "missing default_strategy profile must fall back to Auto"
+                );
+            }
+            other => {
+                panic!("Expected Auto Desync fallback for missing default profile, got {other:?}")
+            }
+        }
+
+        let d_def_quic = matcher.evaluate(
+            Some("unknown-domain.example.net"),
+            "93.184.216.34".parse().unwrap(),
+            443,
+            true,
+        );
+        assert!(
+            matches!(d_def_quic, MatchDecision::Desync { .. }),
+            "missing default_strategy profile must not Block UDP/443: {d_def_quic:?}"
+        );
+
+        let d_def_udp_game = matcher.evaluate(None, "93.184.216.34".parse().unwrap(), 30092, true);
+        assert!(
+            matches!(d_def_udp_game, MatchDecision::Direct { .. }),
+            "missing default_strategy profile must not bypass non-443 UDP guard: {d_def_udp_game:?}"
+        );
+    }
+
+    #[test]
+    fn tdd_discord_media_alternative_cloudflare_ports_tcp() {
+        let lists = default_builtin_lists();
+        let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+
+        for port in [443u16, 2053, 2083, 2087, 2096, 8443] {
+            for (host, ip) in [
+                ("cdn.discord.media", "162.159.135.232"),
+                ("media.discordapp.net", "104.16.10.1"),
+            ] {
+                let dec = matcher.evaluate(Some(host), ip.parse().unwrap(), port, false);
+                match dec {
+                    MatchDecision::Desync {
+                        config,
+                        matched_list,
+                    } => {
+                        assert!(matched_list.contains("Discord"), "{host}:{port}");
+                        assert!(config.enabled, "{host}:{port}");
+                    }
+                    other => {
+                        panic!("Expected Discord TCP Desync for {host}:{port}, got {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tdd_discord_voice_subnets_strict_udp_port_isolation_from_games_and_tcp() {
+        let lists = default_builtin_lists();
+        let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
+        let cf_voice_ip: IpAddr = "104.16.50.10".parse().unwrap();
+        let gcp_voice_ip: IpAddr = "35.217.14.88".parse().unwrap();
+        let non_discord_ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let snoop_voice_ip: IpAddr = "66.22.196.10".parse().unwrap();
+        record_dns_mapping(snoop_voice_ip, "rotterdam999.discord.media");
+
+        // 1. Both Discord Voice subnets (104.16.0.0/12, 35.217.0.0/16) on Voice UDP ports -> Desync TTL=3
+        for ip in [cf_voice_ip, gcp_voice_ip] {
+            for port in [19294u16, 19310, 19344, 50000, 50055, 50100] {
+                let dec = matcher.evaluate(None, ip, port, true);
+                match dec {
+                    MatchDecision::Desync {
+                        config,
+                        matched_list,
+                    } => {
+                        assert!(matched_list.contains("Discord"), "{ip}:{port}");
+                        assert!(config.udp_fake, "{ip}:{port}");
+                        assert_eq!(config.udp_fake_ttl, 3, "{ip}:{port}");
+                        assert!(config.explicit_udp_fake_ttl, "{ip}:{port}");
+                    }
+                    other => panic!("Expected Discord UDP Desync for {ip}:{port}, got {other:?}"),
+                }
+            }
+        }
+
+        // 2. Arbitrary non-Discord IP on Discord voice port range must NOT match Discord
+        for port in [19300u16, 50010] {
+            let dec = matcher.evaluate(None, non_discord_ip, port, true);
+            assert!(
+                matches!(dec, MatchDecision::Direct { .. }),
+                "non-Discord IP {non_discord_ip}:{port} must stay Direct, got {dec:?}"
+            );
+        }
+
+        // 3. Game UDP port 30092 (Call of Duty / Activision) must NEVER receive Discord UDP fakes
+        for ip in [cf_voice_ip, gcp_voice_ip, snoop_voice_ip] {
+            for app in [None, Some("cod.exe")] {
+                let dec = matcher.evaluate_with_app(None, ip, 30092, true, app);
+                assert!(
+                    matches!(dec, MatchDecision::Direct { .. }),
+                    "game UDP {ip}:30092 (app={app:?}) must be Direct, got {dec:?}"
+                );
+            }
+        }
+        let cod_voice_range =
+            matcher.evaluate_with_app(None, cf_voice_ip, 50010, true, Some("cod.exe"));
+        assert!(
+            matches!(cod_voice_range, MatchDecision::Direct { .. }),
+            "protected game process UDP must never be hijacked by subnet rule: {cod_voice_range:?}"
+        );
+
+        // 4. TCP/443 to 104.16.0.0/12 (Cloudflare) must NOT be hijacked by Discord ahead of AI/RU lists
+        let d_chatgpt = matcher.evaluate(Some("chatgpt.com"), cf_voice_ip, 443, false);
+        match d_chatgpt {
+            MatchDecision::Desync { matched_list, .. } => {
+                assert!(
+                    !matched_list.contains("Discord"),
+                    "chatgpt.com over 104.16.x.x TCP must not match Discord: {matched_list}"
+                );
+            }
+            other => panic!("Expected AI Desync for chatgpt.com, got {other:?}"),
+        }
+        let d_ru = matcher.evaluate(Some("gosuslugi.ru"), cf_voice_ip, 443, false);
+        assert!(
+            matches!(d_ru, MatchDecision::Direct { .. }),
+            "gosuslugi.ru over 104.16.x.x TCP must stay Direct, got {d_ru:?}"
+        );
     }
 }

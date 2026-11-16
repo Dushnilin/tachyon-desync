@@ -116,7 +116,11 @@ impl Controller for Cubic {
             } else {
                 segment
             };
-            self.cwnd = self.cwnd.saturating_add(step).min(self.rwnd).max(self.mss);
+            self.cwnd = self
+                .cwnd
+                .saturating_add(step)
+                .min(self.rwnd)
+                .max(self.mss);
             return;
         }
 

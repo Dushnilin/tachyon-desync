@@ -275,98 +275,23 @@ pub fn list_running_apps() -> Vec<RunningAppInfo> {
 mod imp {
     use super::*;
     use std::ffi::c_void;
-
-    const AF_INET: u32 = 2;
-    const AF_INET6: u32 = 23;
-    const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
-    const UDP_TABLE_OWNER_PID: u32 = 1;
-    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    const INVALID_HANDLE_VALUE: *mut c_void = (-1isize) as *mut c_void;
-
-    #[repr(C)]
-    struct MibTcpRowOwnerPid {
-        state: u32,
-        local_addr: u32,
-        local_port: u32,
-        remote_addr: u32,
-        remote_port: u32,
-        owning_pid: u32,
-    }
-
-    #[repr(C)]
-    struct MibTcp6RowOwnerPid {
-        local_addr: [u8; 16],
-        local_scope_id: u32,
-        local_port: u32,
-        remote_addr: [u8; 16],
-        remote_scope_id: u32,
-        remote_port: u32,
-        state: u32,
-        owning_pid: u32,
-    }
-
-    #[repr(C)]
-    struct MibUdpRowOwnerPid {
-        local_addr: u32,
-        local_port: u32,
-        owning_pid: u32,
-    }
-
-    #[repr(C)]
-    struct MibUdp6RowOwnerPid {
-        local_addr: [u8; 16],
-        local_scope_id: u32,
-        local_port: u32,
-        owning_pid: u32,
-    }
-
-    #[repr(C)]
-    struct ProcessEntry32W {
-        dw_size: u32,
-        cnt_usage: u32,
-        th32_process_id: u32,
-        th32_default_heap_id: usize,
-        th32_module_id: u32,
-        cnt_threads: u32,
-        th32_parent_process_id: u32,
-        pc_pri_class_base: i32,
-        dw_flags: u32,
-        sz_exe_file: [u16; 260],
-    }
-
-    #[link(name = "iphlpapi")]
-    unsafe extern "system" {
-        fn GetExtendedTcpTable(
-            p_tcp_table: *mut c_void,
-            pdw_size: *mut u32,
-            b_order: i32,
-            ul_af: u32,
-            table_class: u32,
-            reserved: u32,
-        ) -> u32;
-
-        fn GetExtendedUdpTable(
-            p_udp_table: *mut c_void,
-            pdw_size: *mut u32,
-            b_order: i32,
-            ul_af: u32,
-            table_class: u32,
-            reserved: u32,
-        ) -> u32;
-    }
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID,
+        MIB_UDP6ROW_OWNER_PID, MIB_UDPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
 
     // Примечание: мы принципиально НЕ импортируем и НЕ вызываем `OpenProcess`,
     // чтобы не триггерить `ObRegisterCallbacks` ядерных античитов (RICOCHET / randgrid.sys,
     // EasyAntiCheat, BattlEye, Vanguard). Имя `.exe` по PID определяется исключительно
     // через снимок таблицы процессов `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)`.
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CloseHandle(h_object: *mut c_void) -> i32;
-        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> *mut c_void;
-        fn Process32FirstW(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
-        fn Process32NextW(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
-    }
 
     struct ProcessSnapshotCache {
         map: HashMap<u32, String>,
@@ -389,28 +314,18 @@ mod imp {
         let mut map = HashMap::with_capacity(256);
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if !snap.is_null() && snap != INVALID_HANDLE_VALUE {
-            let mut entry = ProcessEntry32W {
-                dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
-                cnt_usage: 0,
-                th32_process_id: 0,
-                th32_default_heap_id: 0,
-                th32_module_id: 0,
-                cnt_threads: 0,
-                th32_parent_process_id: 0,
-                pc_pri_class_base: 0,
-                dw_flags: 0,
-                sz_exe_file: [0u16; 260],
-            };
+            let mut entry: PROCESSENTRY32W = unsafe { core::mem::zeroed() };
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
             if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
                 loop {
                     let nul = entry
-                        .sz_exe_file
+                        .szExeFile
                         .iter()
                         .position(|&c| c == 0)
-                        .unwrap_or(entry.sz_exe_file.len());
-                    if nul > 0 && entry.th32_process_id > 4 {
-                        let exe = String::from_utf16_lossy(&entry.sz_exe_file[..nul]);
-                        map.insert(entry.th32_process_id, exe);
+                        .unwrap_or(entry.szExeFile.len());
+                    if nul > 0 && entry.th32ProcessID > 4 {
+                        let exe = String::from_utf16_lossy(&entry.szExeFile[..nul]);
+                        map.insert(entry.th32ProcessID, exe);
                     }
                     if unsafe { Process32NextW(snap, &mut entry) } == 0 {
                         break;
@@ -438,7 +353,7 @@ mod imp {
             let rc = unsafe {
                 if is_udp {
                     GetExtendedUdpTable(
-                        buf.as_mut_ptr() as *mut c_void,
+                        buf.as_mut_ptr().cast::<c_void>(),
                         &mut size,
                         0,
                         af,
@@ -447,7 +362,7 @@ mod imp {
                     )
                 } else {
                     GetExtendedTcpTable(
-                        buf.as_mut_ptr() as *mut c_void,
+                        buf.as_mut_ptr().cast::<c_void>(),
                         &mut size,
                         0,
                         af,
@@ -456,7 +371,7 @@ mod imp {
                     )
                 }
             };
-            if rc == 0 {
+            if rc == NO_ERROR {
                 return Some(buf);
             }
             if rc != ERROR_INSUFFICIENT_BUFFER {
@@ -471,83 +386,90 @@ mod imp {
         u16::from_be((raw_port & 0xFFFF) as u16)
     }
 
-    pub fn lookup_socket_owner_pid(local_port: u16, is_udp: bool) -> Option<u32> {
-        if !is_udp {
-            if let Some(buf) = fetch_raw_table(false, AF_INET)
-                && buf.len() >= 4
-            {
-                let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                let row_size = std::mem::size_of::<MibTcpRowOwnerPid>();
-                let max_rows = (buf.len() - 4) / row_size;
-                let rows = unsafe {
-                    std::slice::from_raw_parts(
-                        buf[4..].as_ptr() as *const MibTcpRowOwnerPid,
-                        count.min(max_rows),
-                    )
-                };
-                for r in rows {
-                    if decode_win_port(r.local_port) == local_port && r.owning_pid > 4 {
-                        return Some(r.owning_pid);
-                    }
-                }
-            }
-            if let Some(buf) = fetch_raw_table(false, AF_INET6)
-                && buf.len() >= 4
-            {
-                let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                let row_size = std::mem::size_of::<MibTcp6RowOwnerPid>();
-                let max_rows = (buf.len() - 4) / row_size;
-                let rows = unsafe {
-                    std::slice::from_raw_parts(
-                        buf[4..].as_ptr() as *const MibTcp6RowOwnerPid,
-                        count.min(max_rows),
-                    )
-                };
-                for r in rows {
-                    if decode_win_port(r.local_port) == local_port && r.owning_pid > 4 {
-                        return Some(r.owning_pid);
-                    }
-                }
-            }
-        } else {
-            if let Some(buf) = fetch_raw_table(true, AF_INET)
-                && buf.len() >= 4
-            {
-                let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                let row_size = std::mem::size_of::<MibUdpRowOwnerPid>();
-                let max_rows = (buf.len() - 4) / row_size;
-                let rows = unsafe {
-                    std::slice::from_raw_parts(
-                        buf[4..].as_ptr() as *const MibUdpRowOwnerPid,
-                        count.min(max_rows),
-                    )
-                };
-                for r in rows {
-                    if decode_win_port(r.local_port) == local_port && r.owning_pid > 4 {
-                        return Some(r.owning_pid);
-                    }
-                }
-            }
-            if let Some(buf) = fetch_raw_table(true, AF_INET6)
-                && buf.len() >= 4
-            {
-                let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                let row_size = std::mem::size_of::<MibUdp6RowOwnerPid>();
-                let max_rows = (buf.len() - 4) / row_size;
-                let rows = unsafe {
-                    std::slice::from_raw_parts(
-                        buf[4..].as_ptr() as *const MibUdp6RowOwnerPid,
-                        count.min(max_rows),
-                    )
-                };
-                for r in rows {
-                    if decode_win_port(r.local_port) == local_port && r.owning_pid > 4 {
-                        return Some(r.owning_pid);
-                    }
-                }
+    trait OwnerRow: Sized {
+        const IS_UDP: bool;
+        const AF: u32;
+        fn local_port(&self) -> u16;
+        fn owning_pid(&self) -> u32;
+    }
+
+    impl OwnerRow for MIB_TCPROW_OWNER_PID {
+        const IS_UDP: bool = false;
+        const AF: u32 = AF_INET as u32;
+        fn local_port(&self) -> u16 {
+            decode_win_port(self.dwLocalPort)
+        }
+        fn owning_pid(&self) -> u32 {
+            self.dwOwningPid
+        }
+    }
+
+    impl OwnerRow for MIB_TCP6ROW_OWNER_PID {
+        const IS_UDP: bool = false;
+        const AF: u32 = AF_INET6 as u32;
+        fn local_port(&self) -> u16 {
+            decode_win_port(self.dwLocalPort)
+        }
+        fn owning_pid(&self) -> u32 {
+            self.dwOwningPid
+        }
+    }
+
+    impl OwnerRow for MIB_UDPROW_OWNER_PID {
+        const IS_UDP: bool = true;
+        const AF: u32 = AF_INET as u32;
+        fn local_port(&self) -> u16 {
+            decode_win_port(self.dwLocalPort)
+        }
+        fn owning_pid(&self) -> u32 {
+            self.dwOwningPid
+        }
+    }
+
+    impl OwnerRow for MIB_UDP6ROW_OWNER_PID {
+        const IS_UDP: bool = true;
+        const AF: u32 = AF_INET6 as u32;
+        fn local_port(&self) -> u16 {
+            decode_win_port(self.dwLocalPort)
+        }
+        fn owning_pid(&self) -> u32 {
+            self.dwOwningPid
+        }
+    }
+
+    fn with_iphlp_table<R: OwnerRow, T>(mut f: impl FnMut(&R) -> Option<T>) -> Option<T> {
+        let buf = fetch_raw_table(R::IS_UDP, R::AF)?;
+        if buf.len() < 4 {
+            return None;
+        }
+        let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = std::mem::size_of::<R>();
+        let max_rows = (buf.len() - 4) / row_size;
+        let rows_ptr = buf[4..].as_ptr().cast::<R>();
+        for i in 0..count.min(max_rows) {
+            // SAFETY: граница проверена через max_rows; read_unaligned избегает требований к выравниванию Vec<u8> + 4
+            let row = unsafe { rows_ptr.add(i).read_unaligned() };
+            if let Some(res) = f(&row) {
+                return Some(res);
             }
         }
         None
+    }
+
+    fn find_owner_in_table<R: OwnerRow>(local_port: u16) -> Option<u32> {
+        with_iphlp_table::<R, u32>(|r| {
+            (r.local_port() == local_port && r.owning_pid() > 4).then_some(r.owning_pid())
+        })
+    }
+
+    pub fn lookup_socket_owner_pid(local_port: u16, is_udp: bool) -> Option<u32> {
+        if is_udp {
+            find_owner_in_table::<MIB_UDPROW_OWNER_PID>(local_port)
+                .or_else(|| find_owner_in_table::<MIB_UDP6ROW_OWNER_PID>(local_port))
+        } else {
+            find_owner_in_table::<MIB_TCPROW_OWNER_PID>(local_port)
+                .or_else(|| find_owner_in_table::<MIB_TCP6ROW_OWNER_PID>(local_port))
+        }
     }
 
     pub fn query_os_process_name(pid: u32) -> Option<String> {
@@ -557,44 +479,22 @@ mod imp {
         snapshot_pid_map().remove(&pid)
     }
 
+    fn count_active_pids_in_table<R: OwnerRow>(map: &mut HashMap<u32, usize>) {
+        let _ = with_iphlp_table::<R, ()>(|r| {
+            let pid = r.owning_pid();
+            if pid > 4 {
+                *map.entry(pid).or_insert(0) += 1;
+            }
+            None
+        });
+    }
+
     pub fn collect_active_socket_pids() -> HashMap<u32, usize> {
         let mut map = HashMap::new();
-        if let Some(buf) = fetch_raw_table(false, AF_INET)
-            && buf.len() >= 4
-        {
-            let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-            let row_size = std::mem::size_of::<MibTcpRowOwnerPid>();
-            let max_rows = (buf.len() - 4) / row_size;
-            let rows = unsafe {
-                std::slice::from_raw_parts(
-                    buf[4..].as_ptr() as *const MibTcpRowOwnerPid,
-                    count.min(max_rows),
-                )
-            };
-            for r in rows {
-                if r.owning_pid > 4 {
-                    *map.entry(r.owning_pid).or_insert(0) += 1;
-                }
-            }
-        }
-        if let Some(buf) = fetch_raw_table(true, AF_INET)
-            && buf.len() >= 4
-        {
-            let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-            let row_size = std::mem::size_of::<MibUdpRowOwnerPid>();
-            let max_rows = (buf.len() - 4) / row_size;
-            let rows = unsafe {
-                std::slice::from_raw_parts(
-                    buf[4..].as_ptr() as *const MibUdpRowOwnerPid,
-                    count.min(max_rows),
-                )
-            };
-            for r in rows {
-                if r.owning_pid > 4 {
-                    *map.entry(r.owning_pid).or_insert(0) += 1;
-                }
-            }
-        }
+        count_active_pids_in_table::<MIB_TCPROW_OWNER_PID>(&mut map);
+        count_active_pids_in_table::<MIB_TCP6ROW_OWNER_PID>(&mut map);
+        count_active_pids_in_table::<MIB_UDPROW_OWNER_PID>(&mut map);
+        count_active_pids_in_table::<MIB_UDP6ROW_OWNER_PID>(&mut map);
         map
     }
 

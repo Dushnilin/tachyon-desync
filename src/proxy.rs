@@ -28,6 +28,22 @@ pub struct TrafficCounters {
     pub rx_bytes: AtomicU64,
 }
 
+/// RAII-счётчик активных TCP-соединений: гарантирует декремент при раннем возврате через `?` или панике.
+pub(crate) struct ActiveConnGuard<'a>(&'a AtomicU64);
+
+impl Drop for ActiveConnGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl TrafficCounters {
+    pub(crate) fn track_active(&self) -> ActiveConnGuard<'_> {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ActiveConnGuard(&self.active_connections)
+    }
+}
+
 /// Запустить комбинированный сервер SOCKS5 + HTTP/CONNECT на `127.0.0.1:port`.
 pub async fn run_local_proxy_server(
     listen_addr: SocketAddr,
@@ -302,60 +318,42 @@ async fn resolve_target_addr(
     Ok(chosen)
 }
 
-/// Универсальный конвейер TCP-соединения: читает первый пакет (`ClientHello` / HTTP),
-/// вычисляет правило по списку и приложению, применяет десинхронизацию и передаёт трафик в обе стороны.
-pub async fn relay_with_desync_policy(
-    mut client: TcpStream,
+#[inline]
+fn format_tcp_origin_prefix(source_prefix: &str, app_name: Option<&str>) -> String {
+    match (source_prefix.is_empty(), app_name) {
+        (true, Some(a)) => format!("[{a}] "),
+        (true, None) => String::new(),
+        (false, Some(a)) => format!("{source_prefix} [{a}] "),
+        (false, None) => format!("{source_prefix} "),
+    }
+}
+
+/// Общий исполнитель решения маршрутизации/десинхронизации TCP-потока для SOCKS5/HTTP прокси и TUN.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tcp_decision<S>(
+    mut client: S,
     dst_addr: SocketAddr,
-    known_host: Option<String>,
-    initial_payload: Vec<u8>,
-    matcher: Arc<CompiledMatcher>,
+    first_pkt: Vec<u8>,
+    sni_host: Option<String>,
+    app_name: Option<String>,
+    decision: MatchDecision,
+    source_prefix: &str,
     counters: Arc<TrafficCounters>,
     log_fn: LogCallback,
-) -> io::Result<()> {
-    let peer_port = client.peer_addr().map(|a| a.port()).unwrap_or(0);
-    let app_name = crate::apps::resolve_socket_process_name(peer_port, false);
-    let app_tag = app_name
-        .as_deref()
-        .map(|a| format!("[{a}] "))
-        .unwrap_or_default();
-
-    let first_pkt = if !initial_payload.is_empty() {
-        initial_payload
-    } else {
-        let mut buf = vec![0u8; 16384];
-        match tokio::time::timeout(Duration::from_millis(400), client.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                buf.truncate(n);
-                buf
-            }
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => Vec::new(),
-        }
-    };
-
-    let sni_host = extract_hostname(&first_pkt).or(known_host);
-    if let Some(ref h) = sni_host {
-        record_dns_mapping(dst_addr.ip(), h);
-    }
-
-    let decision = matcher.evaluate_with_app(
-        sni_host.as_deref(),
-        dst_addr.ip(),
-        dst_addr.port(),
-        false,
-        app_name.as_deref(),
-    );
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let origin_prefix = format_tcp_origin_prefix(source_prefix, app_name.as_deref());
     let display_target = sni_host
         .clone()
         .unwrap_or_else(|| dst_addr.ip().to_string());
 
     counters.total_connections.fetch_add(1, Ordering::Relaxed);
-    counters.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _active_guard = counters.track_active();
 
     let t0 = Instant::now();
-    let result = match decision {
+    match decision {
         MatchDecision::Block { reason } => {
             let _flow = crate::flows::register_flow(
                 "TCP",
@@ -369,7 +367,10 @@ pub async fn relay_with_desync_policy(
             (log_fn)(
                 "warn",
                 "block",
-                &format!("{app_tag}{display_target}:{} — {reason}", dst_addr.port()),
+                &format!(
+                    "{origin_prefix}{display_target}:{} — {reason}",
+                    dst_addr.port()
+                ),
             );
             Ok(())
         }
@@ -388,7 +389,7 @@ pub async fn relay_with_desync_policy(
                 "info",
                 "direct",
                 &format!(
-                    "{app_tag}{display_target}:{} -> Прямое соединение ({list_tag})",
+                    "{origin_prefix}{display_target}:{} -> Прямое соединение ({list_tag})",
                     dst_addr.port()
                 ),
             );
@@ -425,7 +426,7 @@ pub async fn relay_with_desync_policy(
                 "info",
                 "proxy",
                 &format!(
-                    "{app_tag}{display_target}:{} -> Внешний прокси {proxy_url} [{matched_list}]",
+                    "{origin_prefix}{display_target}:{} -> Внешний прокси {proxy_url} [{matched_list}]",
                     dst_addr.port()
                 ),
             );
@@ -477,13 +478,12 @@ pub async fn relay_with_desync_policy(
                             "warn",
                             "desync",
                             &format!(
-                                "{app_tag}{display_target}:{} ({}) -> [{matched_list}] ошибка: {e} (first_pkt={} Б)",
+                                "{origin_prefix}{display_target}:{} ({}) -> [{matched_list}] ошибка: {e} (first_pkt={} Б)",
                                 dst_addr.port(),
                                 dst_addr.ip(),
                                 first_pkt.len()
                             ),
                         );
-                        counters.active_connections.fetch_sub(1, Ordering::Relaxed);
                         return Err(e);
                     }
                 };
@@ -516,7 +516,7 @@ pub async fn relay_with_desync_policy(
                 "info",
                 "desync",
                 &format!(
-                    "{app_tag}{display_target}:{} -> [{matched_list}] {strategy_title}",
+                    "{origin_prefix}{display_target}:{} -> [{matched_list}] {strategy_title}",
                     dst_addr.port()
                 ),
             );
@@ -573,10 +573,54 @@ pub async fn relay_with_desync_policy(
             }
             relay_res.map(|_| ())
         }
+    }
+}
+
+/// Универсальный конвейер TCP-соединения: читает первый пакет (`ClientHello` / HTTP),
+/// вычисляет правило по списку и приложению, применяет десинхронизацию и передаёт трафик в обе стороны.
+pub async fn relay_with_desync_policy(
+    mut client: TcpStream,
+    dst_addr: SocketAddr,
+    known_host: Option<String>,
+    initial_payload: Vec<u8>,
+    matcher: Arc<CompiledMatcher>,
+    counters: Arc<TrafficCounters>,
+    log_fn: LogCallback,
+) -> io::Result<()> {
+    let peer_port = client.peer_addr().map(|a| a.port()).unwrap_or(0);
+    let app_name = crate::apps::resolve_socket_process_name(peer_port, false);
+
+    let first_pkt = if !initial_payload.is_empty() {
+        initial_payload
+    } else {
+        let mut buf = vec![0u8; 16384];
+        match tokio::time::timeout(Duration::from_millis(400), client.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                buf.truncate(n);
+                buf
+            }
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => Vec::new(),
+        }
     };
 
-    counters.active_connections.fetch_sub(1, Ordering::Relaxed);
-    result
+    let sni_host = extract_hostname(&first_pkt).or(known_host);
+    if let Some(ref h) = sni_host {
+        record_dns_mapping(dst_addr.ip(), h);
+    }
+
+    let decision = matcher.evaluate_with_app(
+        sni_host.as_deref(),
+        dst_addr.ip(),
+        dst_addr.port(),
+        false,
+        app_name.as_deref(),
+    );
+    execute_tcp_decision(
+        client, dst_addr, first_pkt, sni_host, app_name, decision, "", counters, log_fn,
+    )
+    .await
 }
 
 static SYSTEM_PROXY_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -598,18 +642,13 @@ pub fn install_crash_guard() {
 
     #[cfg(target_os = "windows")]
     unsafe {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn SetConsoleCtrlHandler(
-                handler_routine: unsafe extern "system" fn(u32) -> i32,
-                add: i32,
-            ) -> i32;
-        }
-        unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+        unsafe extern "system" fn ctrl_handler(
+            _ctrl_type: u32,
+        ) -> windows_sys::Win32::Foundation::BOOL {
             emergency_disable_system_proxy();
             0
         }
-        let _ = SetConsoleCtrlHandler(ctrl_handler, 1);
+        let _ = windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
 }
 
@@ -755,29 +794,56 @@ pub fn set_os_system_proxy(enable: bool, port: u16) -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn notify_wininet_proxy_changed() {
-    #[link(name = "wininet")]
-    unsafe extern "system" {
-        fn InternetSetOptionW(
-            h_internet: *mut core::ffi::c_void,
-            dw_option: u32,
-            lp_buffer: *mut core::ffi::c_void,
-            dw_buffer_length: u32,
-        ) -> i32;
-    }
-    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
-    const INTERNET_OPTION_REFRESH: u32 = 37;
+    use windows_sys::Win32::Networking::WinInet::{
+        INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
+    };
     unsafe {
         let _ = InternetSetOptionW(
-            core::ptr::null_mut(),
+            core::ptr::null(),
             INTERNET_OPTION_SETTINGS_CHANGED,
-            core::ptr::null_mut(),
+            core::ptr::null(),
             0,
         );
         let _ = InternetSetOptionW(
-            core::ptr::null_mut(),
+            core::ptr::null(),
             INTERNET_OPTION_REFRESH,
-            core::ptr::null_mut(),
+            core::ptr::null(),
             0,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_conn_guard_decrements_on_early_drop_and_unwind() {
+        let counters = TrafficCounters::default();
+        assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
+        {
+            let _g1 = counters.track_active();
+            let _g2 = counters.track_active();
+            assert_eq!(counters.active_connections.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = counters.track_active();
+            assert_eq!(counters.active_connections.load(Ordering::Relaxed), 1);
+            panic!("simulated early failure");
+        }));
+        assert!(res.is_err());
+        assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn parse_host_port_preserves_discord_alt_cloudflare_ports() {
+        for port in [443u16, 2053, 2083, 2087, 2096, 8443] {
+            let input = format!("cdn.discord.media:{port}");
+            let (host, parsed_port) = parse_host_port(&input, 443);
+            assert_eq!(host, "cdn.discord.media");
+            assert_eq!(parsed_port, port);
+        }
     }
 }

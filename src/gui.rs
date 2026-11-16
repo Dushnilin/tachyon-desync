@@ -5,16 +5,24 @@
 
 use crate::desync::{
     AutoTtlReport, DesyncConfig, PacketSlicePreview, ServiceHealthItem, StrategyGeneratorReport,
-    calibrate_optimal_ttl, generate_domain_strategy, inspect_client_hello_slices,
-    probe_custom_strategy, run_services_health_check,
+    calibrate_optimal_ttl, generate_domain_strategy_with_options, inspect_client_hello_slices,
+    probe_custom_strategy_with_options, run_services_health_check, white_sni_pool,
+};
+use crate::dns_resolver::{
+    DnsBenchmarkState, DnsIpStrategy, DnsProtocol, DnsRecommendation, DnsSettings,
+    DnsSpeedTestState, DnsUpstreamMode, bootstrap_presets, default_speed_test_domains,
+    estimate_cache_ram_kb, presets_for_protocol, run_dns_benchmark, run_dns_speed_test,
+    validate_dns_server_entry,
 };
 use crate::lists::AppFilterMode;
 use crate::runtime::{CaptureMode, DesyncRuntime, UiSnapshot};
+use crate::upstream_compat::{NetworkTuningConfig, TcpCongestionMode, TunBufferMode, hardware};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Key, Layout, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, TextStyle, Vec2,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -183,6 +191,7 @@ enum ActiveTab {
     Flows,
     Generator,
     Lists,
+    Dns,
     Logs,
 }
 
@@ -237,6 +246,24 @@ enum GuiUpdateState {
     Error(String),
 }
 
+struct BusyFlagGuard(Arc<Mutex<bool>>);
+
+impl Drop for BusyFlagGuard {
+    fn drop(&mut self) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *g = false;
+    }
+}
+
+fn try_acquire_busy(flag: &Arc<Mutex<bool>>) -> Option<BusyFlagGuard> {
+    let mut g = flag.lock().unwrap_or_else(|e| e.into_inner());
+    if *g {
+        return None;
+    }
+    *g = true;
+    Some(BusyFlagGuard(flag.clone()))
+}
+
 pub struct TachyonGuiApp {
     rt: Arc<DesyncRuntime>,
     tokio_handle: tokio::runtime::Handle,
@@ -266,6 +293,25 @@ pub struct TachyonGuiApp {
     dns_overrides_input: String,
     dns_overrides_dirty: bool,
 
+    // Вкладка DNS (резолвер, бенчмарк, автонастройка, тест скорости)
+    dns_draft: DnsSettings,
+    dns_dirty: bool,
+    dns_server_input: String,
+    dns_bootstrap_input: String,
+    dns_fallback_input: String,
+    dns_speed_domains_input: String,
+    dns_bench_state: Arc<Mutex<DnsBenchmarkState>>,
+    dns_bench_cancel: Arc<AtomicBool>,
+    dns_speed_state: Arc<Mutex<DnsSpeedTestState>>,
+    dns_speed_cancel: Arc<AtomicBool>,
+    dns_auto_apply_on_finish: Arc<AtomicBool>,
+    selected_speed_server_idx: Option<usize>,
+
+    // Сетевой стек и производительность (BBR / TUN / IPv6)
+    net_draft: NetworkTuningConfig,
+    net_dirty: bool,
+    show_net_tuning_panel: bool,
+
     // Вкладка Потоки (Live Flows + DataTable сортировка)
     flow_filter: String,
     flows_only_active: bool,
@@ -275,6 +321,7 @@ pub struct TachyonGuiApp {
     // Вкладка Генератор и Конструктор
     probe_domain: String,
     probe_port: u16,
+    probe_stream_192k: bool,
     probe_in_progress: Arc<Mutex<bool>>,
     probe_report: Arc<Mutex<Option<StrategyGeneratorReport>>>,
     ttl_calib_in_progress: Arc<Mutex<bool>>,
@@ -332,6 +379,10 @@ impl TachyonGuiApp {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let dns_draft = initial_snap.config.dns.clone();
+        let dns_speed_domains_input = dns_draft.speed_test_domains.join("\n");
+        let net_draft = initial_snap.config.network.clone();
+        let probe_stream_192k = net_draft.stream_verify_192k;
         let probe_domain = "www.youtube.com".to_string();
         let packet_preview = inspect_client_hello_slices(&probe_domain);
         let mut telemetry = VecDeque::with_capacity(HISTORY_LEN);
@@ -380,12 +431,28 @@ impl TachyonGuiApp {
             show_services_on_overview: false,
             dns_overrides_input,
             dns_overrides_dirty: false,
+            dns_draft,
+            dns_dirty: false,
+            dns_server_input: String::new(),
+            dns_bootstrap_input: String::new(),
+            dns_fallback_input: String::new(),
+            dns_speed_domains_input,
+            dns_bench_state: Arc::new(Mutex::new(DnsBenchmarkState::default())),
+            dns_bench_cancel: Arc::new(AtomicBool::new(false)),
+            dns_speed_state: Arc::new(Mutex::new(DnsSpeedTestState::default())),
+            dns_speed_cancel: Arc::new(AtomicBool::new(false)),
+            dns_auto_apply_on_finish: Arc::new(AtomicBool::new(false)),
+            selected_speed_server_idx: None,
+            net_draft,
+            net_dirty: false,
+            show_net_tuning_panel: false,
             flow_filter: String::new(),
             flows_only_active: false,
             flow_sort_col: FlowSortColumn::Time,
             flow_sort_asc: false,
             probe_domain,
             probe_port: 443,
+            probe_stream_192k,
             probe_in_progress: Arc::new(Mutex::new(false)),
             probe_report: Arc::new(Mutex::new(None)),
             ttl_calib_in_progress: Arc::new(Mutex::new(false)),
@@ -551,12 +618,7 @@ impl TachyonGuiApp {
         strategy_short_label(code, is_en).to_string()
     }
 
-    fn dispatch_ipc(&mut self, action: &str, payload: serde_json::Value) {
-        let rt = self.rt.clone();
-        let _ = self
-            .tokio_handle
-            .block_on(rt.handle_ipc_action(action, payload));
-        self.snap = self.tokio_handle.block_on(self.rt.snapshot());
+    fn sync_editable_fields_from_snap(&mut self) {
         if !self.builder_dirty {
             self.builder_cfg = self.snap.config.custom_global_config.clone();
         }
@@ -573,6 +635,22 @@ impl TachyonGuiApp {
                 .collect::<Vec<_>>()
                 .join("\n");
         }
+        if !self.dns_dirty {
+            self.dns_draft = self.snap.config.dns.clone();
+            self.dns_speed_domains_input = self.dns_draft.speed_test_domains.join("\n");
+        }
+        if !self.net_dirty {
+            self.net_draft = self.snap.config.network.clone();
+        }
+    }
+
+    fn dispatch_ipc(&mut self, action: &str, payload: serde_json::Value) {
+        let rt = self.rt.clone();
+        let _ = self
+            .tokio_handle
+            .block_on(rt.handle_ipc_action(action, payload));
+        self.snap = self.tokio_handle.block_on(self.rt.snapshot());
+        self.sync_editable_fields_from_snap();
     }
 
     fn poll_snapshot_if_due(&mut self) {
@@ -581,22 +659,7 @@ impl TachyonGuiApp {
         }
         self.last_refresh = Instant::now();
         self.snap = self.tokio_handle.block_on(self.rt.snapshot());
-        if !self.builder_dirty {
-            self.builder_cfg = self.snap.config.custom_global_config.clone();
-        }
-        if !self.upstream_proxy_dirty {
-            self.upstream_proxy_input = self.snap.config.upstream_proxy.clone();
-        }
-        if !self.dns_overrides_dirty {
-            self.dns_overrides_input = self
-                .snap
-                .config
-                .dns_overrides
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
+        self.sync_editable_fields_from_snap();
 
         let now = Instant::now();
         let rx = self.snap.rx_bytes;
@@ -1655,6 +1718,7 @@ impl TachyonGuiApp {
                         )
                     },
                 ),
+                (ActiveTab::Dns, "DNS".to_string()),
                 (
                     ActiveTab::Logs,
                     format!("{} ({})", if is_en { "Logs" } else { "Журнал" }, logs_cnt),
@@ -1668,7 +1732,7 @@ impl TachyonGuiApp {
                 .corner_radius(CornerRadius::same(6))
                 .inner_margin(Margin::same(2))
                 .show(ui, |ui| {
-                    ui.columns(5, |cols| {
+                    ui.columns(tabs.len(), |cols| {
                         for (i, (tab_id, label)) in tabs.into_iter().enumerate() {
                             let is_active = self.active_tab == tab_id;
                             let fill = if is_active {
@@ -1881,111 +1945,154 @@ impl TachyonGuiApp {
             self.draw_telemetry_chart(ui);
         });
 
-        // 2.5. Чистый DNS + Проверка доступности 6 ключевых узлов
+        // 2.5. Активный DNS (сводка + быстрая автонастройка) и экспресс-проверка 6 ключевых узлов
         Self::panel_frame().show(ui, |ui| {
             let is_checking = self.health_in_progress.lock().map(|g| *g).unwrap_or(false);
-            let cur_dns_owned = self.snap.config.dns_mode.clone();
-            let cur_dns = cur_dns_owned.as_str();
-            let mut next_dns_mode: Option<&'static str> = None;
+            let is_dns_benching = self.dns_bench_state.lock().map(|g| g.running).unwrap_or(false);
             let mut trigger_hc = false;
+            let mut trigger_dns_auto = false;
+            let mut open_dns_tab = false;
 
-            ui.horizontal(|ui| {
+            let dns_st = &self.snap.dns_status;
+            let dns_dot_col = if !dns_st.enabled {
+                TEXT_MUTED
+            } else if dns_st.consecutive_failures > 0 {
+                SEMANTIC_WARN
+            } else {
+                SEMANTIC_OK
+            };
+            let dns_proto_txt = if dns_st.enabled {
+                format!(
+                    "{} · {}",
+                    dns_st.protocol.as_str().to_ascii_uppercase(),
+                    if is_en {
+                        dns_st.upstream_mode.label_en()
+                    } else {
+                        dns_st.upstream_mode.label_ru()
+                    }
+                )
+            } else if is_en {
+                "OS System DNS".to_string()
+            } else {
+                "Системный DNS ОС".to_string()
+            };
+            let dns_primary = if !dns_st.enabled {
+                "-".to_string()
+            } else if !dns_st.active_primary.is_empty() {
+                dns_st.active_primary.clone()
+            } else {
+                self.snap
+                    .config
+                    .dns
+                    .servers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let dns_metrics = format!(
+                "{}/{} {} · ~{} {}",
+                dns_st.cache_hits,
+                dns_st.total_queries,
+                if is_en { "hits" } else { "кэш" },
+                dns_st.approx_ram_kb,
+                if is_en { "KiB" } else { "КиБ" },
+            );
+
+            ui.horizontal_wrapped(|ui| {
+                let (dot_r, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                ui.painter().circle_filled(dot_r.center(), 3.0, dns_dot_col);
                 ui.label(
                     RichText::new("DNS:")
+                        .strong()
                         .size(10.0)
                         .color(TEXT_SECONDARY),
                 );
-                let dns_label = match cur_dns {
-                    "cloudflare" => "Cloudflare (1.1.1.1)",
-                    "google" => "Google (8.8.8.8)",
-                    "port1253" => {
-                        if is_en {
-                            "Alt-Port (77.88.8.8:1253 / :5353)"
-                        } else {
-                            "Порт 1253/5353 (Анти-перехват)"
-                        }
-                    }
-                    "system" => {
-                        if is_en {
-                            "OS System DNS"
-                        } else {
-                            "Системный DNS ОС"
-                        }
-                    }
-                    _ => {
-                        if is_en {
-                            "Auto Clean (1253/5353 + 1.1.1.1)"
-                        } else {
-                            "Авто Чистый (1253/5353 + 1.1.1.1)"
-                        }
-                    }
-                };
-                let combo_w = (ui.available_width() - 156.0).max(116.0);
-                egui::ComboBox::from_id_salt("combo_clean_dns_mode")
-                    .width(combo_w)
-                    .selected_text(RichText::new(dns_label).size(10.0))
-                    .show_ui(ui, |ui| {
-                        let dns_opts = [
-                            (
-                                "auto",
-                                if is_en {
-                                    "Auto Clean (77.88.8.8:1253 + 1.1.1.1 + 8.8.8.8)"
-                                } else {
-                                    "Авто Чистый (77.88.8.8:1253 + 1.1.1.1 + 8.8.8.8)"
-                                },
-                            ),
-                            ("cloudflare", "Cloudflare (1.1.1.1 / 1.0.0.1)"),
-                            ("google", "Google (8.8.8.8 / 8.8.4.4)"),
-                            (
-                                "port1253",
-                                if is_en {
-                                    "Alt-Port (77.88.8.8:1253 + OpenDNS :5353)"
-                                } else {
-                                    "Нестандартные порты (77.88.8.8:1253 + OpenDNS :5353)"
-                                },
-                            ),
-                            (
-                                "system",
-                                if is_en {
-                                    "OS System DNS (off)"
-                                } else {
-                                    "Системный DNS ОС (выкл.)"
-                                },
-                            ),
-                        ];
-                        for (code, lbl) in dns_opts {
-                            if ui.selectable_label(cur_dns == code, lbl).clicked() {
-                                next_dns_mode = Some(code);
-                            }
-                        }
-                    });
+                Self::keycap(ui, &dns_proto_txt);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&dns_primary)
+                            .monospace()
+                            .size(10.0)
+                            .color(TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+                ui.label(
+                    RichText::new(dns_metrics)
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_MUTED),
+                );
+            });
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let hc_lbl = if is_checking {
-                        if is_en {
-                            "Checking..."
-                        } else {
-                            "Проверка..."
-                        }
-                    } else if is_en {
-                        "Check Services (6)"
+            ui.horizontal_wrapped(|ui| {
+                let auto_dns_lbl = if is_dns_benching {
+                    if is_en {
+                        "Auto-tuning DNS..."
                     } else {
-                        "Проверить узлы (6)"
-                    };
-                    if ui
-                        .add_enabled(!is_checking, Self::primary_button(hc_lbl))
-                        .clicked()
-                    {
-                        trigger_hc = true;
+                        "Автонастройка DNS..."
                     }
-                });
+                } else if is_en {
+                    "DNS Auto-Tune"
+                } else {
+                    "Автонастройка DNS"
+                };
+                if ui
+                    .add_enabled(
+                        !is_dns_benching,
+                        egui::Button::new(RichText::new(auto_dns_lbl).size(10.0).color(ACCENT)),
+                    )
+                    .on_hover_text(if is_en {
+                        "Benchmark public UDP/DoT/DoH resolvers and automatically apply the optimal configuration"
+                    } else {
+                        "Протестировать публичные UDP/DoT/DoH резолверы, подобрать оптимальный профиль и перейти во вкладку DNS"
+                    })
+                    .clicked()
+                {
+                    trigger_dns_auto = true;
+                }
+
+                let cfg_dns_lbl = if is_en {
+                    "DNS Settings"
+                } else {
+                    "Настройки DNS"
+                };
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new(cfg_dns_lbl).size(10.0).color(TEXT_PRIMARY),
+                    ))
+                    .clicked()
+                {
+                    open_dns_tab = true;
+                }
+
+                let hc_lbl = if is_checking {
+                    if is_en {
+                        "Checking..."
+                    } else {
+                        "Проверка..."
+                    }
+                } else if is_en {
+                    "Check Services (6)"
+                } else {
+                    "Проверить узлы (6)"
+                };
+                if ui
+                    .add_enabled(!is_checking, Self::primary_button(hc_lbl))
+                    .clicked()
+                {
+                    trigger_hc = true;
+                }
             });
 
             if trigger_hc {
                 self.start_health_check();
             }
-            if let Some(m) = next_dns_mode {
-                self.dispatch_ipc("set_dns_mode", serde_json::json!({ "dns_mode": m }));
+            if trigger_dns_auto {
+                self.active_tab = ActiveTab::Dns;
+                self.start_dns_benchmark(true);
+            } else if open_dns_tab {
+                self.active_tab = ActiveTab::Dns;
             }
 
             let mut auto_rel = self.snap.config.auto_relearn;
@@ -2031,46 +2138,7 @@ impl TachyonGuiApp {
             }
 
             if self.show_dns_overrides_panel {
-                let mut save_dns_ov = false;
-                Self::card_frame(false).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(if is_en {
-                                "Format: domain=IP (one per line, e.g. chatgpt.com=172.64.155.209)"
-                            } else {
-                                "Формат: домен=IP (по одному на строку, напр. chatgpt.com=172.64.155.209)"
-                            })
-                            .size(10.0)
-                            .color(TEXT_MUTED),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let sv_lbl = if is_en { "Save hosts" } else { "Сохранить hosts" };
-                            if ui.add(Self::primary_button(sv_lbl)).clicked() {
-                                save_dns_ov = true;
-                            }
-                        });
-                    });
-                    if ui
-                        .add(
-                            TextEdit::multiline(&mut self.dns_overrides_input)
-                                .font(FontId::new(10.0, FontFamily::Monospace))
-                                .desired_rows(3)
-                                .desired_width(ui.available_width())
-                                .hint_text("chatgpt.com=172.64.155.209\n*.googlevideo.com=142.250.74.14"),
-                        )
-                        .changed()
-                    {
-                        self.dns_overrides_dirty = true;
-                    }
-                });
-                if save_dns_ov {
-                    self.dns_overrides_dirty = false;
-                    let txt = self.dns_overrides_input.clone();
-                    self.dispatch_ipc(
-                        "set_dns_overrides_text",
-                        serde_json::json!({ "text": txt }),
-                    );
-                }
+                self.render_dns_overrides_editor(ui, is_en, "overview_dns_overrides");
             }
 
             let hc_items = self
@@ -2148,6 +2216,279 @@ impl TachyonGuiApp {
                 }
             }
         });
+
+        ui.add_space(4.0);
+
+        // 2.75. Компактная панель сетевого стека и производительности ядра (BBR / smoltcp / Happy Eyeballs)
+        Self::panel_frame().show(ui, |ui| {
+            let hw = hardware::HardwareProfile::detect();
+            let init_kb = hardware::smol_tcp_init_buf() / 1024;
+            let max_kb = hardware::smol_tcp_max_buf() / 1024;
+            let last_rtt_ms = hardware::last_connect_rtt_us() / 1000;
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "Network Stack & Tuning"
+                    } else {
+                        "Сетевой стек и производительность"
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+                Self::keycap(
+                    ui,
+                    &format!(
+                        "{} · {}..{} KiB · MTU {}",
+                        self.snap.config.network.tcp_congestion.as_str().to_ascii_uppercase(),
+                        init_kb,
+                        max_kb,
+                        self.snap.config.network.tun_mtu,
+                    ),
+                );
+                let hw_info = if last_rtt_ms > 0 {
+                    format!("{} MB · {} CPU · RTT {} ms", hw.total_ram_mb, hw.cpu_count, last_rtt_ms)
+                } else {
+                    format!("{} MB · {} CPU", hw.total_ram_mb, hw.cpu_count)
+                };
+                ui.label(RichText::new(hw_info).monospace().size(9.5).color(TEXT_MUTED));
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let adv_lbl = if self.show_net_tuning_panel {
+                        if is_en { "Hide" } else { "Скрыть" }
+                    } else if is_en {
+                        "Tune"
+                    } else {
+                        "Настроить"
+                    };
+                    if ui
+                        .small_button(RichText::new(adv_lbl).size(10.0).color(TEXT_SECONDARY))
+                        .clicked()
+                    {
+                        self.show_net_tuning_panel = !self.show_net_tuning_panel;
+                    }
+
+                    if ui
+                        .small_button(
+                            RichText::new(if is_en { "Turbo 4K" } else { "Турбо 4K" })
+                                .size(10.0)
+                                .color(ACCENT),
+                        )
+                        .on_hover_text(if is_en {
+                            "BBR + 2 MiB TUN auto-tune buffers + MSS Clamp + Happy Eyeballs v2 + 192 KiB Verify"
+                        } else {
+                            "Целочисленный BBR + буфер до 2 MiB + MSS Clamp + Happy Eyeballs v2 + зонд 192 KiB"
+                        })
+                        .clicked()
+                    {
+                        let turbo = NetworkTuningConfig {
+                            tcp_congestion: TcpCongestionMode::Bbr,
+                            tun_buffer_mode: TunBufferMode::Turbo2m,
+                            tun_mss_clamp: true,
+                            tun_mtu: self.net_draft.tun_mtu,
+                            tun_ipv6: self.net_draft.tun_ipv6,
+                            happy_eyeballs: true,
+                            quic_fast_failover: true,
+                            stream_verify_192k: true,
+                        };
+                        self.net_draft = turbo.clone();
+                        self.net_dirty = false;
+                        self.probe_stream_192k = true;
+                        self.dispatch_ipc("update_network_tuning", serde_json::json!(turbo));
+                        self.push_toast(
+                            ToastKind::Success,
+                            if is_en { "Turbo 4K profile applied" } else { "Профиль Турбо 4K применён" },
+                            "BBR + 2 MiB + Happy Eyeballs v2",
+                        );
+                    }
+
+                    if ui
+                        .small_button(
+                            RichText::new(if is_en { "Default" } else { "Базовый" })
+                                .size(10.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .clicked()
+                    {
+                        let def = NetworkTuningConfig::default();
+                        self.net_draft = def.clone();
+                        self.net_dirty = false;
+                        self.probe_stream_192k = def.stream_verify_192k;
+                        self.dispatch_ipc("update_network_tuning", serde_json::json!(def));
+                    }
+                });
+            });
+
+            if self.show_net_tuning_panel {
+                ui.add_space(4.0);
+                ui.columns(3, |cols| {
+                    cols[0].horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if is_en { "TCP CC:" } else { "TCP перегрузка:" })
+                                .size(10.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                        let cur_lbl = if is_en {
+                            self.net_draft.tcp_congestion.label_en()
+                        } else {
+                            self.net_draft.tcp_congestion.label_ru()
+                        };
+                        egui::ComboBox::from_id_salt("net_tcp_cc_combo")
+                            .width(124.0)
+                            .selected_text(RichText::new(cur_lbl).size(10.0))
+                            .show_ui(ui, |ui| {
+                                for m in TcpCongestionMode::ALL {
+                                    let lbl = if is_en { m.label_en() } else { m.label_ru() };
+                                    if ui
+                                        .selectable_label(self.net_draft.tcp_congestion == m, lbl)
+                                        .clicked()
+                                    {
+                                        self.net_draft.tcp_congestion = m;
+                                        self.net_dirty = true;
+                                    }
+                                }
+                            });
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if is_en { "TUN Buffer:" } else { "Буфер TUN:" })
+                                .size(10.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                        let cur_lbl = if is_en {
+                            self.net_draft.tun_buffer_mode.label_en()
+                        } else {
+                            self.net_draft.tun_buffer_mode.label_ru()
+                        };
+                        egui::ComboBox::from_id_salt("net_tun_buf_combo")
+                            .width(136.0)
+                            .selected_text(RichText::new(cur_lbl).size(10.0))
+                            .show_ui(ui, |ui| {
+                                for m in TunBufferMode::ALL {
+                                    let lbl = if is_en { m.label_en() } else { m.label_ru() };
+                                    if ui
+                                        .selectable_label(self.net_draft.tun_buffer_mode == m, lbl)
+                                        .clicked()
+                                    {
+                                        self.net_draft.tun_buffer_mode = m;
+                                        self.net_dirty = true;
+                                    }
+                                }
+                            });
+                    });
+
+                    cols[2].horizontal(|ui| {
+                        ui.label(RichText::new("TUN MTU:").size(10.0).color(TEXT_SECONDARY));
+                        if ui
+                            .add(egui::DragValue::new(&mut self.net_draft.tun_mtu).range(1280..=9000))
+                            .changed()
+                        {
+                            self.net_dirty = true;
+                        }
+                    });
+                });
+
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    if Self::gpui_switch(
+                        ui,
+                        &mut self.net_draft.tun_mss_clamp,
+                        if is_en {
+                            "MSS Clamp (IPv4 + IPv6 ext headers)"
+                        } else {
+                            "MSS Clamp (IPv4 + IPv6 заголовки)"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.net_dirty = true;
+                    }
+                    if Self::gpui_switch(
+                        ui,
+                        &mut self.net_draft.happy_eyeballs,
+                        "Happy Eyeballs v2 (RFC 8305)",
+                    )
+                    .changed()
+                    {
+                        self.net_dirty = true;
+                    }
+                    if Self::gpui_switch(
+                        ui,
+                        &mut self.net_draft.quic_fast_failover,
+                        if is_en {
+                            "QUIC Fast Failover (Host+IP)"
+                        } else {
+                            "Быстрый откат QUIC (Хост+IP)"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.net_dirty = true;
+                    }
+                    if Self::gpui_switch(
+                        ui,
+                        &mut self.net_draft.tun_ipv6,
+                        if is_en {
+                            "TUN IPv6 Routing"
+                        } else {
+                            "IPv6 в TUN (fd00::)"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.net_dirty = true;
+                    }
+                    if Self::gpui_switch(
+                        ui,
+                        &mut self.net_draft.stream_verify_192k,
+                        if is_en {
+                            "192 KiB Stream Probe"
+                        } else {
+                            "Зонд 192 KiB (поток)"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.probe_stream_192k = self.net_draft.stream_verify_192k;
+                        self.net_dirty = true;
+                    }
+                });
+
+                if self.net_dirty {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(Self::primary_button(if is_en {
+                                "Apply Stack Tuning"
+                            } else {
+                                "Применить настройки стека"
+                            }))
+                            .clicked()
+                        {
+                            let payload = self.net_draft.clone();
+                            self.net_dirty = false;
+                            self.dispatch_ipc("update_network_tuning", serde_json::json!(payload));
+                            self.push_toast(
+                                ToastKind::Success,
+                                if is_en { "Stack tuning saved" } else { "Настройки стека сохранены" },
+                                format!(
+                                    "CC={}, MTU={}",
+                                    self.net_draft.tcp_congestion.as_str(),
+                                    self.net_draft.tun_mtu
+                                ),
+                            );
+                        }
+                        if ui.button(if is_en { "Discard" } else { "Отменить" }).clicked() {
+                            self.net_draft = self.snap.config.network.clone();
+                            self.net_dirty = false;
+                        }
+                    });
+                }
+            }
+        });
+
+        ui.add_space(4.0);
 
         // 3. Карточки сервисов и категорий (по умолчанию свёрнуты)
         Self::panel_frame().show(ui, |ui| {
@@ -3052,19 +3393,25 @@ impl TachyonGuiApp {
         });
     }
 
-    fn start_health_check(&mut self) {
-        if let Ok(mut busy) = self.health_in_progress.lock() {
-            if *busy {
-                return;
-            }
-            *busy = true;
+    fn effective_probe_domain(&self) -> String {
+        let domain = self.probe_domain.trim();
+        if domain.is_empty() {
+            "www.youtube.com".to_string()
+        } else {
+            domain.to_string()
         }
+    }
+
+    fn start_health_check(&mut self) {
+        let Some(busy_guard) = try_acquire_busy(&self.health_in_progress) else {
+            return;
+        };
         let cfg = self.snap.config.custom_global_config.clone();
         let rt = self.rt.clone();
-        let busy_flag = self.health_in_progress.clone();
         let results_slot = self.health_results.clone();
 
         self.tokio_handle.spawn(async move {
+            let _busy_guard = busy_guard;
             let items = run_services_health_check(&cfg).await;
             let ok_cnt = items.iter().filter(|i| i.ok).count();
             rt.push_log(
@@ -3078,34 +3425,27 @@ impl TachyonGuiApp {
             if let Ok(mut g) = results_slot.lock() {
                 *g = items;
             }
-            if let Ok(mut busy) = busy_flag.lock() {
-                *busy = false;
-            }
         });
     }
 
     fn start_probe_scan(&mut self, scan_all: bool) {
-        if let Ok(mut busy) = self.probe_in_progress.lock() {
-            if *busy {
-                return;
-            }
-            *busy = true;
-        }
-        let domain = self.probe_domain.trim().to_string();
-        let domain = if domain.is_empty() {
-            "www.youtube.com".to_string()
-        } else {
-            domain
+        let Some(busy_guard) = try_acquire_busy(&self.probe_in_progress) else {
+            return;
         };
+        let domain = self.effective_probe_domain();
         self.packet_preview = inspect_client_hello_slices(&domain);
 
         let port = self.probe_port;
+        let stream_verify = self.probe_stream_192k;
         let rt = self.rt.clone();
-        let busy_flag = self.probe_in_progress.clone();
         let report_slot = self.probe_report.clone();
 
         self.tokio_handle.spawn(async move {
-            if let Ok(rep) = generate_domain_strategy(&domain, port, scan_all, 2500).await {
+            let _busy_guard = busy_guard;
+            if let Ok(rep) =
+                generate_domain_strategy_with_options(&domain, port, scan_all, 2500, stream_verify)
+                    .await
+            {
                 rt.push_log(
                     "info",
                     "probe",
@@ -3115,33 +3455,25 @@ impl TachyonGuiApp {
                     *guard = Some(rep);
                 }
             }
-            if let Ok(mut busy) = busy_flag.lock() {
-                *busy = false;
-            }
         });
     }
 
     fn start_custom_builder_probe(&mut self) {
-        if let Ok(mut busy) = self.probe_in_progress.lock() {
-            if *busy {
-                return;
-            }
-            *busy = true;
-        }
-        let domain = self.probe_domain.trim().to_string();
-        let domain = if domain.is_empty() {
-            "www.youtube.com".to_string()
-        } else {
-            domain
+        let Some(busy_guard) = try_acquire_busy(&self.probe_in_progress) else {
+            return;
         };
+        let domain = self.effective_probe_domain();
         let port = self.probe_port;
+        let stream_verify = self.probe_stream_192k;
         let cfg = self.builder_cfg.clone();
         let rt = self.rt.clone();
-        let busy_flag = self.probe_in_progress.clone();
         let report_slot = self.probe_report.clone();
 
         self.tokio_handle.spawn(async move {
-            if let Ok(rep) = probe_custom_strategy(&domain, port, &cfg, 2500).await {
+            let _busy_guard = busy_guard;
+            if let Ok(rep) =
+                probe_custom_strategy_with_options(&domain, port, &cfg, 2500, stream_verify).await
+            {
                 rt.push_log(
                     if rep.passed_count > 0 { "info" } else { "warn" },
                     "probe",
@@ -3151,31 +3483,20 @@ impl TachyonGuiApp {
                     *guard = Some(rep);
                 }
             }
-            if let Ok(mut busy) = busy_flag.lock() {
-                *busy = false;
-            }
         });
     }
 
     fn start_ttl_calibration(&mut self) {
-        if let Ok(mut busy) = self.ttl_calib_in_progress.lock() {
-            if *busy {
-                return;
-            }
-            *busy = true;
-        }
-        let domain = self.probe_domain.trim().to_string();
-        let domain = if domain.is_empty() {
-            "www.youtube.com".to_string()
-        } else {
-            domain
+        let Some(busy_guard) = try_acquire_busy(&self.ttl_calib_in_progress) else {
+            return;
         };
+        let domain = self.effective_probe_domain();
         let port = self.probe_port;
         let rt = self.rt.clone();
-        let busy_flag = self.ttl_calib_in_progress.clone();
         let report_slot = self.ttl_calib_report.clone();
 
         self.tokio_handle.spawn(async move {
+            let _busy_guard = busy_guard;
             if let Ok(rep) = calibrate_optimal_ttl(&domain, port).await {
                 let _ = rt
                     .handle_ipc_action(
@@ -3187,9 +3508,6 @@ impl TachyonGuiApp {
                 if let Ok(mut guard) = report_slot.lock() {
                     *guard = Some(rep);
                 }
-            }
-            if let Ok(mut busy) = busy_flag.lock() {
-                *busy = false;
             }
         });
     }
@@ -3277,6 +3595,15 @@ impl TachyonGuiApp {
                         self.start_ttl_calibration();
                     }
                 });
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                let sv_lbl = if is_en {
+                    "Stream Verify 192 KiB (detect 64..128 KiB CDN/video caps)"
+                } else {
+                    "Потоковый зонд 192 KiB (выявление отложенных лимитов видео/CDN)"
+                };
+                Self::gpui_switch(ui, &mut self.probe_stream_192k, sv_lbl);
             });
 
             // Если выполнена авто-калибровка TTL — отображаем компактную шкалу хопов 2..10 (один акцент на найденном хопе)
@@ -4118,6 +4445,20 @@ impl TachyonGuiApp {
                         self.builder_dirty = true;
                     }
                 }
+                egui::ComboBox::from_id_salt("b_white_sni_pool")
+                    .width(120.0)
+                    .selected_text(RichText::new("WHITE_SNI_POOL").monospace().size(9.5))
+                    .show_ui(ui, |ui| {
+                        for &sni in white_sni_pool() {
+                            if ui
+                                .selectable_label(self.builder_cfg.fake_sni == sni, sni)
+                                .clicked()
+                            {
+                                self.builder_cfg.fake_sni = sni.to_string();
+                                self.builder_dirty = true;
+                            }
+                        }
+                    });
                 ui.separator();
                 if ui
                     .small_button(
@@ -4143,6 +4484,26 @@ impl TachyonGuiApp {
                     self.builder_cfg.host_fake = false;
                     self.builder_cfg.wsize = 1;
                     self.builder_cfg.wscale = Some(1);
+                    self.builder_dirty = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Fake Payload (Hex):")
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                );
+                let pw = (ui.available_width() - 4.0).max(120.0);
+                if ui
+                    .add(
+                        TextEdit::singleline(&mut self.builder_cfg.fake_payload_hex)
+                            .hint_text("160301... (опционально)")
+                            .font(TextStyle::Monospace)
+                            .desired_width(pw),
+                    )
+                    .changed()
+                {
                     self.builder_dirty = true;
                 }
             });
@@ -4225,6 +4586,25 @@ impl TachyonGuiApp {
                 {
                     self.builder_dirty = true;
                 }
+
+                ui.label(RichText::new("QUIC Rep:").size(10.0).color(TEXT_SECONDARY));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.builder_cfg.quic_repeats)
+                            .range(0..=50)
+                            .custom_formatter(|v, _| {
+                                let n = v as u32;
+                                if n == 0 {
+                                    "Auto".to_string()
+                                } else {
+                                    n.to_string()
+                                }
+                            }),
+                    )
+                    .changed()
+                {
+                    self.builder_dirty = true;
+                }
             });
 
             ui.columns(2, |cols| {
@@ -4278,6 +4658,15 @@ impl TachyonGuiApp {
                     &mut cols[1],
                     &mut self.builder_cfg.udp_fake,
                     "UDP Fakes (QUIC/Voice)",
+                )
+                .changed()
+                {
+                    self.builder_dirty = true;
+                }
+                if Self::gpui_switch(
+                    &mut cols[1],
+                    &mut self.builder_cfg.quic_desync,
+                    "QUIC Initial Desync",
                 )
                 .changed()
                 {
@@ -5643,6 +6032,2036 @@ impl TachyonGuiApp {
         });
     }
 
+    fn parse_speed_domains(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for raw in text.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+            let d = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+            if d.len() >= 3 && d.contains('.') && !out.iter().any(|x| x == &d) {
+                out.push(d);
+                if out.len() >= 32 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn save_dns_overrides_input(&mut self) {
+        self.dns_overrides_dirty = false;
+        let txt = self.dns_overrides_input.clone();
+        self.dispatch_ipc("set_dns_overrides", serde_json::json!({ "text": txt }));
+        let is_en = self.is_en();
+        let cnt = self.snap.config.dns_overrides.len();
+        self.push_toast(
+            ToastKind::Success,
+            if is_en {
+                "Local hosts updated"
+            } else {
+                "Локальные переопределения сохранены"
+            },
+            if is_en {
+                format!("{cnt} domain overrides active")
+            } else {
+                format!("Активно записей: {cnt}")
+            },
+        );
+    }
+
+    fn render_dns_overrides_editor(&mut self, ui: &mut egui::Ui, is_en: bool, id_salt: &str) {
+        let mut save_dns_ov = false;
+        Self::card_frame(self.dns_overrides_dirty).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "Format: domain=IP or IP domain (one per line, no system hosts edit)"
+                    } else {
+                        "Формат: домен=IP или IP домен (по одному на строку, без правки системного hosts)"
+                    })
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let sv_lbl = if is_en {
+                        "Save hosts"
+                    } else {
+                        "Сохранить hosts"
+                    };
+                    if ui.add(Self::primary_button(sv_lbl)).clicked() {
+                        save_dns_ov = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            if ui
+                .add(
+                    TextEdit::multiline(&mut self.dns_overrides_input)
+                        .id_salt(id_salt)
+                        .font(FontId::new(10.0, FontFamily::Monospace))
+                        .desired_rows(4)
+                        .desired_width(ui.available_width())
+                        .hint_text("chatgpt.com=172.64.155.209\n*.googlevideo.com=142.250.74.14"),
+                )
+                .changed()
+            {
+                self.dns_overrides_dirty = true;
+            }
+        });
+        if save_dns_ov {
+            self.save_dns_overrides_input();
+        }
+    }
+
+    fn apply_dns_recommendation_with_toast(&mut self, rec: &DnsRecommendation) {
+        if let Ok(val) = serde_json::to_value(rec) {
+            self.dns_dirty = false;
+            self.dispatch_ipc("apply_dns_recommendation", val);
+            let is_en = self.is_en();
+            let proto_lbl = if is_en {
+                rec.protocol.label_en()
+            } else {
+                rec.protocol.label_ru()
+            };
+            let title = if is_en {
+                format!("DNS applied: {proto_lbl}")
+            } else {
+                format!("DNS применён: {proto_lbl}")
+            };
+            let detail = if is_en {
+                rec.reason_en.clone()
+            } else {
+                rec.reason_ru.clone()
+            };
+            self.push_toast(ToastKind::Success, title, detail);
+        }
+    }
+
+    fn flush_dns_cache_with_toast(&mut self) {
+        self.dispatch_ipc("flush_dns_cache", serde_json::Value::Null);
+        let is_en = self.is_en();
+        self.push_toast(
+            ToastKind::Info,
+            if is_en {
+                "DNS cache flushed"
+            } else {
+                "Кэш DNS очищен"
+            },
+            if is_en {
+                "Resolver cache and address table cleared"
+            } else {
+                "Локальный кэш ответов и обратная таблица очищены"
+            },
+        );
+    }
+
+    fn start_dns_benchmark(&mut self, auto_apply: bool) {
+        if let Ok(mut st) = self.dns_bench_state.lock() {
+            if st.running {
+                if auto_apply {
+                    self.dns_auto_apply_on_finish.store(true, Ordering::Release);
+                }
+                return;
+            }
+            *st = DnsBenchmarkState {
+                running: true,
+                progress_pct: 0,
+                current_target: String::new(),
+                results: Vec::new(),
+                recommendation: None,
+                error: None,
+            };
+        } else {
+            return;
+        }
+
+        self.dns_bench_cancel.store(false, Ordering::SeqCst);
+        self.dns_auto_apply_on_finish
+            .store(auto_apply, Ordering::Release);
+
+        let state_slot = self.dns_bench_state.clone();
+        let cancel = self.dns_bench_cancel.clone();
+        let cfg = self.snap.config.custom_global_config.clone();
+        let rt = self.rt.clone();
+
+        self.tokio_handle.spawn(async move {
+            struct BenchStateGuard(Arc<Mutex<DnsBenchmarkState>>);
+            impl Drop for BenchStateGuard {
+                fn drop(&mut self) {
+                    if let Ok(mut st) = self.0.lock() {
+                        st.running = false;
+                    }
+                }
+            }
+            let _guard = BenchStateGuard(state_slot.clone());
+            let rec_opt = run_dns_benchmark(state_slot.clone(), cancel.clone(), cfg).await;
+            let summary = if let Ok(mut st) = state_slot.lock() {
+                if st.recommendation.is_none() {
+                    st.recommendation = rec_opt;
+                }
+                st.running = false;
+                let ok_cnt = st.results.iter().filter(|r| r.latency_ms >= 0).count();
+                Some((ok_cnt, st.results.len()))
+            } else {
+                None
+            };
+            if let Some((ok_cnt, total)) = summary
+                && total > 0
+                && !cancel.load(Ordering::Relaxed)
+            {
+                rt.push_log(
+                    "info",
+                    "dns",
+                    &format!("Бенчмарк DNS завершён: доступно {ok_cnt}/{total} узлов"),
+                );
+            }
+        });
+    }
+
+    fn start_dns_speed_test(&mut self) {
+        if let Ok(mut st) = self.dns_speed_state.lock() {
+            if st.running {
+                return;
+            }
+            *st = DnsSpeedTestState {
+                running: true,
+                progress_pct: 0,
+                current_target: String::new(),
+                reports: Vec::new(),
+                error: None,
+            };
+        } else {
+            return;
+        }
+
+        self.dns_speed_cancel.store(false, Ordering::SeqCst);
+        self.selected_speed_server_idx = None;
+
+        let mut settings = self.dns_draft.clone();
+        let parsed = Self::parse_speed_domains(&self.dns_speed_domains_input);
+        settings.speed_test_domains = if parsed.is_empty() {
+            default_speed_test_domains()
+        } else {
+            parsed
+        };
+
+        let state_slot = self.dns_speed_state.clone();
+        let cancel = self.dns_speed_cancel.clone();
+        let cfg = self.snap.config.custom_global_config.clone();
+        let rt = self.rt.clone();
+
+        self.tokio_handle.spawn(async move {
+            struct SpeedStateGuard(Arc<Mutex<DnsSpeedTestState>>);
+            impl Drop for SpeedStateGuard {
+                fn drop(&mut self) {
+                    if let Ok(mut st) = self.0.lock() {
+                        st.running = false;
+                    }
+                }
+            }
+            let _guard = SpeedStateGuard(state_slot.clone());
+            run_dns_speed_test(settings, state_slot.clone(), cancel.clone(), cfg).await;
+            let count = if let Ok(mut st) = state_slot.lock() {
+                st.running = false;
+                st.reports.len()
+            } else {
+                0
+            };
+            if count > 0 && !cancel.load(Ordering::Relaxed) {
+                rt.push_log(
+                    "info",
+                    "dns",
+                    &format!("Тест скорости DNS завершён: проверено серверов — {count}"),
+                );
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_dns_server_list_editor(
+        ui: &mut egui::Ui,
+        is_en: bool,
+        title: &str,
+        hint: &str,
+        list: &mut Vec<String>,
+        input: &mut String,
+        dirty: &mut bool,
+        proto: DnsProtocol,
+        id_salt: &str,
+        max_items: usize,
+        min_items: usize,
+    ) -> Option<String> {
+        let mut validation_err: Option<String> = None;
+        Self::card_frame(false).show(ui, |ui| {
+            ui.push_id(id_salt, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{title} ({})", list.len()))
+                            .strong()
+                            .size(10.5)
+                            .color(TEXT_PRIMARY),
+                    );
+                });
+                ui.add_space(4.0);
+
+                let mut promote_idx: Option<usize> = None;
+                let mut remove_idx: Option<usize> = None;
+                for (idx, addr) in list.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let role_lbl = if idx == 0 {
+                            if is_en { "Primary" } else { "Осн." }
+                        } else if is_en {
+                            "Backup"
+                        } else {
+                            "Рез."
+                        };
+                        Self::semantic_tag(
+                            ui,
+                            role_lbl,
+                            if idx == 0 { ACCENT } else { TEXT_MUTED },
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(addr)
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .truncate(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    list.len() > min_items,
+                                    egui::Button::new(
+                                        RichText::new("×").monospace().size(10.0).color(TEXT_MUTED),
+                                    )
+                                    .small(),
+                                )
+                                .on_hover_text(if is_en { "Remove" } else { "Удалить" })
+                                .clicked()
+                            {
+                                remove_idx = Some(idx);
+                            }
+                            if idx > 0
+                                && ui
+                                    .small_button(
+                                        RichText::new("▲")
+                                            .monospace()
+                                            .size(9.5)
+                                            .color(TEXT_SECONDARY),
+                                    )
+                                    .on_hover_text(if is_en {
+                                        "Promote to primary"
+                                    } else {
+                                        "Сделать основным"
+                                    })
+                                    .clicked()
+                            {
+                                promote_idx = Some(idx);
+                            }
+                        });
+                    });
+                }
+
+                if let Some(idx) = promote_idx
+                    && idx < list.len()
+                {
+                    let item = list.remove(idx);
+                    list.insert(0, item);
+                    *dirty = true;
+                } else if let Some(idx) = remove_idx
+                    && idx < list.len()
+                    && list.len() > min_items
+                {
+                    list.remove(idx);
+                    *dirty = true;
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let inp_w = (ui.available_width() - 68.0).max(96.0);
+                    let resp = ui.add(
+                        TextEdit::singleline(input)
+                            .font(FontId::new(10.0, FontFamily::Monospace))
+                            .hint_text(hint)
+                            .desired_width(inp_w),
+                    );
+                    let enter_hit = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    let add_lbl = if is_en { "Add" } else { "Добавить" };
+                    if ui.small_button(RichText::new(add_lbl).size(10.0)).clicked() || enter_hit {
+                        let trimmed = input.trim();
+                        if !trimmed.is_empty() {
+                            if list.len() >= max_items {
+                                validation_err = Some(if is_en {
+                                    format!("Maximum {max_items} entries allowed")
+                                } else {
+                                    format!("Максимум записей: {max_items}")
+                                });
+                            } else {
+                                match validate_dns_server_entry(trimmed, proto) {
+                                    Ok(norm) => {
+                                        if !list.iter().any(|x| x.eq_ignore_ascii_case(&norm)) {
+                                            list.push(norm);
+                                            *dirty = true;
+                                        }
+                                        input.clear();
+                                    }
+                                    Err(e) => {
+                                        validation_err = Some(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        validation_err
+    }
+
+    fn render_dns_telemetry_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        is_en: bool,
+        bench_running: bool,
+        speed_running: bool,
+    ) {
+        let mut trigger_auto_tune = false;
+        let mut trigger_benchmark = false;
+        let mut trigger_speed = false;
+        let mut trigger_flush = false;
+
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "DNS Subsystem & Auto-Tune"
+                    } else {
+                        "Подсистема DNS и автонастройка"
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let flush_lbl = if is_en {
+                        "Flush Cache"
+                    } else {
+                        "Сбросить кэш"
+                    };
+                    if ui.small_button(RichText::new(flush_lbl).size(10.0)).clicked() {
+                        trigger_flush = true;
+                    }
+
+                    let speed_lbl = if speed_running {
+                        if is_en {
+                            "Speed Running..."
+                        } else {
+                            "Тест скорости..."
+                        }
+                    } else if is_en {
+                        "Speed Test"
+                    } else {
+                        "Тест скорости"
+                    };
+                    if ui
+                        .add_enabled(
+                            !speed_running,
+                            egui::Button::new(
+                                RichText::new(speed_lbl).size(10.0).color(TEXT_PRIMARY),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        trigger_speed = true;
+                    }
+
+                    let bench_lbl = if bench_running {
+                        if is_en {
+                            "Benchmarking..."
+                        } else {
+                            "Бенчмарк..."
+                        }
+                    } else if is_en {
+                        "DNS Benchmark"
+                    } else {
+                        "Бенчмарк DNS"
+                    };
+                    if ui
+                        .add_enabled(
+                            !bench_running,
+                            egui::Button::new(
+                                RichText::new(bench_lbl).size(10.0).color(TEXT_PRIMARY),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        trigger_benchmark = true;
+                    }
+
+                    let auto_lbl = if bench_running {
+                        if is_en {
+                            "Auto-Tuning..."
+                        } else {
+                            "Автонастройка..."
+                        }
+                    } else if is_en {
+                        "Auto-Tune (1-Click)"
+                    } else {
+                        "Автонастройка в 1 клик"
+                    };
+                    if ui
+                        .add_enabled(!bench_running, Self::primary_button(auto_lbl))
+                        .on_hover_text(if is_en {
+                            "Test public UDP/DoT/DoH resolvers and automatically apply the best configuration"
+                        } else {
+                            "Проверить публичные UDP/DoT/DoH резолверы и автоматически применить лучшую конфигурацию"
+                        })
+                        .clicked()
+                    {
+                        trigger_auto_tune = true;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+
+            let st = &self.snap.dns_status;
+            let hit_pct = if st.total_queries > 0 {
+                (st.cache_hits as f64 / st.total_queries as f64) * 100.0
+            } else {
+                0.0
+            };
+            let primary_display = if !st.enabled {
+                if is_en {
+                    "System OS".to_string()
+                } else {
+                    "Системный ОС".to_string()
+                }
+            } else if st.active_primary.is_empty() {
+                "-".to_string()
+            } else {
+                st.active_primary.clone()
+            };
+
+            ui.columns(4, |cols| {
+                Self::card_frame(false).show(&mut cols[0], |ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Active Upstream"
+                        } else {
+                            "Активный узел"
+                        })
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&primary_display)
+                                .monospace()
+                                .strong()
+                                .size(11.0)
+                                .color(if !st.enabled {
+                                    TEXT_MUTED
+                                } else if st.consecutive_failures > 0 {
+                                    SEMANTIC_WARN
+                                } else {
+                                    TEXT_PRIMARY
+                                }),
+                        )
+                        .truncate(),
+                    );
+                    let proto_str = if is_en {
+                        st.protocol.label_en()
+                    } else {
+                        st.protocol.label_ru()
+                    };
+                    let mode_str = if is_en {
+                        st.upstream_mode.label_en()
+                    } else {
+                        st.upstream_mode.label_ru()
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "{proto_str} · {mode_str} ({}/{})",
+                                if st.primary_count > 0 {
+                                    st.active_index + 1
+                                } else {
+                                    0
+                                },
+                                st.primary_count
+                            ))
+                            .monospace()
+                            .size(9.5)
+                            .color(TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    );
+                });
+
+                Self::card_frame(false).show(&mut cols[1], |ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Cache Hits / Total"
+                        } else {
+                            "Кэш / Запросы"
+                        })
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!("{}/{}", st.cache_hits, st.total_queries))
+                            .monospace()
+                            .strong()
+                            .size(14.0)
+                            .color(ACCENT),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{:.0}% hit · {} DoH/DoT",
+                            hit_pct, st.encrypted_queries
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+
+                Self::card_frame(false).show(&mut cols[2], |ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Cache Entries"
+                        } else {
+                            "Размер кэша"
+                        })
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!("{}/{}", st.cache_entries, st.cache_capacity))
+                            .monospace()
+                            .strong()
+                            .size(14.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "~{} {}",
+                            st.approx_ram_kb,
+                            if is_en { "KiB RAM" } else { "КиБ ОЗУ" }
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+
+                Self::card_frame(false).show(&mut cols[3], |ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Failover Switches"
+                        } else {
+                            "Переключения"
+                        })
+                        .size(10.0)
+                        .color(TEXT_MUTED),
+                    );
+                    ui.label(
+                        RichText::new(st.failover_switches.to_string())
+                            .monospace()
+                            .strong()
+                            .size(14.0)
+                            .color(if st.failover_switches > 0 {
+                                SEMANTIC_WARN
+                            } else {
+                                TEXT_PRIMARY
+                            }),
+                    );
+                    ui.label(
+                        RichText::new(if is_en {
+                            format!("Consecutive fails: {}", st.consecutive_failures)
+                        } else {
+                            format!("Сбоев подряд: {}", st.consecutive_failures)
+                        })
+                        .monospace()
+                        .size(9.5)
+                        .color(if st.consecutive_failures > 0 {
+                            SEMANTIC_WARN
+                        } else {
+                            TEXT_SECONDARY
+                        }),
+                    );
+                });
+            });
+        });
+
+        if trigger_auto_tune {
+            self.start_dns_benchmark(true);
+        } else if trigger_benchmark {
+            self.start_dns_benchmark(false);
+        }
+        if trigger_speed {
+            self.start_dns_speed_test();
+        }
+        if trigger_flush {
+            self.flush_dns_cache_with_toast();
+        }
+    }
+
+    fn render_dns_benchmark_section(&mut self, ui: &mut egui::Ui, is_en: bool) {
+        let bench_snap = self
+            .dns_bench_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut apply_rec_opt: Option<DnsRecommendation> = None;
+
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "1. Resolver Benchmark & Auto-Tune"
+                    } else {
+                        "1. Бенчмарк резолверов и автонастройка"
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+                if bench_snap.running {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let stop_lbl = if is_en { "Stop" } else { "Остановить" };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(stop_lbl).size(10.0).color(Color32::WHITE),
+                                )
+                                .fill(SEMANTIC_ERR),
+                            )
+                            .clicked()
+                        {
+                            self.dns_bench_cancel.store(true, Ordering::SeqCst);
+                            self.dns_auto_apply_on_finish
+                                .store(false, Ordering::Release);
+                        }
+                    });
+                }
+            });
+
+            if bench_snap.running || bench_snap.progress_pct > 0 {
+                ui.add_space(4.0);
+                let frac = (bench_snap.progress_pct.min(100) as f32) / 100.0;
+                let bar_txt = if bench_snap.current_target.is_empty() {
+                    format!("{}%", bench_snap.progress_pct)
+                } else {
+                    format!("{}% · {}", bench_snap.progress_pct, bench_snap.current_target)
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(ui.available_width())
+                        .desired_height(16.0)
+                        .fill(active_tokens().accent)
+                        .text(RichText::new(bar_txt).monospace().size(10.0)),
+                );
+            }
+
+            if let Some(ref err) = bench_snap.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(err).size(10.0).color(SEMANTIC_ERR));
+            }
+
+            if let Some(ref rec) = bench_snap.recommendation {
+                ui.add_space(4.0);
+                Self::card_frame(true).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        Self::semantic_tag(
+                            ui,
+                            if is_en {
+                                "RECOMMENDED"
+                            } else {
+                                "РЕКОМЕНДАЦИЯ"
+                            },
+                            SEMANTIC_OK,
+                        );
+                        let p_lbl = if is_en {
+                            rec.protocol.label_en()
+                        } else {
+                            rec.protocol.label_ru()
+                        };
+                        let m_lbl = if is_en {
+                            rec.upstream_mode.label_en()
+                        } else {
+                            rec.upstream_mode.label_ru()
+                        };
+                        Self::keycap(ui, &format!("{p_lbl} · {m_lbl}"));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let apply_lbl = if is_en {
+                                "Apply Recommendation"
+                            } else {
+                                "Применить рекомендацию"
+                            };
+                            if ui.add(Self::primary_button(apply_lbl)).clicked() {
+                                apply_rec_opt = Some(rec.clone());
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let reason = if is_en {
+                        &rec.reason_en
+                    } else {
+                        &rec.reason_ru
+                    };
+                    ui.add(
+                        egui::Label::new(RichText::new(reason).size(10.5).color(TEXT_PRIMARY))
+                            .wrap(),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Servers: {}  |  Bootstrap: {}  |  Fallback: {}",
+                            rec.servers.join(", "),
+                            rec.bootstrap_servers.join(", "),
+                            rec.fallback_servers.join(", ")
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+            }
+
+            if !bench_snap.results.is_empty() {
+                ui.add_space(4.0);
+                ScrollArea::horizontal()
+                    .id_salt("scroll_dns_bench_h")
+                    .show(ui, |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("scroll_dns_bench_v")
+                            .max_height(240.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                egui::Grid::new("dns_benchmark_table")
+                                    .num_columns(8)
+                                    .striped(true)
+                                    .spacing([12.0, 4.0])
+                                    .show(ui, |ui| {
+                                        let headers = if is_en {
+                                            [
+                                                "Provider",
+                                                "Protocol",
+                                                "Address",
+                                                "Tag",
+                                                "Latency",
+                                                "Loss",
+                                                "Status",
+                                                "TLS Split",
+                                            ]
+                                        } else {
+                                            [
+                                                "Провайдер",
+                                                "Протокол",
+                                                "Адрес",
+                                                "Тег",
+                                                "Задержка",
+                                                "Потери",
+                                                "Статус",
+                                                "TLS Split",
+                                            ]
+                                        };
+                                        for h in headers {
+                                            ui.label(
+                                                RichText::new(h)
+                                                    .strong()
+                                                    .size(10.0)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+                                        }
+                                        ui.end_row();
+
+                                        for row in &bench_snap.results {
+                                            ui.label(
+                                                RichText::new(&row.provider)
+                                                    .size(10.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(
+                                                    row.protocol.as_str().to_ascii_uppercase(),
+                                                )
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(ACCENT),
+                                            );
+                                            ui.label(
+                                                RichText::new(&row.address)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(&row.tag)
+                                                    .size(10.0)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+
+                                            let lat_txt = if row.latency_ms < 0 {
+                                                "—".to_string()
+                                            } else {
+                                                format!("{} ms", row.latency_ms)
+                                            };
+                                            let (rating_lbl, rating_col) = match row.rating.as_str()
+                                            {
+                                                "excellent" => (
+                                                    if is_en { "Excellent" } else { "Отлично" },
+                                                    SEMANTIC_OK,
+                                                ),
+                                                "good" => (
+                                                    if is_en { "Good" } else { "Хорошо" },
+                                                    ACCENT,
+                                                ),
+                                                "fair" => (
+                                                    if is_en { "Fair" } else { "Средне" },
+                                                    TEXT_SECONDARY,
+                                                ),
+                                                "slow" => (
+                                                    if is_en { "Slow" } else { "Медленно" },
+                                                    SEMANTIC_WARN,
+                                                ),
+                                                "failed" => (
+                                                    if is_en { "Failed" } else { "Отказ" },
+                                                    SEMANTIC_ERR,
+                                                ),
+                                                other => (other, TEXT_MUTED),
+                                            };
+                                            ui.label(
+                                                RichText::new(lat_txt)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(rating_col),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{}%", row.loss_pct))
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(if row.loss_pct > 0 {
+                                                        SEMANTIC_WARN
+                                                    } else {
+                                                        TEXT_SECONDARY
+                                                    }),
+                                            );
+                                            ui.label(
+                                                RichText::new(rating_lbl)
+                                                    .size(10.0)
+                                                    .color(rating_col),
+                                            );
+                                            let (split_txt, split_col) =
+                                                if row.protocol == DnsProtocol::Udp {
+                                                    ("—", TEXT_MUTED)
+                                                } else if row.used_desync {
+                                                    (if is_en { "Yes" } else { "Да" }, ACCENT)
+                                                } else {
+                                                    (
+                                                        if is_en { "No" } else { "Нет" },
+                                                        TEXT_SECONDARY,
+                                                    )
+                                                };
+                                            ui.label(
+                                                RichText::new(split_txt)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(split_col),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    });
+            } else if !bench_snap.running {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(if is_en {
+                        "Click \"Auto-Tune (1-Click)\" or \"DNS Benchmark\" above to measure latency across UDP, DoT, and DoH resolvers."
+                    } else {
+                        "Нажмите «Автонастройка в 1 клик» или «Бенчмарк DNS» выше, чтобы замерить задержку публичных UDP, DoT и DoH серверов."
+                    })
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+                );
+            }
+        });
+
+        if let Some(rec) = apply_rec_opt {
+            self.apply_dns_recommendation_with_toast(&rec);
+        }
+    }
+
+    fn render_dns_settings_section(&mut self, ui: &mut egui::Ui, is_en: bool) {
+        let tk = active_tokens();
+        let mut save_clicked = false;
+        let mut discard_clicked = false;
+        let mut validation_toasts: Vec<String> = Vec::new();
+
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "2. Core DNS Settings & Tuning"
+                    } else {
+                        "2. Основные настройки и параметры DNS"
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+            });
+
+            if self.dns_dirty {
+                ui.add_space(4.0);
+                Self::card_frame(true).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        Self::semantic_tag(
+                            ui,
+                            if is_en { "UNSAVED" } else { "ИЗМЕНЕНО" },
+                            SEMANTIC_WARN,
+                        );
+                        ui.label(
+                            RichText::new(if is_en {
+                                "DNS settings have unsaved changes"
+                            } else {
+                                "Есть несохранённые изменения настроек DNS"
+                            })
+                            .size(10.5)
+                            .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let sv_lbl = if is_en {
+                                "Save Settings"
+                            } else {
+                                "Сохранить"
+                            };
+                            if ui.add(Self::primary_button(sv_lbl)).clicked() {
+                                save_clicked = true;
+                            }
+                            let disc_lbl = if is_en { "Discard" } else { "Отменить" };
+                            if ui.small_button(RichText::new(disc_lbl).size(10.0)).clicked() {
+                                discard_clicked = true;
+                            }
+                        });
+                    });
+                });
+            }
+
+            ui.add_space(4.0);
+            if Self::gpui_switch(
+                ui,
+                &mut self.dns_draft.enabled,
+                if is_en {
+                    "Enable built-in Smart DNS resolver (disable to pass through OS DNS)"
+                } else {
+                    "Включить встроенный DNS-резолвер (при выключении используется системный DNS ОС)"
+                },
+            )
+            .changed()
+            {
+                self.dns_dirty = true;
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if is_en { "Protocol:" } else { "Протокол:" })
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                );
+                for proto in [DnsProtocol::Doh, DnsProtocol::Dot, DnsProtocol::Udp] {
+                    let is_cur = self.dns_draft.protocol == proto;
+                    let lbl = if is_en {
+                        proto.label_en()
+                    } else {
+                        proto.label_ru()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(lbl).size(10.0).color(if is_cur {
+                                tk.bg_deepest
+                            } else {
+                                TEXT_PRIMARY
+                            }))
+                            .fill(if is_cur { ACCENT } else { tk.bg_elevated }),
+                        )
+                        .clicked()
+                        && !is_cur
+                    {
+                        self.dns_draft.protocol = proto;
+                        if self
+                            .dns_draft
+                            .servers
+                            .iter()
+                            .all(|s| validate_dns_server_entry(s, proto).is_err())
+                            && let Some(first_preset) = presets_for_protocol(proto).first()
+                        {
+                            self.dns_draft.servers =
+                                first_preset.servers.iter().map(|s| (*s).to_string()).collect();
+                            if !first_preset.bootstrap_ip.is_empty()
+                                && !self
+                                    .dns_draft
+                                    .bootstrap_servers
+                                    .iter()
+                                    .any(|b| b.eq_ignore_ascii_case(first_preset.bootstrap_ip))
+                            {
+                                self.dns_draft
+                                    .bootstrap_servers
+                                    .insert(0, first_preset.bootstrap_ip.to_string());
+                            }
+                        }
+                        self.dns_dirty = true;
+                    }
+                }
+
+                ui.separator();
+                ui.label(
+                    RichText::new(if is_en { "Upstream:" } else { "Режим:" })
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                );
+                for mode in [DnsUpstreamMode::Parallel, DnsUpstreamMode::Sequential] {
+                    let is_cur = self.dns_draft.upstream_mode == mode;
+                    let lbl = if is_en {
+                        mode.label_en()
+                    } else {
+                        mode.label_ru()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(lbl).size(10.0).color(if is_cur {
+                                tk.bg_deepest
+                            } else {
+                                TEXT_PRIMARY
+                            }))
+                            .fill(if is_cur { ACCENT } else { tk.bg_elevated }),
+                        )
+                        .clicked()
+                        && !is_cur
+                    {
+                        self.dns_draft.upstream_mode = mode;
+                        self.dns_dirty = true;
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "IP Strategy:"
+                    } else {
+                        "Стратегия IP:"
+                    })
+                    .size(10.0)
+                    .color(TEXT_SECONDARY),
+                );
+                let cur_strat_lbl = if is_en {
+                    self.dns_draft.strategy.label_en()
+                } else {
+                    self.dns_draft.strategy.label_ru()
+                };
+                egui::ComboBox::from_id_salt("combo_dns_ip_strategy")
+                    .width(220.0)
+                    .selected_text(RichText::new(cur_strat_lbl).size(10.0))
+                    .show_ui(ui, |ui| {
+                        for st in DnsIpStrategy::ALL {
+                            let lbl = if is_en { st.label_en() } else { st.label_ru() };
+                            if ui
+                                .selectable_label(self.dns_draft.strategy == st, lbl)
+                                .clicked()
+                            {
+                                self.dns_draft.strategy = st;
+                                self.dns_dirty = true;
+                            }
+                        }
+                    });
+            });
+
+            // Чипы провайдеров из presets_for_protocol
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "Provider presets:"
+                    } else {
+                        "Пресеты провайдеров:"
+                    })
+                    .size(10.0)
+                    .color(TEXT_SECONDARY),
+                );
+                for preset in presets_for_protocol(self.dns_draft.protocol) {
+                    let is_cur = self.dns_draft.servers.len() == preset.servers.len()
+                        && self
+                            .dns_draft
+                            .servers
+                            .iter()
+                            .zip(preset.servers.iter())
+                            .all(|(a, b)| a.eq_ignore_ascii_case(b));
+                    let lbl = if preset.tag.is_empty() {
+                        preset.provider.to_string()
+                    } else {
+                        format!("{} [{}]", preset.provider, preset.tag)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(lbl).size(10.0).color(if is_cur {
+                                ACCENT
+                            } else {
+                                TEXT_PRIMARY
+                            }))
+                            .fill(if is_cur { tk.bg_hover } else { tk.bg_elevated })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if is_cur { ACCENT } else { tk.border_subtle },
+                            )),
+                        )
+                        .on_hover_text(preset.servers.join(", "))
+                        .clicked()
+                    {
+                        self.dns_draft.servers =
+                            preset.servers.iter().map(|s| (*s).to_string()).collect();
+                        if !preset.bootstrap_ip.is_empty()
+                            && !self
+                                .dns_draft
+                                .bootstrap_servers
+                                .iter()
+                                .any(|b| b.eq_ignore_ascii_case(preset.bootstrap_ip))
+                        {
+                            self.dns_draft
+                                .bootstrap_servers
+                                .insert(0, preset.bootstrap_ip.to_string());
+                        }
+                        self.dns_dirty = true;
+                    }
+                }
+            });
+
+            // Редакторы списков servers / bootstrap_servers / fallback_servers
+            ui.add_space(4.0);
+            let main_hint = match self.dns_draft.protocol {
+                DnsProtocol::Doh => "https://dns.example/dns-query",
+                DnsProtocol::Dot => "tls://dns.example:853",
+                DnsProtocol::Udp => {
+                    if is_en {
+                        "1.1.1.1 or 77.88.8.8:1253"
+                    } else {
+                        "1.1.1.1 или 77.88.8.8:1253"
+                    }
+                }
+            };
+            if let Some(err) = Self::render_dns_server_list_editor(
+                ui,
+                is_en,
+                if is_en {
+                    "Upstream DNS Servers"
+                } else {
+                    "Основные DNS-серверы"
+                },
+                main_hint,
+                &mut self.dns_draft.servers,
+                &mut self.dns_server_input,
+                &mut self.dns_dirty,
+                self.dns_draft.protocol,
+                "dns_main_servers_editor",
+                8,
+                1,
+            ) {
+                validation_toasts.push(err);
+            }
+
+            ui.add_space(4.0);
+            ui.columns(2, |cols| {
+                if let Some(err) = Self::render_dns_server_list_editor(
+                    &mut cols[0],
+                    is_en,
+                    if is_en {
+                        "Bootstrap UDP Servers"
+                    } else {
+                        "Bootstrap UDP-серверы"
+                    },
+                    "77.88.8.8:1253 / 1.1.1.1",
+                    &mut self.dns_draft.bootstrap_servers,
+                    &mut self.dns_bootstrap_input,
+                    &mut self.dns_dirty,
+                    DnsProtocol::Udp,
+                    "dns_bootstrap_servers_editor",
+                    6,
+                    0,
+                ) {
+                    validation_toasts.push(err);
+                }
+
+                if let Some(err) = Self::render_dns_server_list_editor(
+                    &mut cols[1],
+                    is_en,
+                    if is_en {
+                        "Fallback UDP Servers"
+                    } else {
+                        "Резервные UDP-серверы"
+                    },
+                    "208.67.222.222:5353 / 1.0.0.1",
+                    &mut self.dns_draft.fallback_servers,
+                    &mut self.dns_fallback_input,
+                    &mut self.dns_dirty,
+                    DnsProtocol::Udp,
+                    "dns_fallback_servers_editor",
+                    6,
+                    0,
+                ) {
+                    validation_toasts.push(err);
+                }
+            });
+
+            // Пресеты Bootstrap
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "Bootstrap presets:"
+                    } else {
+                        "Пресеты Bootstrap:"
+                    })
+                    .size(9.5)
+                    .color(TEXT_MUTED),
+                );
+                for (lbl, addrs) in bootstrap_presets() {
+                    if ui
+                        .small_button(RichText::new(*lbl).size(9.5))
+                        .on_hover_text(addrs.join(", "))
+                        .clicked()
+                    {
+                        self.dns_draft.bootstrap_servers =
+                            addrs.iter().map(|s| (*s).to_string()).collect();
+                        self.dns_dirty = true;
+                    }
+                }
+            });
+
+            // Инженерные переключатели
+            ui.add_space(4.0);
+            Self::card_frame(false).show(ui, |ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "Engine & Cache Tuning"
+                    } else {
+                        "Инженерные параметры и кэш"
+                    })
+                    .strong()
+                    .size(10.5)
+                    .color(TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+
+                ui.columns(2, |cols| {
+                    if Self::gpui_switch(
+                        &mut cols[0],
+                        &mut self.dns_draft.desync_doh_dot,
+                        if is_en {
+                            "TLS Record Split for DoH/DoT"
+                        } else {
+                            "TLS Record Split для DoH/DoT"
+                        },
+                    )
+                    .on_hover_text(if is_en {
+                        "Fragment TLS 1.3 ClientHello records on encrypted DoH/DoT connections"
+                    } else {
+                        "Применять фрагментацию TLS-записей к зашифрованным соединениям DoH и DoT"
+                    })
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+
+                    if Self::gpui_switch(
+                        &mut cols[1],
+                        &mut self.dns_draft.split_local_ru,
+                        if is_en {
+                            "Fast local UDP for .ru/.su/.рф/.local"
+                        } else {
+                            "Быстрый UDP для .ru/.su/.рф/.local"
+                        },
+                    )
+                    .on_hover_text(if is_en {
+                        "Resolve domestic and local-network zones directly via fast UDP bootstrap"
+                    } else {
+                        "Направлять запросы локальных и .ru/.su/.рф зон напрямую через быстрый UDP bootstrap"
+                    })
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+                });
+
+                ui.columns(2, |cols| {
+                    if Self::gpui_switch(
+                        &mut cols[0],
+                        &mut self.dns_draft.local_cache,
+                        if is_en {
+                            "In-memory DNS cache"
+                        } else {
+                            "Локальный кэш DNS в памяти"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+
+                    if Self::gpui_switch(
+                        &mut cols[1],
+                        &mut self.dns_draft.turbo_cache,
+                        if is_en {
+                            "Turbo startup cache pre-resolve"
+                        } else {
+                            "Турбо-предразрешение при старте"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+                });
+
+                ui.columns(2, |cols| {
+                    if Self::gpui_switch(
+                        &mut cols[0],
+                        &mut self.dns_draft.reverse_mapping,
+                        if is_en {
+                            "Reverse IP -> domain table (TUN)"
+                        } else {
+                            "Обратная таблица IP -> домен (TUN)"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+
+                    if Self::gpui_switch(
+                        &mut cols[1],
+                        &mut self.dns_draft.reject_fake_ip,
+                        if is_en {
+                            "Filter synthetic / bogon IPs"
+                        } else {
+                            "Отсеивать синтетические / локальные IP"
+                        },
+                    )
+                    .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+                });
+
+                if Self::gpui_switch(
+                    ui,
+                    &mut self.dns_draft.fallback_system_dns,
+                    if is_en {
+                        "Fallback to OS DNS when all upstreams fail"
+                    } else {
+                        "Переходить на системный DNS ОС при отказе всех серверов"
+                    },
+                )
+                .changed()
+                {
+                    self.dns_dirty = true;
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Cache size:"
+                        } else {
+                            "Размер кэша:"
+                        })
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.dns_draft.local_cache,
+                            egui::DragValue::new(&mut self.dns_draft.cache_size)
+                                .range(256..=65536)
+                                .speed(64),
+                        )
+                        .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+                    Self::keycap(
+                        ui,
+                        &format!(
+                            "~{} {}",
+                            estimate_cache_ram_kb(self.dns_draft.cache_size),
+                            if is_en { "KiB RAM" } else { "КиБ ОЗУ" }
+                        ),
+                    );
+                    for preset_sz in [1024usize, 4096, 16384] {
+                        if ui
+                            .small_button(RichText::new(preset_sz.to_string()).monospace().size(9.5))
+                            .clicked()
+                        {
+                            self.dns_draft.cache_size = preset_sz;
+                            self.dns_dirty = true;
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Min TTL rewrite (s):"
+                        } else {
+                            "Мин. TTL ответа (с):"
+                        })
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.dns_draft.rewrite_ttl_secs)
+                                .range(0..=3600),
+                        )
+                        .changed()
+                    {
+                        self.dns_dirty = true;
+                    }
+                });
+            });
+
+            // Блок таймингов переключения при Sequential
+            if self.dns_draft.upstream_mode == DnsUpstreamMode::Sequential {
+                ui.add_space(4.0);
+                Self::card_frame(false).show(ui, |ui| {
+                    ui.label(
+                        RichText::new(if is_en {
+                            "Sequential Health & Failover Timings"
+                        } else {
+                            "Тайминги проверки и автопереключения (Последовательный режим)"
+                        })
+                        .strong()
+                        .size(10.5)
+                        .color(TEXT_PRIMARY),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Check interval (s):"
+                            } else {
+                                "Интервал (с):"
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.dns_draft.check_interval_secs)
+                                    .range(5..=600),
+                            )
+                            .changed()
+                        {
+                            self.dns_dirty = true;
+                        }
+
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Recovery interval (s):"
+                            } else {
+                                "Возврат (с):"
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(
+                                    &mut self.dns_draft.recovery_check_interval_secs,
+                                )
+                                .range(10..=1800),
+                            )
+                            .changed()
+                        {
+                            self.dns_dirty = true;
+                        }
+
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Timeout (ms):"
+                            } else {
+                                "Таймаут (мс):"
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.dns_draft.check_timeout_ms)
+                                    .range(300..=10000)
+                                    .speed(50),
+                            )
+                            .changed()
+                        {
+                            self.dns_dirty = true;
+                        }
+
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Fail thr:"
+                            } else {
+                                "Порог сбоев:"
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.dns_draft.failure_threshold)
+                                    .range(1..=10),
+                            )
+                            .changed()
+                        {
+                            self.dns_dirty = true;
+                        }
+
+                        ui.label(
+                            RichText::new(if is_en {
+                                "Rec thr:"
+                            } else {
+                                "Порог восст.:"
+                            })
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.dns_draft.recovery_threshold)
+                                    .range(1..=10),
+                            )
+                            .changed()
+                        {
+                            self.dns_dirty = true;
+                        }
+                    });
+                });
+            }
+        });
+
+        for err in validation_toasts {
+            self.push_toast(
+                ToastKind::Warn,
+                if is_en {
+                    "Invalid DNS server entry"
+                } else {
+                    "Некорректный адрес DNS-сервера"
+                },
+                err,
+            );
+        }
+
+        if save_clicked {
+            let parsed = Self::parse_speed_domains(&self.dns_speed_domains_input);
+            self.dns_draft.speed_test_domains = if parsed.is_empty() {
+                default_speed_test_domains()
+            } else {
+                parsed
+            };
+            if let Ok(val) = serde_json::to_value(&self.dns_draft) {
+                self.dns_dirty = false;
+                self.dispatch_ipc("update_dns_settings", val);
+                self.push_toast(
+                    ToastKind::Success,
+                    if is_en {
+                        "DNS settings saved"
+                    } else {
+                        "Настройки DNS сохранены"
+                    },
+                    format!(
+                        "{} · {} {}",
+                        self.dns_draft.protocol.as_str().to_ascii_uppercase(),
+                        self.dns_draft.servers.len(),
+                        if is_en {
+                            "servers"
+                        } else {
+                            "сервер(ов)"
+                        }
+                    ),
+                );
+            }
+        } else if discard_clicked {
+            self.dns_draft = self.snap.config.dns.clone();
+            self.dns_speed_domains_input = self.dns_draft.speed_test_domains.join("\n");
+            self.dns_dirty = false;
+        }
+    }
+
+    fn render_dns_speed_test_section(&mut self, ui: &mut egui::Ui, is_en: bool) {
+        let speed_snap = self
+            .dns_speed_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut trigger_start = false;
+        let mut trigger_stop = false;
+
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        "3. Multi-Domain Speed Test (Current Servers)"
+                    } else {
+                        "3. Многодоменный тест скорости текущих серверов"
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if speed_snap.running {
+                        let stop_lbl = if is_en { "Stop" } else { "Остановить" };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(stop_lbl).size(10.0).color(Color32::WHITE),
+                                )
+                                .fill(SEMANTIC_ERR),
+                            )
+                            .clicked()
+                        {
+                            trigger_stop = true;
+                        }
+                    } else {
+                        let start_lbl = if is_en {
+                            "Run Speed Test"
+                        } else {
+                            "Запустить тест"
+                        };
+                        if ui.add(Self::primary_button(start_lbl)).clicked() {
+                            trigger_start = true;
+                        }
+                    }
+                    let rst_lbl = if is_en {
+                        "Reset defaults"
+                    } else {
+                        "Сбросить к дефолтам"
+                    };
+                    if ui.small_button(RichText::new(rst_lbl).size(10.0)).clicked() {
+                        let defs = default_speed_test_domains();
+                        self.dns_draft.speed_test_domains = defs;
+                        self.dns_speed_domains_input =
+                            self.dns_draft.speed_test_domains.join("\n");
+                        self.dns_dirty = true;
+                    }
+                });
+            });
+
+            let parsed_cnt = Self::parse_speed_domains(&self.dns_speed_domains_input).len();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        format!(
+                            "Test domains ({parsed_cnt}/32, newline/comma separated):"
+                        )
+                    } else {
+                        format!(
+                            "Домены для замера ({parsed_cnt}/32, по одному на строку или через запятую):"
+                        )
+                    })
+                    .size(10.0)
+                    .color(TEXT_MUTED),
+                );
+            });
+            if ui
+                .add(
+                    TextEdit::multiline(&mut self.dns_speed_domains_input)
+                        .id_salt("dns_speed_domains_editor")
+                        .font(FontId::new(10.0, FontFamily::Monospace))
+                        .desired_rows(3)
+                        .desired_width(ui.available_width())
+                        .hint_text("google.com\nyoutube.com\ndiscord.com"),
+                )
+                .changed()
+            {
+                let parsed = Self::parse_speed_domains(&self.dns_speed_domains_input);
+                if !parsed.is_empty() {
+                    self.dns_draft.speed_test_domains = parsed;
+                }
+                self.dns_dirty = true;
+            }
+
+            if speed_snap.running || speed_snap.progress_pct > 0 {
+                ui.add_space(4.0);
+                let frac = (speed_snap.progress_pct.min(100) as f32) / 100.0;
+                let bar_txt = if speed_snap.current_target.is_empty() {
+                    format!("{}%", speed_snap.progress_pct)
+                } else {
+                    format!("{}% · {}", speed_snap.progress_pct, speed_snap.current_target)
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(ui.available_width())
+                        .desired_height(16.0)
+                        .fill(active_tokens().accent)
+                        .text(RichText::new(bar_txt).monospace().size(10.0)),
+                );
+            }
+
+            if let Some(ref err) = speed_snap.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(err).size(10.0).color(SEMANTIC_ERR));
+            }
+
+            if !speed_snap.reports.is_empty() {
+                ui.add_space(4.0);
+                let fmt_ms = |v: i32| -> String {
+                    if v < 0 {
+                        "—".to_string()
+                    } else {
+                        format!("{v} ms")
+                    }
+                };
+                ScrollArea::horizontal()
+                    .id_salt("scroll_dns_speed_h")
+                    .show(ui, |ui| {
+                        egui::Grid::new("dns_speed_table")
+                            .num_columns(7)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                let headers = if is_en {
+                                    ["Server", "Role", "Min", "Median", "Avg", "Max", "Success"]
+                                } else {
+                                    ["Сервер", "Роль", "Min", "Median", "Avg", "Max", "Успешно"]
+                                };
+                                for h in headers {
+                                    ui.label(
+                                        RichText::new(h)
+                                            .strong()
+                                            .size(10.0)
+                                            .color(TEXT_SECONDARY),
+                                    );
+                                }
+                                ui.end_row();
+
+                                for (idx, rep) in speed_snap.reports.iter().enumerate() {
+                                    let is_sel = self.selected_speed_server_idx == Some(idx);
+                                    let srv_lbl = format!(
+                                        "{} ({})",
+                                        rep.server,
+                                        rep.protocol.as_str().to_ascii_uppercase()
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            is_sel,
+                                            RichText::new(srv_lbl)
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(if is_sel { ACCENT } else { TEXT_PRIMARY }),
+                                        )
+                                        .on_hover_text(if is_en {
+                                            "Click to expand per-domain details"
+                                        } else {
+                                            "Нажмите, чтобы раскрыть детали по доменам"
+                                        })
+                                        .clicked()
+                                    {
+                                        self.selected_speed_server_idx =
+                                            if is_sel { None } else { Some(idx) };
+                                    }
+
+                                    let role_lbl = match rep.role.as_str() {
+                                        "main" => {
+                                            if is_en { "Primary" } else { "Основной" }
+                                        }
+                                        "bootstrap" => "Bootstrap",
+                                        "fallback" => {
+                                            if is_en { "Fallback" } else { "Резерв" }
+                                        }
+                                        other => other,
+                                    };
+                                    ui.label(
+                                        RichText::new(role_lbl).size(10.0).color(TEXT_SECONDARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(fmt_ms(rep.min_ms))
+                                            .monospace()
+                                            .size(10.0)
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(fmt_ms(rep.median_ms))
+                                            .monospace()
+                                            .strong()
+                                            .size(10.0)
+                                            .color(ACCENT),
+                                    );
+                                    ui.label(
+                                        RichText::new(fmt_ms(rep.avg_ms))
+                                            .monospace()
+                                            .size(10.0)
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(fmt_ms(rep.max_ms))
+                                            .monospace()
+                                            .size(10.0)
+                                            .color(TEXT_SECONDARY),
+                                    );
+                                    let ok_col = if rep.success_count == rep.total_count {
+                                        SEMANTIC_OK
+                                    } else if rep.success_count > 0 {
+                                        SEMANTIC_WARN
+                                    } else {
+                                        SEMANTIC_ERR
+                                    };
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}/{}",
+                                            rep.success_count, rep.total_count
+                                        ))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(ok_col),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                if let Some(sel_idx) = self.selected_speed_server_idx
+                    && let Some(rep) = speed_snap.reports.get(sel_idx)
+                {
+                    ui.add_space(4.0);
+                    Self::card_frame(true).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(if is_en {
+                                    format!("Per-domain breakdown: {}", rep.server)
+                                } else {
+                                    format!("Детализация по доменам: {}", rep.server)
+                                })
+                                .strong()
+                                .size(10.5)
+                                .color(TEXT_PRIMARY),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .small_button(if is_en { "Collapse" } else { "Скрыть" })
+                                    .clicked()
+                                {
+                                    self.selected_speed_server_idx = None;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .id_salt("scroll_dns_speed_samples")
+                            .max_height(180.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                egui::Grid::new("dns_speed_samples_grid")
+                                    .num_columns(4)
+                                    .striped(true)
+                                    .spacing([12.0, 4.0])
+                                    .show(ui, |ui| {
+                                        for s in &rep.samples {
+                                            ui.label(
+                                                RichText::new(&s.domain)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(if s.ok { "OK" } else { "FAIL" })
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(if s.ok {
+                                                        SEMANTIC_OK
+                                                    } else {
+                                                        SEMANTIC_ERR
+                                                    }),
+                                            );
+                                            ui.label(
+                                                RichText::new(if s.ms < 0 {
+                                                    "—".to_string()
+                                                } else {
+                                                    format!("{} ms", s.ms)
+                                                })
+                                                .monospace()
+                                                .size(10.0)
+                                                .color(TEXT_SECONDARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(&s.detail)
+                                                    .size(10.0)
+                                                    .color(TEXT_MUTED),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    });
+                }
+            }
+        });
+
+        if trigger_stop {
+            self.dns_speed_cancel.store(true, Ordering::SeqCst);
+        } else if trigger_start {
+            self.start_dns_speed_test();
+        }
+    }
+
+    fn render_tab_dns(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let is_en = self.is_en();
+        let bench_running = self
+            .dns_bench_state
+            .lock()
+            .map(|g| g.running)
+            .unwrap_or(false);
+        let speed_running = self
+            .dns_speed_state
+            .lock()
+            .map(|g| g.running)
+            .unwrap_or(false);
+        if bench_running || speed_running {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+
+        // Верхняя плашка live-телеметрии + кнопки действий
+        self.render_dns_telemetry_bar(ui, is_en, bench_running, speed_running);
+        ui.add_space(4.0);
+
+        // Секция 1: Бенчмарк и автонастройка
+        self.render_dns_benchmark_section(ui, is_en);
+        ui.add_space(4.0);
+
+        // Секция 2: Основные настройки и параметры DNS
+        self.render_dns_settings_section(ui, is_en);
+        ui.add_space(4.0);
+
+        // Секция 3: Многодоменный тест скорости текущих серверов
+        self.render_dns_speed_test_section(ui, is_en);
+        ui.add_space(4.0);
+
+        // Секция 4: Локальные переопределения домен=IP
+        Self::panel_frame().show(ui, |ui| {
+            let hosts_cnt = self.snap.config.dns_overrides.len();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if is_en {
+                        format!("4. Local Domain Overrides ({hosts_cnt})")
+                    } else {
+                        format!("4. Локальные переопределения домен=IP ({hosts_cnt})")
+                    })
+                    .strong()
+                    .size(12.0),
+                );
+            });
+            ui.add_space(4.0);
+            self.render_dns_overrides_editor(ui, is_en, "dns_tab_overrides");
+        });
+    }
+
     fn render_about_modal(&mut self, ctx: &egui::Context) {
         if !self.about_modal_open {
             return;
@@ -5799,9 +8218,9 @@ impl TachyonGuiApp {
                     );
                     ui.label(
                         RichText::new(if is_en {
-                            "Clean DNS (:1253/:5353) · Local hosts"
+                            "Smart DNS (DoH/DoT/UDP) · Local hosts"
                         } else {
-                            "Чистый DNS (:1253/:5353) · Local hosts"
+                            "Умный DNS (DoH/DoT/UDP) · Local hosts"
                         })
                         .size(10.0)
                         .color(TEXT_SECONDARY),
@@ -6182,19 +8601,91 @@ impl TachyonGuiApp {
                     );
                     ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
 
-                    let dns_short = match self.snap.config.dns_mode.as_str() {
-                        "cloudflare" => "DNS: 1.1.1.1",
-                        "google" => "DNS: 8.8.8.8",
-                        "port1253" => "DNS: :1253",
-                        "system" => "DNS: OS",
-                        _ => "DNS: AutoClean",
+                    let dns_st = &self.snap.dns_status;
+                    let dns_short = if !dns_st.enabled {
+                        if is_en {
+                            "DNS: OS".to_string()
+                        } else {
+                            "DNS: ОС".to_string()
+                        }
+                    } else {
+                        let primary = if dns_st.active_primary.is_empty() {
+                            self.snap
+                                .config
+                                .dns
+                                .servers
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("-")
+                        } else {
+                            dns_st.active_primary.as_str()
+                        };
+                        format!(
+                            "DNS: {} {primary}",
+                            dns_st.protocol.as_str().to_ascii_uppercase()
+                        )
                     };
-                    ui.label(
-                        RichText::new(dns_short)
-                            .monospace()
-                            .size(9.5)
-                            .color(TEXT_SECONDARY),
+                    let dns_col = if !dns_st.enabled {
+                        TEXT_MUTED
+                    } else if dns_st.consecutive_failures > 0 {
+                        SEMANTIC_WARN
+                    } else {
+                        TEXT_SECONDARY
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(dns_short)
+                                    .monospace()
+                                    .size(9.5)
+                                    .color(dns_col),
+                            )
+                            .fill(tk.bg_elevated)
+                            .small(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(if is_en {
+                            "Active DNS resolver — click to open DNS tab"
+                        } else {
+                            "Активный DNS-резолвер — нажмите, чтобы открыть вкладку DNS"
+                        })
+                        .clicked()
+                    {
+                        self.active_tab = ActiveTab::Dns;
+                    }
+                    ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
+
+                    let cc_lbl = format!(
+                        "CC: {}",
+                        self.snap
+                            .config
+                            .network
+                            .tcp_congestion
+                            .as_str()
+                            .to_ascii_uppercase()
                     );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(cc_lbl)
+                                    .monospace()
+                                    .size(9.5)
+                                    .color(TEXT_SECONDARY),
+                            )
+                            .fill(tk.bg_elevated)
+                            .small(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(if is_en {
+                            "TCP Congestion Control & TUN tuning — click to open"
+                        } else {
+                            "Алгоритм перегрузки TCP и настройки TUN — нажмите для открытия"
+                        })
+                        .clicked()
+                    {
+                        self.active_tab = ActiveTab::Overview;
+                        self.show_net_tuning_panel = true;
+                    }
                     ui.label(RichText::new("│").size(9.5).color(tk.border_strong));
 
                     let verified_cnt = self
@@ -6614,6 +9105,16 @@ impl TachyonGuiApp {
                 "Tab 4",
             ),
             (
+                "tab_dns".to_string(),
+                if is_en { "Navigate" } else { "Вкладка" },
+                if is_en {
+                    "Go to Tab: DNS & Auto-Tune".to_string()
+                } else {
+                    "Перейти: DNS и автонастройка".to_string()
+                },
+                "Tab 5",
+            ),
+            (
                 "tab_logs".to_string(),
                 if is_en { "Navigate" } else { "Вкладка" },
                 if is_en {
@@ -6621,7 +9122,67 @@ impl TachyonGuiApp {
                 } else {
                     "Перейти: Рейтинг L3 и Журнал событий".to_string()
                 },
-                "Tab 5",
+                "Tab 6",
+            ),
+            (
+                "dns_auto_tune".to_string(),
+                "DNS",
+                if is_en {
+                    "DNS Auto-Tune (Benchmark + Apply Best)".to_string()
+                } else {
+                    "Автонастройка DNS (бенчмарк и выбор лучшего)".to_string()
+                },
+                "Auto",
+            ),
+            (
+                "dns_benchmark".to_string(),
+                "DNS",
+                if is_en {
+                    "Run DNS Benchmark (UDP / DoT / DoH)".to_string()
+                } else {
+                    "Запустить бенчмарк DNS (UDP / DoT / DoH)".to_string()
+                },
+                "Bench",
+            ),
+            (
+                "dns_speed_test".to_string(),
+                "DNS",
+                if is_en {
+                    "Run Multi-Domain DNS Speed Test".to_string()
+                } else {
+                    "Запустить многодоменный тест скорости DNS".to_string()
+                },
+                "Speed",
+            ),
+            (
+                "dns_flush_cache".to_string(),
+                "DNS",
+                if is_en {
+                    "Flush DNS Resolver Cache".to_string()
+                } else {
+                    "Сбросить локальный кэш DNS".to_string()
+                },
+                "Flush",
+            ),
+            (
+                "net_preset_turbo".to_string(),
+                "Net",
+                if is_en {
+                    "Apply Turbo 4K Stack Profile (BBR + 2 MiB + Happy Eyeballs v2)".to_string()
+                } else {
+                    "Включить профиль Турбо 4K (BBR + 2 MiB + Happy Eyeballs v2)".to_string()
+                },
+                "Turbo",
+            ),
+            (
+                "net_preset_default".to_string(),
+                "Net",
+                if is_en {
+                    "Reset Network Stack Tuning to Defaults (BBR + Auto)".to_string()
+                } else {
+                    "Сбросить сетевой стек на стандарт (BBR + Авто)".to_string()
+                },
+                "Reset",
             ),
         ];
 
@@ -6973,7 +9534,46 @@ impl TachyonGuiApp {
                 "tab_flows" => self.active_tab = ActiveTab::Flows,
                 "tab_generator" => self.active_tab = ActiveTab::Generator,
                 "tab_lists" => self.active_tab = ActiveTab::Lists,
+                "tab_dns" => self.active_tab = ActiveTab::Dns,
                 "tab_logs" => self.active_tab = ActiveTab::Logs,
+                "dns_auto_tune" => {
+                    self.active_tab = ActiveTab::Dns;
+                    self.start_dns_benchmark(true);
+                }
+                "dns_benchmark" => {
+                    self.active_tab = ActiveTab::Dns;
+                    self.start_dns_benchmark(false);
+                }
+                "dns_speed_test" => {
+                    self.active_tab = ActiveTab::Dns;
+                    self.start_dns_speed_test();
+                }
+                "dns_flush_cache" => {
+                    self.flush_dns_cache_with_toast();
+                }
+                "net_preset_turbo" => {
+                    let turbo = NetworkTuningConfig {
+                        tcp_congestion: TcpCongestionMode::Bbr,
+                        tun_buffer_mode: TunBufferMode::Turbo2m,
+                        tun_mss_clamp: true,
+                        tun_mtu: self.net_draft.tun_mtu,
+                        tun_ipv6: self.net_draft.tun_ipv6,
+                        happy_eyeballs: true,
+                        quic_fast_failover: true,
+                        stream_verify_192k: true,
+                    };
+                    self.net_draft = turbo.clone();
+                    self.net_dirty = false;
+                    self.probe_stream_192k = true;
+                    self.dispatch_ipc("update_network_tuning", serde_json::json!(turbo));
+                }
+                "net_preset_default" => {
+                    let def = NetworkTuningConfig::default();
+                    self.net_draft = def.clone();
+                    self.net_dirty = false;
+                    self.probe_stream_192k = def.stream_verify_192k;
+                    self.dispatch_ipc("update_network_tuning", serde_json::json!(def));
+                }
                 other if other.starts_with("theme_") => {
                     if let Ok(idx) = other.trim_start_matches("theme_").parse::<u8>() {
                         self.set_theme_preset(GpuiThemePreset::from_u8(idx));
@@ -7071,6 +9671,37 @@ impl eframe::App for TachyonGuiApp {
         }
 
         self.poll_snapshot_if_due();
+
+        if self.dns_auto_apply_on_finish.load(Ordering::Acquire) {
+            let bench_done = self.dns_bench_state.lock().ok().and_then(|st| {
+                if !st.running {
+                    Some((st.recommendation.clone(), st.error.clone()))
+                } else {
+                    None
+                }
+            });
+            if let Some((rec_opt, err_opt)) = bench_done {
+                self.dns_auto_apply_on_finish
+                    .store(false, Ordering::Release);
+                if !self.dns_bench_cancel.load(Ordering::Relaxed) {
+                    if let Some(rec) = rec_opt {
+                        self.apply_dns_recommendation_with_toast(&rec);
+                    } else if let Some(err) = err_opt {
+                        let is_en = self.is_en();
+                        self.push_toast(
+                            ToastKind::Warn,
+                            if is_en {
+                                "DNS auto-tune finished"
+                            } else {
+                                "Автонастройка DNS"
+                            },
+                            err,
+                        );
+                    }
+                }
+            }
+        }
+
         let tk = active_tokens();
 
         egui::TopBottomPanel::top("custom_window_titlebar")
@@ -7104,6 +9735,7 @@ impl eframe::App for TachyonGuiApp {
                         ActiveTab::Flows => self.render_tab_flows(ui),
                         ActiveTab::Generator => self.render_tab_generator(ui),
                         ActiveTab::Lists => self.render_tab_lists(ui),
+                        ActiveTab::Dns => self.render_tab_dns(ui, ctx),
                         ActiveTab::Logs => self.render_tab_logs(ui),
                     });
             });
@@ -7127,7 +9759,17 @@ impl eframe::App for TachyonGuiApp {
             );
         }
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        let dns_active = self
+            .dns_bench_state
+            .lock()
+            .map(|g| g.running)
+            .unwrap_or(false)
+            || self
+                .dns_speed_state
+                .lock()
+                .map(|g| g.running)
+                .unwrap_or(false);
+        ctx.request_repaint_after(Duration::from_millis(if dns_active { 120 } else { 500 }));
     }
 }
 
@@ -7240,222 +9882,240 @@ fn format_hms(ts_ms: u64) -> String {
 }
 
 fn build_outbound_json_string(cfg: &DesyncConfig) -> String {
-    let mut map = serde_json::Map::new();
-    map.insert("type".to_string(), serde_json::json!("desync"));
-    map.insert("tag".to_string(), serde_json::json!("desync-out"));
-    map.insert("mode".to_string(), serde_json::json!(cfg.mode));
-    map.insert("fooling".to_string(), serde_json::json!(cfg.fooling));
-    map.insert("split_pos".to_string(), serde_json::json!(cfg.split_pos));
-    map.insert(
-        "tlsrec_first".to_string(),
-        serde_json::json!(cfg.tlsrec_first),
-    );
-    map.insert("fake_sni".to_string(), serde_json::json!(cfg.fake_sni));
-    map.insert("fake_ttl".to_string(), serde_json::json!(cfg.fake_ttl));
-    if cfg.multi_seven_point {
-        map.insert(
-            "split_positions".to_string(),
-            serde_json::json!([
-                1,
-                "sniext+1",
-                "host+1",
-                "midsld-2",
-                "midsld",
-                "midsld+2",
-                "endhost-1"
-            ]),
-        );
-    } else if cfg.host_fake {
-        map.insert(
-            "split_positions".to_string(),
-            serde_json::json!(["sni", "endhost-1"]),
-        );
-    }
-    if cfg.repeats > 1 {
-        map.insert("repeats".to_string(), serde_json::json!(cfg.repeats));
-    }
-    if cfg.seqovl > 0 {
-        map.insert("seqovl".to_string(), serde_json::json!(cfg.seqovl));
-    }
-    if cfg.wsize > 0 {
-        map.insert("wsize".to_string(), serde_json::json!(cfg.wsize));
-    }
-    if let Some(ws) = cfg.wscale {
-        map.insert("wscale".to_string(), serde_json::json!(ws.min(14)));
-    }
-    if cfg.syndata {
-        map.insert("syndata".to_string(), serde_json::json!(true));
-    }
-    if cfg.ipfrag {
-        map.insert("ipfrag".to_string(), serde_json::json!(true));
-    }
-    map.insert("udp_fake".to_string(), serde_json::json!(cfg.udp_fake));
-    map.insert(
-        "udp_repeats".to_string(),
-        serde_json::json!(cfg.udp_repeats),
-    );
-    map.insert(
-        "udp_fake_ttl".to_string(),
-        serde_json::json!(cfg.udp_fake_ttl),
-    );
-    serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+    let mut c = cfg.clone();
+    c.auto = false;
+    serde_json::to_string_pretty(&c.to_core_outbound_json()).unwrap_or_default()
 }
+
+const ACTIVE_MODE_EN: &[(&str, &str)] = &[
+    ("Остановлен", "Stopped"),
+    ("Адаптер TUN (Wintun L3)", "TUN Adapter (Wintun L3)"),
+    (
+        "Системный прокси (127.0.0.1:7897)",
+        "System Proxy (127.0.0.1:7897)",
+    ),
+    (
+        "Локальный прокси (127.0.0.1:7897)",
+        "Local Proxy (127.0.0.1:7897)",
+    ),
+];
+
+const RECIPE_TITLES_EN: &[&str] = &[
+    "#0 FakeSplit (midsld, MD5 ClientHello clone)",
+    "#1 TlsRec + Split (SNI TLS record split, no fake)",
+    "#2 FakeSplit + TlsRec (midsld, PAWS Timestamp, max.ru)",
+    "#3 FakeDisorder (midsld, MD5, vk.com)",
+    "#4 FakeDisorder + TlsRec (midsld, BadSeq -10000, rzd.ru)",
+    "#5 IPv6 HopByHop2 + FakeSplit (midsld, fonts.google.com)",
+    "#6 MultiSplit [2, sni_ext, host, midsld] + TlsRec",
+    "#7 FakeSplit AutoTTL (SNI boundary, gosuslugi.ru)",
+    "#8 MultiDisorder [2, sni_ext, host, midsld] (MD5, vk.com)",
+    "#9 Disorder (1st byte AutoTTL + retransmit)",
+    "#10 7-Point MultiDisorder (Md5BadAck + rndsni)",
+    "#11 HostFakeSplit Disorder (in-band host slice, Md5BadAck, rzd.ru)",
+    "#12 FakeDisorder (BadAck -66000 + PadEncap + seqovl=8)",
+    "#13 7-Point MultiDisorder (BadSeq+BadAck+BadSum, ozon.ru)",
+    "#14 FakeSplit DataNoAck (PSH no-ACK + sniext+1 + seqovl=12, aws.amazon.com)",
+    "#15 HostFakeSplit Disorder (AutoTTL, max.ru)",
+    "#16 OOB Urgent (MSG_OOB urgent pointer at midsld, no fake)",
+    "#17 Disoob + TlsRec (out-of-order MSG_OOB at host+1 + wsize=64)",
+    "#18 MultiSplit + SeqOvl=210 (pure segment overlap, no fake)",
+    "#19 FakeSplit sni_del (SNI-stripped clone + DataNoAck + seqovl=16)",
+    "#20 MultiDisorder bin_noise (0x0F0F0F0F decoy + BadSeq+BadAck+BadSum)",
+    "#21 FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap + seqovl=10)",
+    "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)",
+    "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)",
+];
+
+const LIST_LOCALE_EN: &[(&str, &str, &str)] = &[
+    (
+        "youtube",
+        "YouTube & Google Video",
+        "googlevideo.com CDN, youtube.com, ytimg, ggpht + QUIC Initial desync",
+    ),
+    (
+        "discord",
+        "Discord (Voice, Gateway & Media)",
+        "discord.gg, discordapp.com, discord.media + UDP voice packet desync",
+    ),
+    (
+        "telegram",
+        "Telegram & Media Servers",
+        "t.me, telegram.org, telesco.pe + DC IPv4/IPv6 CIDR subnets",
+    ),
+    (
+        "ai_services",
+        "AI Platforms (OpenAI, Claude, Gemini, xAI)",
+        "chatgpt.com, openai.com, claude.ai, anthropic.com, gemini.google.com",
+    ),
+    (
+        "social_media",
+        "Social Networks (X, Instagram, Meta)",
+        "x.com, twitter.com, t.co, instagram.com, facebook.com, fbcdn.net",
+    ),
+    (
+        "gaming",
+        "Gaming & Launchers (Steam, Roblox, Epic)",
+        "roblox.com, rbxcdn.com, steamcommunity.com, epicgames.com",
+    ),
+    (
+        "streaming",
+        "Streaming & Audio (Twitch, Spotify, Netflix)",
+        "twitch.tv, ttvnw.net, spotify.com, scdn.co, soundcloud.com",
+    ),
+    (
+        "dev_cloud",
+        "Dev & Cloud (GitHub, Docker, Cloudflare)",
+        "github.com, ghcr.io, docker.io, huggingface.co, medium.com",
+    ),
+    (
+        "trackers",
+        "Trackers & Archives (RuTracker, NNM)",
+        "rutracker.org, nnmclub.to, rutor.info, animego.org",
+    ),
+    (
+        "ru_direct",
+        "Domestic & Banking (Direct Bypass)",
+        ".ru / .рф domains, banking & government services — always direct without desync",
+    ),
+    (
+        "direct_bypass",
+        "Direct (Desync Exclusions)",
+        "Domains & subnets connected directly without packet modification",
+    ),
+];
+
+const RUNTIME_REPLACEMENTS_EN: &[(&str, &str)] = &[
+    ("По умолчанию", "Default"),
+    ("по умолчанию", "default"),
+    ("Профиль", "Profile"),
+    ("Прямое (Bypass .exe)", "Direct (Bypass .exe)"),
+    ("Прямое (Исключение)", "Direct (Bypass)"),
+    ("Прямое", "Direct"),
+    ("Принуд. .exe", "Forced .exe"),
+    ("YouTube и Google Video", "YouTube & Google Video"),
+    ("Discord (Голос и Чат)", "Discord (Voice & Chat)"),
+    ("Telegram и Медиа-серверы", "Telegram & Media"),
+    ("AI и Нейросети", "AI Services"),
+    ("Социальные сети и Медиа", "Social Networks"),
+    ("Игровые сервисы и лаунчеры", "Gaming & Launchers"),
+    ("Стриминг и аудиосервисы", "Streaming & Audio"),
+    ("Разработка и облака", "Dev & Cloud"),
+    ("Торрент-трекеры и архивы", "Trackers & Archives"),
+    (
+        "QUIC UDP/443 отключён профилем",
+        "QUIC UDP/443 blocked by profile",
+    ),
+    ("переход на TCP/TLS", "fallback to TCP/TLS"),
+    ("клон ClientHello", "ClientHello clone"),
+    ("разрез TLS-записи по SNI без фейка", "SNI TLS record split"),
+    (
+        "Системный интерфейс TUN «TachyonDesync» активирован",
+        "System TUN interface 'TachyonDesync' active",
+    ),
+    (
+        "Локальный узел SOCKS5/HTTP запущен на",
+        "Local SOCKS5/HTTP node listening on",
+    ),
+    (
+        "Системный прокси Windows направлен на",
+        "Windows System Proxy set to",
+    ),
+    (
+        "Движок десинхронизации Tachyon Desync инициализирован",
+        "Tachyon Desync engine initialized",
+    ),
+    (
+        "Служба Tachyon Desync остановлена",
+        "Tachyon Desync service stopped",
+    ),
+    ("Генератор стратегий", "Strategy Generator"),
+    (
+        "Бенчмарк DNS завершён: доступно",
+        "DNS benchmark finished: reachable",
+    ),
+    (
+        "Тест скорости DNS завершён: проверено серверов —",
+        "DNS speed test finished: servers tested -",
+    ),
+    ("Настройки DNS обновлены", "DNS settings updated"),
+    ("Применена рекомендация DNS", "DNS recommendation applied"),
+    ("Кэш DNS очищен", "DNS cache flushed"),
+    ("«", "\""),
+    ("»", "\""),
+];
 
 fn localize_active_mode(mode: &str, is_en: bool) -> String {
     if !is_en {
         return mode.to_string();
     }
-    match mode {
-        "Остановлен" => "Stopped".to_string(),
-        "Адаптер TUN (Wintun L3)" => "TUN Adapter (Wintun L3)".to_string(),
-        "Системный прокси (127.0.0.1:7897)" => {
-            "System Proxy (127.0.0.1:7897)".to_string()
-        }
-        "Локальный прокси (127.0.0.1:7897)" => {
-            "Local Proxy (127.0.0.1:7897)".to_string()
-        }
-        other => localize_runtime_text(other, true),
-    }
+    ACTIVE_MODE_EN
+        .iter()
+        .find(|&&(ru, _)| ru == mode)
+        .map(|&(_, en)| en.to_string())
+        .unwrap_or_else(|| localize_runtime_text(mode, true))
 }
 
 fn localize_recipe_title(id: u8, fallback: &str, is_en: bool) -> String {
     if !is_en {
         return fallback.to_string();
     }
-    match id {
-        0 => "#0 FakeSplit (midsld, MD5 ClientHello clone)".to_string(),
-        1 => "#1 TlsRec + Split (SNI TLS record split, no fake)".to_string(),
-        2 => "#2 FakeSplit + TlsRec (midsld, PAWS Timestamp, max.ru)".to_string(),
-        3 => "#3 FakeDisorder (midsld, MD5, vk.com)".to_string(),
-        4 => "#4 FakeDisorder + TlsRec (midsld, BadSeq -10000, rzd.ru)".to_string(),
-        5 => "#5 IPv6 HopByHop2 + FakeSplit (midsld, fonts.google.com)".to_string(),
-        6 => "#6 MultiSplit [2, sni_ext, host, midsld] + TlsRec".to_string(),
-        7 => "#7 FakeSplit AutoTTL (SNI boundary, gosuslugi.ru)".to_string(),
-        8 => "#8 MultiDisorder [2, sni_ext, host, midsld] (MD5, vk.com)".to_string(),
-        9 => "#9 Disorder (1st byte AutoTTL + retransmit)".to_string(),
-        10 => "#10 7-Point MultiDisorder (Md5BadAck + rndsni)".to_string(),
-        11 => "#11 HostFakeSplit Disorder (in-band host slice, Md5BadAck, rzd.ru)".to_string(),
-        12 => "#12 FakeDisorder (BadAck -66000 + PadEncap + seqovl=8)".to_string(),
-        13 => "#13 7-Point MultiDisorder (BadSeq+BadAck+BadSum, ozon.ru)".to_string(),
-        14 => "#14 FakeSplit DataNoAck (PSH no-ACK + sniext+1 + seqovl=12, aws.amazon.com)"
-            .to_string(),
-        15 => "#15 HostFakeSplit Disorder (AutoTTL, max.ru)".to_string(),
-        16 => "#16 OOB Urgent (MSG_OOB urgent pointer at midsld, no fake)".to_string(),
-        17 => "#17 Disoob + TlsRec (out-of-order MSG_OOB at host+1 + wsize=64)".to_string(),
-        18 => "#18 MultiSplit + SeqOvl=210 (pure segment overlap, no fake)".to_string(),
-        19 => "#19 FakeSplit sni_del (SNI-stripped clone + DataNoAck + seqovl=16)".to_string(),
-        20 => "#20 MultiDisorder bin_noise (0x0F0F0F0F decoy + BadSeq+BadAck+BadSum)".to_string(),
-        21 => "#21 FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap + seqovl=10)".to_string(),
-        22 => "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)".to_string(),
-        23 => "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)"
-            .to_string(),
-        _ => localize_runtime_text(fallback, true),
-    }
+    RECIPE_TITLES_EN
+        .get(id as usize)
+        .map(|&title| title.to_string())
+        .unwrap_or_else(|| localize_runtime_text(fallback, true))
+}
+
+fn find_list_locale_en(id: &str) -> Option<(&'static str, &'static str)> {
+    let norm = if id == "ai_all" { "ai_services" } else { id };
+    LIST_LOCALE_EN
+        .iter()
+        .find(|&&(entry_id, _, _)| entry_id == norm)
+        .map(|&(_, name, desc)| (name, desc))
 }
 
 fn localize_list_name(id: &str, fallback: &str, is_en: bool) -> String {
-    if !is_en {
-        return fallback.to_string();
+    if is_en && let Some((name, _)) = find_list_locale_en(id) {
+        return name.to_string();
     }
-    match id {
-        "youtube" => "YouTube & Google Video".to_string(),
-        "discord" => "Discord (Voice, Gateway & Media)".to_string(),
-        "telegram" => "Telegram & Media Servers".to_string(),
-        "ai_services" | "ai_all" => "AI Platforms (OpenAI, Claude, Gemini, xAI)".to_string(),
-        "social_media" => "Social Networks (X, Instagram, Meta)".to_string(),
-        "gaming" => "Gaming & Launchers (Steam, Roblox, Epic)".to_string(),
-        "streaming" => "Streaming & Audio (Twitch, Spotify, Netflix)".to_string(),
-        "dev_cloud" => "Dev & Cloud (GitHub, Docker, Cloudflare)".to_string(),
-        "trackers" => "Trackers & Archives (RuTracker, NNM)".to_string(),
-        "ru_direct" => "Domestic & Banking (Direct Bypass)".to_string(),
-        "direct_bypass" => "Direct (Desync Exclusions)".to_string(),
-        _ => fallback.to_string(),
-    }
+    fallback.to_string()
 }
 
 fn localize_list_desc(id: &str, fallback: &str, is_en: bool) -> String {
-    if !is_en {
-        return fallback.to_string();
+    if is_en && let Some((_, desc)) = find_list_locale_en(id) {
+        return desc.to_string();
     }
-    match id {
-        "youtube" => {
-            "googlevideo.com CDN, youtube.com, ytimg, ggpht + QUIC UDP/443 block".to_string()
-        }
-        "discord" => {
-            "discord.gg, discordapp.com, discord.media + UDP voice packet desync".to_string()
-        }
-        "telegram" => "t.me, telegram.org, telesco.pe + DC IPv4/IPv6 CIDR subnets".to_string(),
-        "ai_services" | "ai_all" => {
-            "chatgpt.com, openai.com, claude.ai, anthropic.com, gemini.google.com".to_string()
-        }
-        "social_media" => {
-            "x.com, twitter.com, t.co, instagram.com, facebook.com, fbcdn.net".to_string()
-        }
-        "gaming" => "roblox.com, rbxcdn.com, steamcommunity.com, epicgames.com".to_string(),
-        "streaming" => "twitch.tv, ttvnw.net, spotify.com, scdn.co, soundcloud.com".to_string(),
-        "dev_cloud" => "github.com, ghcr.io, docker.io, huggingface.co, medium.com".to_string(),
-        "trackers" => "rutracker.org, nnmclub.to, rutor.info, animego.org".to_string(),
-        "ru_direct" => {
-            ".ru / .рф domains, banking & government services — always direct without desync"
-                .to_string()
-        }
-        "direct_bypass" => {
-            "Domains & subnets connected directly without packet modification".to_string()
-        }
-        _ => fallback.to_string(),
-    }
+    fallback.to_string()
 }
 
 fn localize_runtime_text(text: &str, is_en: bool) -> String {
-    if !is_en {
+    if !is_en || text.is_empty() {
         return text.to_string();
     }
-    text.replace("По умолчанию", "Default")
-        .replace("по умолчанию", "default")
-        .replace("Профиль", "Profile")
-        .replace("Прямое (Bypass .exe)", "Direct (Bypass .exe)")
-        .replace("Прямое (Исключение)", "Direct (Bypass)")
-        .replace("Прямое", "Direct")
-        .replace("Принуд. .exe", "Forced .exe")
-        .replace("YouTube и Google Video", "YouTube & Google Video")
-        .replace("Discord (Голос и Чат)", "Discord (Voice & Chat)")
-        .replace("Telegram и Медиа-серверы", "Telegram & Media")
-        .replace("AI и Нейросети", "AI Services")
-        .replace("Социальные сети и Медиа", "Social Networks")
-        .replace("Игровые сервисы и лаунчеры", "Gaming & Launchers")
-        .replace("Стриминг и аудиосервисы", "Streaming & Audio")
-        .replace("Разработка и облака", "Dev & Cloud")
-        .replace("Торрент-трекеры и архивы", "Trackers & Archives")
-        .replace(
-            "QUIC UDP/443 отключён профилем",
-            "QUIC UDP/443 blocked by profile",
-        )
-        .replace("переход на TCP/TLS", "fallback to TCP/TLS")
-        .replace("клон ClientHello", "ClientHello clone")
-        .replace("разрез TLS-записи по SNI без фейка", "SNI TLS record split")
-        .replace(
-            "Системный интерфейс TUN «TachyonDesync» активирован",
-            "System TUN interface 'TachyonDesync' active",
-        )
-        .replace(
-            "Локальный узел SOCKS5/HTTP запущен на",
-            "Local SOCKS5/HTTP node listening on",
-        )
-        .replace(
-            "Системный прокси Windows направлен на",
-            "Windows System Proxy set to",
-        )
-        .replace(
-            "Движок десинхронизации Tachyon Desync инициализирован",
-            "Tachyon Desync engine initialized",
-        )
-        .replace(
-            "Служба Tachyon Desync остановлена",
-            "Tachyon Desync service stopped",
-        )
-        .replace("Генератор стратегий", "Strategy Generator")
-        .replace("«", "\"")
-        .replace("»", "\"")
+    let mut out: Option<String> = None;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if let Some(&(needle, repl)) = RUNTIME_REPLACEMENTS_EN
+            .iter()
+            .find(|&&(needle, _)| rest.starts_with(needle))
+        {
+            let buf = out.get_or_insert_with(|| {
+                let mut s = String::with_capacity(text.len());
+                s.push_str(&text[..i]);
+                s
+            });
+            buf.push_str(repl);
+            i += needle.len();
+        } else {
+            let ch_len = rest.chars().next().map_or(1, char::len_utf8);
+            if let Some(buf) = out.as_mut() {
+                buf.push_str(&rest[..ch_len]);
+            }
+            i += ch_len;
+        }
+    }
+    out.unwrap_or_else(|| text.to_string())
 }
 
 fn backup_file_path() -> std::path::PathBuf {
@@ -7483,37 +10143,54 @@ fn read_clipboard_or_backup_file() -> Option<String> {
 
 #[cfg(windows)]
 fn read_win32_clipboard_text() -> Option<String> {
+    use windows_sys::Win32::Foundation::HGLOBAL;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+
     const CF_UNICODETEXT: u32 = 13;
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn OpenClipboard(hwnd: isize) -> i32;
-        fn CloseClipboard() -> i32;
-        fn GetClipboardData(format: u32) -> isize;
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalLock(hmem: isize) -> *const u16;
-        fn GlobalUnlock(hmem: isize) -> i32;
-    }
-    unsafe {
-        if OpenClipboard(0) == 0 {
-            return None;
-        }
-        let hmem = GetClipboardData(CF_UNICODETEXT);
-        let mut out = None;
-        if hmem != 0 {
-            let ptr = GlobalLock(hmem);
-            if !ptr.is_null() {
-                let mut len = 0usize;
-                while len < 1_048_576 && *ptr.add(len) != 0 {
-                    len += 1;
-                }
-                let slice = std::slice::from_raw_parts(ptr, len);
-                out = Some(String::from_utf16_lossy(slice));
-                GlobalUnlock(hmem);
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
             }
         }
-        CloseClipboard();
-        out
+    }
+
+    struct GlobalLockGuard(HGLOBAL);
+    impl Drop for GlobalLockGuard {
+        fn drop(&mut self) {
+            unsafe {
+                GlobalUnlock(self.0);
+            }
+        }
+    }
+
+    unsafe {
+        if OpenClipboard(core::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let _clipboard_guard = ClipboardGuard;
+
+        let hmem = GetClipboardData(CF_UNICODETEXT);
+        if hmem.is_null() {
+            return None;
+        }
+        let locked = GlobalLock(hmem);
+        if locked.is_null() {
+            return None;
+        }
+        let _lock_guard = GlobalLockGuard(hmem);
+
+        let ptr = locked.cast::<u16>();
+        let mut len = 0usize;
+        while len < 1_048_576 && *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        Some(String::from_utf16_lossy(slice))
     }
 }

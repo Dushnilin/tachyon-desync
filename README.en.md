@@ -8,7 +8,7 @@
 <img src="assets/readme/hero-board.en.svg" width="100%" alt="Tachyon Desync — Cross-Platform Desktop L3/L4/L7 Adaptive Packet Desynchronizer">
 
 <p>
-  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.1.0-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.1.0"></a>
+  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.2.0-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.2.0"></a>
   <img src="https://img.shields.io/badge/Rust-2024_Edition-f97316?style=flat-square&logo=rust&logoColor=white&labelColor=0f172a" alt="Rust 2024">
   <img src="https://img.shields.io/badge/UI-Native_OpenGL_(egui)-38bdf8?style=flat-square&labelColor=0f172a" alt="Native OpenGL UI">
   <img src="https://img.shields.io/badge/Capture-Wintun_%7C_utun_%7C_tun_L3_%2B_SOCKS5-10b981?style=flat-square&labelColor=0f172a" alt="Wintun + utun + tun L3 + SOCKS5">
@@ -18,7 +18,7 @@
 
 <p>
   <strong>Native cross-platform desktop suite for adaptive traffic delivery, TLS record fragmentation, and L3/L4/L7 packet desynchronization across Windows, any Linux distribution, and any macOS system.</strong><br>
-  Three-tier <code>AdaptiveBrain L1–L3</code> selector (24 TCP + 6 UDP recipes) · <code>32 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter with userspace <code>smoltcp</code> stack · per-process PID filtering · Clean DNS (<code>:1253</code> / <code>:5353</code>) · Auto-TTL calibration · custom hardware-accelerated <code>OpenGL</code> window frame with zero WebView2 or browser processes.
+  Three-tier <code>AdaptiveBrain L1–L3</code> selector (24 TCP + 6 UDP recipes) · <code>32 / 192 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter with userspace <code>smoltcp</code> stack (<code>BBR</code>/<code>CUBIC</code>/<code>Reno</code>) · per-process PID filtering · Clean DNS (<code>DoH</code> / <code>DoT</code> / <code>UDP</code> + benchmark) · Auto-TTL calibration · custom hardware-accelerated <code>OpenGL</code> window frame with zero WebView2 or browser processes.
 </p>
 
 <p>
@@ -55,7 +55,7 @@
   - **`L2` (`/24` Subnet Cache)**: when connecting to a new subdomain hosted on an already learned `/24` IPv4 prefix, reuses the subnet's winning recipe without probing overhead.
   - **`L3` (Global Channel Scoreboard)**: ranks all 24 TCP recipes using integer `RecipeStats` (success probability + `EWMA RTT`) and passive `IspFingerprint` path profiling.
 - **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (both on live streams with `256 KiB` promotion and `active_elapsed` idle subtraction, and via pipelined 1-RTT `TLS 1.3` `> 32 KiB` probing in the Generator and Constructor). Consecutive `TCP RST` bursts automatically trigger background re-probing.
-- **Clean DNS & Local `hosts` Overrides**: built-in UDP resolver queries non-standard ports (`77.88.8.8:1253`, `208.67.222.222:5353`) alongside `1.1.1.1` and `8.8.8.8`, while the local `hosts` editor binds `domain=IP` directly inside the engine without touching `/etc/hosts` or `C:\Windows\System32\drivers\etc\hosts`.
+- **Clean DNS (`DoH` / `DoT` / `UDP`), Benchmark & Local `hosts` Overrides**: built-in resolver supports `DoH` (`RFC 8484`), `DoT` (`RFC 7858`, keep-alive) with optional packet desynchronization (`desync_doh_dot`), non-standard UDP ports (`77.88.8.8:1253`, `208.67.222.222:5353`), split `.ru`/domestic routing (`split_local_ru`), `PTR` `.arpa`, `Turbo Cache`, a 2-phase benchmark with auto-recommendation, and a built-in `hosts` editor without modifying OS files.
 - **Strategy Generator, Auto-TTL Calibration & `ClientHello` Visualizer**:
   - One-click `> 32 KiB` probing across all 24 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
   - Active `Auto-TTL` hop discovery (`2..10` hops) to find the exact minimum TTL that reaches transit middleboxes without reaching the destination server.
@@ -64,9 +64,10 @@
 
 | UI Tab | Purpose & Controls |
 | :--- | :--- |
-| **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, Clean DNS & local `hosts` controls, one-click 6-service `> 32 KiB` health check, 10-category service grid, pinned domain table, and `AdaptiveBrain` cache reset. |
+| **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, **`Network Stack & Tuning`** panel (`BBR`/`CUBIC`, `Turbo 4K` / `Default` presets, buffer auto-tuning & MTU), Clean DNS & local `hosts` controls, one-click service health check, category grid, pinned domain table, and `AdaptiveBrain` cache reset. |
+| **`DNS`** | `DoH` / `DoT` / `UDP` transport setup, `Parallel`/`Sequential` failover, `Turbo Cache`, `desync_doh_dot`, `split_local_ru`, 2-phase benchmark with auto-apply recommendation, multi-domain speed test, and DNS cache flush. |
 | **`Flows`** | Live monitor of active and recent TCP/UDP flows showing process name, target domain/IP, applied recipe, RX/TX byte counters, and quick actions to send a domain to the Generator or bypass list (`Direct`). |
-| **`Generator`** | Automated 24-recipe per-domain `> 32 KiB` probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, cache reset, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, `IPv6 Ext`, `QUIC`). |
+| **`Generator`** | Automated 24-recipe per-domain `32 / 192 KiB` probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, cache reset, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, SNI pool, `Fake Payload Hex`, `IPv6 Ext`, `QUIC`). |
 | **`Lists`** | Per-application process filter and list priority over game bypass, per-process strategy overrides, upstream proxy chaining (`SOCKS5/HTTP`), full JSON backup export/import, and editor for all 10 domain/subnet lists (`UDP ports`, `UDP TTL`). |
 | **`Logs`** | Collapsible `L3` channel scoreboard across all 24 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and full log export to clipboard. |
 

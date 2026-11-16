@@ -203,31 +203,31 @@ pub fn minimize_main_window_to_taskbar() {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn shell_execute_verb(verb: &str, target: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb_w = win32::to_wide(verb);
+    let target_w = win32::to_wide(target);
+    let res = unsafe {
+        ShellExecuteW(
+            core::ptr::null_mut(),
+            verb_w.as_ptr(),
+            target_w.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    (res as isize) > 32
+}
+
 /// Открыть внешнюю ссылку (например, репозиторий GitHub) в браузере по умолчанию.
 pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
-    unsafe {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut core::ffi::c_void,
-                lp_operation: *const u16,
-                lp_file: *const u16,
-                lp_parameters: *const u16,
-                lp_directory: *const u16,
-                n_show_cmd: i32,
-            ) -> isize;
-        }
-        let verb: Vec<u16> = "open".encode_utf16().chain(core::iter::once(0)).collect();
-        let target: Vec<u16> = url.encode_utf16().chain(core::iter::once(0)).collect();
-        let _ = ShellExecuteW(
-            core::ptr::null_mut(),
-            verb.as_ptr(),
-            target.as_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
-            win32::SW_SHOWNORMAL,
-        );
+    {
+        let _ = shell_execute_verb("open", url);
     }
     #[cfg(target_os = "macos")]
     {
@@ -257,11 +257,7 @@ pub fn restore_main_window_from_tray() {
 pub fn is_running_as_admin() -> bool {
     #[cfg(target_os = "windows")]
     unsafe {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn IsUserAnAdmin() -> i32;
-        }
-        IsUserAnAdmin() != 0
+        windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0
     }
     #[cfg(target_os = "linux")]
     {
@@ -293,37 +289,12 @@ pub fn is_running_as_admin() -> bool {
 /// Перезапустить текущий исполняемый файл с запросом повышенных привилегий (UAC `runas` / `pkexec` / `osascript`).
 pub fn relaunch_as_admin() -> bool {
     #[cfg(target_os = "windows")]
-    unsafe {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn ShellExecuteW(
-                hwnd: *mut core::ffi::c_void,
-                lp_operation: *const u16,
-                lp_file: *const u16,
-                lp_parameters: *const u16,
-                lp_directory: *const u16,
-                n_show_cmd: i32,
-            ) -> isize;
-        }
+    {
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
-        let verb: Vec<u16> = "runas".encode_utf16().chain(core::iter::once(0)).collect();
-        let file: Vec<u16> = exe
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(core::iter::once(0))
-            .collect();
         crate::proxy::emergency_disable_system_proxy();
-        let res = ShellExecuteW(
-            core::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
-            win32::SW_SHOWNORMAL,
-        );
-        res > 32
+        shell_execute_verb("runas", &exe.to_string_lossy())
     }
     #[cfg(target_os = "linux")]
     {
@@ -394,48 +365,33 @@ pub fn spawn_system_tray(rt: Arc<DesyncRuntime>, tokio_handle: tokio::runtime::H
 }
 
 #[cfg(target_os = "windows")]
-#[allow(clippy::upper_case_acronyms, clippy::manual_dangling_ptr)]
 mod win32 {
     use super::*;
-    use core::ffi::c_void;
+    use std::sync::atomic::AtomicPtr;
+    use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+        DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, HICON, IDI_APPLICATION,
+        LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassExW,
+        SW_SHOWNORMAL, SetTimer, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
+        TranslateMessage, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY,
+        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WM_USER,
+        WNDCLASSEXW,
+    };
+    pub use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SW_HIDE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    };
 
-    pub const SW_HIDE: i32 = 0;
-    pub const SW_SHOWNORMAL: i32 = 1;
-    pub const SW_SHOW: i32 = 5;
-    pub const SW_MINIMIZE: i32 = 6;
-    pub const SW_RESTORE: i32 = 9;
-
-    const WM_DESTROY: u32 = 0x0002;
-    const WM_QUERYENDSESSION: u32 = 0x0011;
-    const WM_ENDSESSION: u32 = 0x0016;
-    const WM_COMMAND: u32 = 0x0111;
-    const WM_TIMER: u32 = 0x0113;
-    const WM_HOTKEY: u32 = 0x0312;
-    const WM_USER: u32 = 0x0400;
     const WM_TRAYICON: u32 = WM_USER + 144;
-
-    const MOD_ALT: u32 = 0x0001;
-    const MOD_CONTROL: u32 = 0x0002;
-    const MOD_NOREPEAT: u32 = 0x4000;
     const ID_HOTKEY_TOGGLE: i32 = 1;
-
-    const WM_LBUTTONUP: u32 = 0x0202;
-    const WM_LBUTTONDBLCLK: u32 = 0x0203;
-    const WM_RBUTTONUP: u32 = 0x0205;
-    const WM_CONTEXTMENU: u32 = 0x007B;
-
-    const NIM_ADD: u32 = 0x00000000;
-    const NIM_MODIFY: u32 = 0x00000001;
-    const NIM_DELETE: u32 = 0x00000002;
-    const NIF_MESSAGE: u32 = 0x00000001;
-    const NIF_ICON: u32 = 0x00000002;
-    const NIF_TIP: u32 = 0x00000004;
-
-    const MF_STRING: u32 = 0x00000000;
-    const MF_CHECKED: u32 = 0x00000008;
-    const MF_SEPARATOR: u32 = 0x00000800;
-    const TPM_RIGHTBUTTON: u32 = 0x0002;
-    const TPM_BOTTOMALIGN: u32 = 0x0020;
 
     const IDM_OPEN: usize = 1001;
     const IDM_TOGGLE_RUN: usize = 1002;
@@ -444,158 +400,27 @@ mod win32 {
     const IDM_AUTOSTART: usize = 1005;
     const IDM_EXIT: usize = 1006;
 
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct POINT {
-        x: i32,
-        y: i32,
-    }
-
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct MSG {
-        hwnd: *mut c_void,
-        message: u32,
-        wparam: usize,
-        lparam: isize,
-        time: u32,
-        pt: POINT,
-    }
-
-    #[repr(C)]
-    struct WNDCLASSEXW {
-        cb_size: u32,
-        style: u32,
-        lpfn_wnd_proc: unsafe extern "system" fn(*mut c_void, u32, usize, isize) -> isize,
-        cb_cls_extra: i32,
-        cb_wnd_extra: i32,
-        h_instance: *mut c_void,
-        h_icon: *mut c_void,
-        h_cursor: *mut c_void,
-        hbr_background: *mut c_void,
-        lpsz_menu_name: *const u16,
-        lpsz_class_name: *const u16,
-        h_icon_sm: *mut c_void,
-    }
-
-    #[repr(C)]
-    struct NOTIFYICONDATAW {
-        cb_size: u32,
-        h_wnd: *mut c_void,
-        u_id: u32,
-        u_flags: u32,
-        u_callback_message: u32,
-        h_icon: *mut c_void,
-        sz_tip: [u16; 128],
-        dw_state: u32,
-        dw_state_mask: u32,
-        sz_info: [u16; 256],
-        u_timeout_or_version: u32,
-        sz_info_title: [u16; 64],
-        dw_info_flags: u32,
-        guid_item: [u8; 16],
-        h_balloon_icon: *mut c_void,
-    }
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        pub fn FindWindowW(lp_class_name: *const u16, lp_window_name: *const u16) -> *mut c_void;
-        pub fn ShowWindow(h_wnd: *mut c_void, n_cmd_show: i32) -> i32;
-        pub fn SetForegroundWindow(h_wnd: *mut c_void) -> i32;
-        fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) -> u16;
-        fn CreateWindowExW(
-            dw_ex_style: u32,
-            lp_class_name: *const u16,
-            lp_window_name: *const u16,
-            dw_style: u32,
-            x: i32,
-            y: i32,
-            n_width: i32,
-            n_height: i32,
-            h_wnd_parent: *mut c_void,
-            h_menu: *mut c_void,
-            h_instance: *mut c_void,
-            lp_param: *mut c_void,
-        ) -> *mut c_void;
-        fn DefWindowProcW(h_wnd: *mut c_void, msg: u32, w_param: usize, l_param: isize) -> isize;
-        fn GetMessageW(
-            lp_msg: *mut MSG,
-            h_wnd: *mut c_void,
-            w_msg_filter_min: u32,
-            w_msg_filter_max: u32,
-        ) -> i32;
-        fn TranslateMessage(lp_msg: *const MSG) -> i32;
-        fn DispatchMessageW(lp_msg: *const MSG) -> isize;
-        fn PostQuitMessage(n_exit_code: i32);
-        fn CreatePopupMenu() -> *mut c_void;
-        fn AppendMenuW(
-            h_menu: *mut c_void,
-            u_flags: u32,
-            u_id_new_item: usize,
-            lp_new_item: *const u16,
-        ) -> i32;
-        fn TrackPopupMenu(
-            h_menu: *mut c_void,
-            u_flags: u32,
-            x: i32,
-            y: i32,
-            n_reserved: i32,
-            h_wnd: *mut c_void,
-            prc_rect: *const c_void,
-        ) -> i32;
-        fn DestroyMenu(h_menu: *mut c_void) -> i32;
-        fn GetCursorPos(lp_point: *mut POINT) -> i32;
-        fn LoadIconW(h_instance: *mut c_void, lp_icon_name: *const u16) -> *mut c_void;
-        fn CreateIcon(
-            h_instance: *mut c_void,
-            n_width: i32,
-            n_height: i32,
-            c_planes: u8,
-            c_bits_pixel: u8,
-            lpb_AND_bits: *const u8,
-            lpb_XOR_bits: *const u8,
-        ) -> *mut c_void;
-        fn SetTimer(
-            h_wnd: *mut c_void,
-            n_id_event: usize,
-            u_elapse: u32,
-            lp_timer_func: *const c_void,
-        ) -> usize;
-        fn RegisterHotKey(h_wnd: *mut c_void, id: i32, fs_modifiers: u32, vk: u32) -> i32;
-        fn UnregisterHotKey(h_wnd: *mut c_void, id: i32) -> i32;
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetModuleHandleW(lp_module_name: *const u16) -> *mut c_void;
-    }
-
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn Shell_NotifyIconW(dw_message: u32, lp_data: *const NOTIFYICONDATAW) -> i32;
-    }
-
     struct TrayContext {
         rt: Arc<DesyncRuntime>,
         tokio_handle: tokio::runtime::Handle,
-        icon_active: *mut c_void,
-        icon_warn: *mut c_void,
-        icon_stopped: *mut c_void,
+        icon_active: HICON,
+        icon_warn: HICON,
+        icon_stopped: HICON,
         prev_rx_bytes: std::sync::atomic::AtomicU64,
         prev_tx_bytes: std::sync::atomic::AtomicU64,
     }
 
-    static mut TRAY_CTX: *const TrayContext = core::ptr::null();
+    static TRAY_CTX: AtomicPtr<TrayContext> = AtomicPtr::new(core::ptr::null_mut());
 
-    fn to_wide(s: &str) -> Vec<u16> {
+    pub(super) fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(core::iter::once(0)).collect()
     }
 
     unsafe fn build_tray_status_icon(
-        hinstance: *mut c_void,
+        hinstance: HINSTANCE,
         dot_rgb: [u8; 3],
         letter_rgb: [u8; 3],
-    ) -> *mut c_void {
+    ) -> HICON {
         let w = 16usize;
         let h = 16usize;
         let and_mask = [0u8; 32];
@@ -633,16 +458,16 @@ mod win32 {
                 xor_bgra.as_ptr(),
             );
             if ic.is_null() {
-                LoadIconW(core::ptr::null_mut(), 32512usize as *const u16)
+                LoadIconW(core::ptr::null_mut(), IDI_APPLICATION)
             } else {
                 ic
             }
         }
     }
 
-    unsafe fn refresh_tray_status_icon(hwnd: *mut c_void) {
+    unsafe fn refresh_tray_status_icon(hwnd: HWND) {
         unsafe {
-            let ctx_ptr = TRAY_CTX;
+            let ctx_ptr = TRAY_CTX.load(Ordering::Acquire);
             if ctx_ptr.is_null() {
                 return;
             }
@@ -704,32 +529,32 @@ mod win32 {
             };
 
             let mut nid: NOTIFYICONDATAW = core::mem::zeroed();
-            nid.cb_size = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.h_wnd = hwnd;
-            nid.u_id = 1;
-            nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-            nid.u_callback_message = WM_TRAYICON;
-            nid.h_icon = hicon;
+            nid.cbSize = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAYICON;
+            nid.hIcon = hicon;
 
             let tip = to_wide(&tip_str);
             for (i, &ch) in tip.iter().take(127).enumerate() {
-                nid.sz_tip[i] = ch;
+                nid.szTip[i] = ch;
             }
             Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 
-    pub unsafe fn find_tachyon_window() -> *mut c_void {
+    pub unsafe fn find_tachyon_window() -> HWND {
         let title = to_wide("Tachyon Desync");
         unsafe { FindWindowW(core::ptr::null(), title.as_ptr()) }
     }
 
     unsafe extern "system" fn tray_wnd_proc(
-        hwnd: *mut c_void,
+        hwnd: HWND,
         msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize {
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         unsafe {
             match msg {
                 WM_TRAYICON => {
@@ -747,7 +572,7 @@ mod win32 {
                 }
                 WM_HOTKEY => {
                     if wparam as i32 == ID_HOTKEY_TOGGLE {
-                        let ctx_ptr = TRAY_CTX;
+                        let ctx_ptr = TRAY_CTX.load(Ordering::Acquire);
                         if !ctx_ptr.is_null() {
                             let ctx = &*ctx_ptr;
                             ctx.tokio_handle.block_on(async {
@@ -785,9 +610,9 @@ mod win32 {
         }
     }
 
-    unsafe fn show_tray_context_menu(hwnd: *mut c_void) {
+    unsafe fn show_tray_context_menu(hwnd: HWND) {
         unsafe {
-            let ctx_ptr = TRAY_CTX;
+            let ctx_ptr = TRAY_CTX.load(Ordering::Acquire);
             if ctx_ptr.is_null() {
                 return;
             }
@@ -890,9 +715,9 @@ mod win32 {
         }
     }
 
-    unsafe fn handle_tray_command(_hwnd: *mut c_void, cmd_id: usize) {
+    unsafe fn handle_tray_command(_hwnd: HWND, cmd_id: usize) {
         unsafe {
-            let ctx_ptr = TRAY_CTX;
+            let ctx_ptr = TRAY_CTX.load(Ordering::Acquire);
             if ctx_ptr.is_null() {
                 return;
             }
@@ -970,23 +795,23 @@ mod win32 {
                 prev_rx_bytes: std::sync::atomic::AtomicU64::new(init_rx),
                 prev_tx_bytes: std::sync::atomic::AtomicU64::new(init_tx),
             });
-            TRAY_CTX = Box::into_raw(boxed_ctx);
+            TRAY_CTX.store(Box::into_raw(boxed_ctx), Ordering::Release);
 
             let class_name = to_wide("TachyonDesyncTrayHiddenWnd");
 
             let wc = WNDCLASSEXW {
-                cb_size: core::mem::size_of::<WNDCLASSEXW>() as u32,
+                cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: 0,
-                lpfn_wnd_proc: tray_wnd_proc,
-                cb_cls_extra: 0,
-                cb_wnd_extra: 0,
-                h_instance: hinstance,
-                h_icon: core::ptr::null_mut(),
-                h_cursor: core::ptr::null_mut(),
-                hbr_background: core::ptr::null_mut(),
-                lpsz_menu_name: core::ptr::null(),
-                lpsz_class_name: class_name.as_ptr(),
-                h_icon_sm: core::ptr::null_mut(),
+                lpfnWndProc: Some(tray_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: core::ptr::null_mut(),
+                hCursor: core::ptr::null_mut(),
+                hbrBackground: core::ptr::null_mut(),
+                lpszMenuName: core::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+                hIconSm: core::ptr::null_mut(),
             };
             RegisterClassExW(&wc);
 
@@ -1009,20 +834,20 @@ mod win32 {
             }
 
             let mut nid: NOTIFYICONDATAW = core::mem::zeroed();
-            nid.cb_size = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.h_wnd = hwnd;
-            nid.u_id = 1;
-            nid.u_flags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-            nid.u_callback_message = WM_TRAYICON;
-            nid.h_icon = icon_active;
+            nid.cbSize = core::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            nid.uCallbackMessage = WM_TRAYICON;
+            nid.hIcon = icon_active;
 
             let tip = to_wide("Tachyon Desync — Адаптивный десинхронизатор");
             for (i, &ch) in tip.iter().take(127).enumerate() {
-                nid.sz_tip[i] = ch;
+                nid.szTip[i] = ch;
             }
 
             Shell_NotifyIconW(NIM_ADD, &nid);
-            SetTimer(hwnd, 1, 1000, core::ptr::null());
+            SetTimer(hwnd, 1, 1000, None);
             let _ = RegisterHotKey(
                 hwnd,
                 ID_HOTKEY_TOGGLE,

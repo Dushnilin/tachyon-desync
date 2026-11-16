@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
@@ -134,18 +134,333 @@ pub mod util {
     }
 }
 
-/// Профиль аппаратных ресурсов, ожидаемый апстримным `tlsspoof.rs` (`crate::hardware::HardwareProfile`).
+/// Режим алгоритма контроля перегрузки TCP (`smoltcp` в TUN и Linux `TCP_CONGESTION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpCongestionMode {
+    /// Целочисленный BBR без плавающей точки (`vendor/smoltcp`, по умолчанию в ядре 0.5.7+).
+    #[default]
+    Bbr,
+    Cubic,
+    Reno,
+    None,
+}
+
+impl TcpCongestionMode {
+    pub const ALL: [Self; 4] = [Self::Bbr, Self::Cubic, Self::Reno, Self::None];
+
+    pub fn from_code(code: &str) -> Self {
+        match code.trim().to_ascii_lowercase().as_str() {
+            "cubic" => Self::Cubic,
+            "reno" | "new_reno" | "newreno" => Self::Reno,
+            "none" | "off" => Self::None,
+            _ => Self::Bbr,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bbr => "bbr",
+            Self::Cubic => "cubic",
+            Self::Reno => "reno",
+            Self::None => "none",
+        }
+    }
+
+    pub fn label_ru(self) -> &'static str {
+        match self {
+            Self::Bbr => "BBR (целочисленный)",
+            Self::Cubic => "CUBIC",
+            Self::Reno => "NewReno",
+            Self::None => "Без ограничения",
+        }
+    }
+
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::Bbr => "BBR (Integer)",
+            Self::Cubic => "CUBIC",
+            Self::Reno => "NewReno",
+            Self::None => "No Control",
+        }
+    }
+}
+
+/// Профиль размера TCP-буферов `smoltcp` (`set_auto_tune_max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunBufferMode {
+    /// Адаптивный подбор по ОЗУ и числу активных потоков (`64 KiB` -> `1..2 MiB`).
+    #[default]
+    Auto,
+    /// Экономный профиль для систем с малым объёмом памяти (`32 KiB` -> `256 KiB`).
+    Eco32k,
+    /// Сбалансированный профиль (`64 KiB` -> `512 KiB`).
+    Balanced64k,
+    /// Скоростной профиль для 4K/8K потоков и высокоскоростных каналов (`128 KiB` -> `2 MiB`).
+    Turbo2m,
+}
+
+impl TunBufferMode {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Eco32k, Self::Balanced64k, Self::Turbo2m];
+
+    pub fn label_ru(self) -> &'static str {
+        match self {
+            Self::Auto => "Авто (по RAM)",
+            Self::Eco32k => "Экономный (32 KiB)",
+            Self::Balanced64k => "Сбалансированный (64..512 KiB)",
+            Self::Turbo2m => "Турбо 4K/8K (до 2 MiB)",
+        }
+    }
+
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (by RAM)",
+            Self::Eco32k => "Eco (32 KiB)",
+            Self::Balanced64k => "Balanced (64..512 KiB)",
+            Self::Turbo2m => "Turbo 4K/8K (up to 2 MiB)",
+        }
+    }
+}
+
+/// Гибкие настройки сетевого стека и производительности ядра `tachyon-core 0.5.7+`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct NetworkTuningConfig {
+    pub tcp_congestion: TcpCongestionMode,
+    pub tun_buffer_mode: TunBufferMode,
+    pub tun_mss_clamp: bool,
+    pub tun_mtu: u16,
+    pub tun_ipv6: bool,
+    pub happy_eyeballs: bool,
+    pub quic_fast_failover: bool,
+    pub stream_verify_192k: bool,
+}
+
+impl Default for NetworkTuningConfig {
+    fn default() -> Self {
+        Self {
+            tcp_congestion: TcpCongestionMode::Bbr,
+            tun_buffer_mode: TunBufferMode::Auto,
+            tun_mss_clamp: true,
+            tun_mtu: 1420,
+            tun_ipv6: false,
+            happy_eyeballs: true,
+            quic_fast_failover: true,
+            stream_verify_192k: false,
+        }
+    }
+}
+
+pub static ACTIVE_TCP_CONGESTION: AtomicU8 = AtomicU8::new(0);
+pub static ACTIVE_TUN_BUFFER_MODE: AtomicU8 = AtomicU8::new(0);
+pub static ACTIVE_TUN_MSS_CLAMP: AtomicBool = AtomicBool::new(true);
+pub static ACTIVE_TUN_MTU: AtomicU16 = AtomicU16::new(1420);
+pub static ACTIVE_TUN_IPV6: AtomicBool = AtomicBool::new(false);
+pub static ACTIVE_HAPPY_EYEBALLS: AtomicBool = AtomicBool::new(true);
+pub static ACTIVE_QUIC_FAST_FAILOVER: AtomicBool = AtomicBool::new(true);
+
+pub fn sanitize_network_tuning(cfg: &mut NetworkTuningConfig) -> bool {
+    let mut changed = false;
+    let clamped_mtu = cfg.tun_mtu.clamp(1280, 9000);
+    if clamped_mtu != cfg.tun_mtu {
+        cfg.tun_mtu = clamped_mtu;
+        changed = true;
+    }
+    changed
+}
+
+pub fn apply_network_tuning(cfg: &NetworkTuningConfig) {
+    let cc = match cfg.tcp_congestion {
+        TcpCongestionMode::Bbr => 0,
+        TcpCongestionMode::Cubic => 1,
+        TcpCongestionMode::Reno => 2,
+        TcpCongestionMode::None => 3,
+    };
+    ACTIVE_TCP_CONGESTION.store(cc, Ordering::Release);
+    let bm = match cfg.tun_buffer_mode {
+        TunBufferMode::Auto => 0,
+        TunBufferMode::Eco32k => 1,
+        TunBufferMode::Balanced64k => 2,
+        TunBufferMode::Turbo2m => 3,
+    };
+    ACTIVE_TUN_BUFFER_MODE.store(bm, Ordering::Release);
+    ACTIVE_TUN_MSS_CLAMP.store(cfg.tun_mss_clamp, Ordering::Release);
+    ACTIVE_TUN_MTU.store(cfg.tun_mtu.clamp(1280, 9000), Ordering::Release);
+    ACTIVE_TUN_IPV6.store(cfg.tun_ipv6, Ordering::Release);
+    ACTIVE_HAPPY_EYEBALLS.store(cfg.happy_eyeballs, Ordering::Release);
+    ACTIVE_QUIC_FAST_FAILOVER.store(cfg.quic_fast_failover, Ordering::Release);
+}
+
+#[inline]
+pub fn active_tcp_congestion_mode() -> TcpCongestionMode {
+    match ACTIVE_TCP_CONGESTION.load(Ordering::Acquire) {
+        1 => TcpCongestionMode::Cubic,
+        2 => TcpCongestionMode::Reno,
+        3 => TcpCongestionMode::None,
+        _ => TcpCongestionMode::Bbr,
+    }
+}
+
+#[inline]
+pub fn active_tun_buffer_mode() -> TunBufferMode {
+    match ACTIVE_TUN_BUFFER_MODE.load(Ordering::Acquire) {
+        1 => TunBufferMode::Eco32k,
+        2 => TunBufferMode::Balanced64k,
+        3 => TunBufferMode::Turbo2m,
+        _ => TunBufferMode::Auto,
+    }
+}
+
+/// Профиль аппаратных ресурсов (`tachyon-core` parity): детекция ОЗУ, ядер CPU и авто-подбор буферов.
 pub mod hardware {
+    use super::*;
+    use std::sync::OnceLock;
+
     #[derive(Debug, Clone, Copy)]
     pub struct HardwareProfile {
         pub total_ram_mb: u64,
+        pub cpu_count: usize,
+        pub tun_max_tcp_sessions: usize,
+    }
+
+    static LAST_CONNECT_RTT_US: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn record_connect_rtt_us(us: u64) {
+        if us > 0 {
+            LAST_CONNECT_RTT_US.store(us, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn last_connect_rtt_us() -> u64 {
+        LAST_CONNECT_RTT_US.load(Ordering::Relaxed)
+    }
+
+    fn detect_total_ram_mb() -> u64 {
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct MemoryStatusEx {
+                dw_length: u32,
+                dw_memory_load: u32,
+                ull_total_phys: u64,
+                ull_avail_phys: u64,
+                ull_total_page_file: u64,
+                ull_avail_page_file: u64,
+                ull_total_virtual: u64,
+                ull_avail_virtual: u64,
+                ull_avail_extended_virtual: u64,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+            }
+            let mut st: MemoryStatusEx = unsafe { std::mem::zeroed() };
+            st.dw_length = std::mem::size_of::<MemoryStatusEx>() as u32;
+            if unsafe { GlobalMemoryStatusEx(&mut st) } != 0 && st.ull_total_phys > 0 {
+                return (st.ull_total_phys / (1024 * 1024)).max(64);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                for line in meminfo.lines() {
+                    if let Some(rest) = line.strip_prefix("MemTotal:") {
+                        if let Some(kb_str) = rest.split_whitespace().next()
+                            && let Ok(kb) = kb_str.parse::<u64>()
+                        {
+                            return (kb / 1024).max(64);
+                        }
+                    }
+                }
+            }
+        }
+        2048
     }
 
     impl HardwareProfile {
         #[inline]
-        pub fn detect() -> Self {
-            Self { total_ram_mb: 2048 }
+        pub fn detect() -> &'static Self {
+            static PROFILE: OnceLock<HardwareProfile> = OnceLock::new();
+            PROFILE.get_or_init(|| {
+                let total_ram_mb = detect_total_ram_mb();
+                let cpu_count = std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(2);
+                let tun_max_tcp_sessions = if total_ram_mb < 96 {
+                    256
+                } else if total_ram_mb <= 256 {
+                    944
+                } else if total_ram_mb < 1500 {
+                    2048
+                } else {
+                    4096
+                };
+                Self {
+                    total_ram_mb,
+                    cpu_count,
+                    tun_max_tcp_sessions,
+                }
+            })
         }
+
+        #[inline]
+        pub fn current_tun_max_tcp_sessions(&self) -> usize {
+            self.tun_max_tcp_sessions
+        }
+    }
+
+    pub fn smol_tcp_init_buf() -> usize {
+        match super::active_tun_buffer_mode() {
+            super::TunBufferMode::Eco32k => 32 * 1024,
+            super::TunBufferMode::Balanced64k | super::TunBufferMode::Auto => {
+                if HardwareProfile::detect().total_ram_mb < 128 {
+                    32 * 1024
+                } else {
+                    64 * 1024
+                }
+            }
+            super::TunBufferMode::Turbo2m => 128 * 1024,
+        }
+    }
+
+    pub fn smol_tcp_max_buf() -> usize {
+        match super::active_tun_buffer_mode() {
+            super::TunBufferMode::Eco32k => 256 * 1024,
+            super::TunBufferMode::Balanced64k => 512 * 1024,
+            super::TunBufferMode::Turbo2m => 2 * 1024 * 1024,
+            super::TunBufferMode::Auto => {
+                let ram = HardwareProfile::detect().total_ram_mb as usize;
+                if ram < 128 {
+                    512 * 1024
+                } else if ram <= 512 {
+                    1024 * 1024
+                } else {
+                    ((ram.saturating_mul(4096)).next_power_of_two())
+                        .clamp(1024 * 1024, 2 * 1024 * 1024)
+                }
+            }
+        }
+    }
+
+    pub fn smol_tcp_fair_max_buf(active_streams: usize) -> usize {
+        let base_max = smol_tcp_max_buf();
+        if active_streams <= 1 {
+            return base_max;
+        }
+        let ram = HardwareProfile::detect().total_ram_mb;
+        let stack_cap = if ram < 128 {
+            1024 * 1024
+        } else if ram <= 512 {
+            2 * 1024 * 1024
+        } else {
+            8 * 1024 * 1024
+        };
+        let budget = base_max.saturating_mul(2).min(stack_cap);
+        let per_sock = (budget / active_streams).next_power_of_two();
+        per_sock.clamp(smol_tcp_init_buf(), base_max)
     }
 }
 
@@ -162,6 +477,7 @@ pub mod cache_file {
         pub enabled: bool,
         pub path: String,
         pub flush_interval: std::time::Duration,
+        pub buffer_size: usize,
     }
 
     #[derive(Default, Serialize, Deserialize)]
@@ -319,7 +635,7 @@ pub mod inbound {
     }
 }
 
-/// Минимальный модуль `crate::dns`, ожидаемый апстримным `outbound/desync/mod.rs` для выбора семейства адресов.
+/// Минимальный модуль `crate::dns`, ожидаемый апстримным `outbound/desync/mod.rs`.
 pub mod dns {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub enum Strategy {
@@ -329,18 +645,18 @@ pub mod dns {
         IPv6Only,
     }
 
-    pub struct DnsServiceStub;
+    pub struct DnsServiceStub(pub Strategy);
 
     impl DnsServiceStub {
         #[inline]
         pub fn strategy(&self) -> Strategy {
-            Strategy::PreferIPv4
+            self.0
         }
     }
 
     #[inline]
     pub fn current() -> Option<DnsServiceStub> {
-        None
+        crate::dns_resolver::active_upstream_dns_strategy().map(DnsServiceStub)
     }
 }
 
@@ -370,6 +686,22 @@ pub mod core_tls {
     pub mod hello {
         pub use super::fingerprints::Template;
         use std::io;
+
+        /// Нормализовать имя хоста для TLS SNI: убрать внешние `[...]` и `%zone_id` для IPv6.
+        pub fn normalize_server_name(raw: &str) -> &str {
+            let trimmed = raw.trim();
+            let unbracketed = trimmed
+                .strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(trimmed);
+            if let Some((addr, _zone)) = unbracketed.split_once('%')
+                && addr.parse::<std::net::IpAddr>().is_ok()
+            {
+                addr
+            } else {
+                unbracketed
+            }
+        }
 
         #[derive(Debug, Clone)]
         pub struct ParsedHello {
@@ -571,6 +903,12 @@ pub mod outbound {
             pub fallback_delay: Option<Duration>,
             #[serde(default)]
             pub parallel: bool,
+            #[serde(default)]
+            pub disable_tcp_keep_alive: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub tcp_keep_alive: Option<Duration>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub tcp_keep_alive_interval: Option<Duration>,
         }
 
         impl DialOptions {
@@ -588,41 +926,217 @@ pub mod outbound {
             }
         }
 
-        type DnsCacheMap = HashMap<String, (Vec<Ipv4Addr>, std::time::Instant)>;
-        static DNS_CACHE: std::sync::OnceLock<Mutex<DnsCacheMap>> = std::sync::OnceLock::new();
-
-        fn dns_cache() -> &'static Mutex<DnsCacheMap> {
-            DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+        /// Разобрать IP-литерал (включая `[ipv6%zone]` / `ipv6%zone`) в `(IpAddr, scope_id)`.
+        pub fn parse_ip_literal_or_scoped(host: &str) -> Option<(IpAddr, u32)> {
+            let trimmed = host.trim();
+            let inner = trimmed
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(trimmed);
+            if let Ok(ip) = inner.parse::<IpAddr>() {
+                return Some((ip, 0));
+            }
+            let (ip_part, zone) = inner.split_once('%')?;
+            let v6 = ip_part.parse::<Ipv6Addr>().ok()?;
+            #[cfg(unix)]
+            let scope_id = zone.parse::<u32>().unwrap_or_else(|_| {
+                std::ffi::CString::new(zone)
+                    .map_or(0, |cz| unsafe { libc::if_nametoindex(cz.as_ptr()) })
+            });
+            #[cfg(not(unix))]
+            let scope_id = zone.parse::<u32>().unwrap_or_default();
+            Some((IpAddr::V6(v6), scope_id))
         }
 
-        fn active_dns_servers() -> &'static [SocketAddr] {
-            const AUTO_SERVERS: &[SocketAddr] = &[
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 1253),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)), 5353),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 53),
-            ];
-            const CF_SERVERS: &[SocketAddr] = &[
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)), 5353),
-            ];
-            const GOOGLE_SERVERS: &[SocketAddr] = &[
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 1253),
-            ];
-            const ALTPORT_SERVERS: &[SocketAddr] = &[
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 1253),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)), 5353),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(208, 67, 220, 220)), 5353),
-            ];
-            match CLEAN_DNS_MODE.load(Ordering::Relaxed) {
-                2 => CF_SERVERS,
-                3 => GOOGLE_SERVERS,
-                4 => ALTPORT_SERVERS,
-                _ => AUTO_SERVERS,
+        #[inline]
+        pub fn scoped_socket_addr(ip: IpAddr, scope_id: u32, port: u16) -> SocketAddr {
+            match ip {
+                IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), port),
+                IpAddr::V6(v6) => {
+                    let eff = if v6.is_unicast_link_local()
+                        || (v6.is_multicast() && (v6.segments()[0] & 0x000f) != 0x000e)
+                    {
+                        scope_id
+                    } else {
+                        0
+                    };
+                    SocketAddr::V6(std::net::SocketAddrV6::new(v6, port, 0, eff))
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn apply_tcp_congestion_sock(sock: &tokio::net::TcpSocket) {
+            use std::os::fd::AsRawFd;
+            let env_override = std::env::var("TACHYON_TCP_CONGESTION")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let algo_name: &str = if let Some(ref ov) = env_override {
+                ov.as_str()
+            } else {
+                match crate::upstream_compat::active_tcp_congestion_mode() {
+                    crate::upstream_compat::TcpCongestionMode::Bbr => "bbr",
+                    crate::upstream_compat::TcpCongestionMode::Cubic => "cubic",
+                    crate::upstream_compat::TcpCongestionMode::Reno => "reno",
+                    crate::upstream_compat::TcpCongestionMode::None => return,
+                }
+            };
+            let Ok(cstr) = std::ffi::CString::new(algo_name) else {
+                return;
+            };
+            let len = cstr.to_bytes().len() as libc::socklen_t;
+            let _ = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONGESTION,
+                    cstr.as_ptr().cast(),
+                    len,
+                )
+            };
+        }
+
+        #[inline]
+        fn apply_wan_tcp_keepalive(stream: &TcpStream, dst: SocketAddr, dial: &DialOptions) {
+            if dial.disable_tcp_keep_alive || dst.ip().to_canonical().is_loopback() {
+                return;
+            }
+            let idle = dial
+                .tcp_keep_alive
+                .filter(|&d| !d.is_zero())
+                .unwrap_or_else(|| Duration::from_secs(30));
+            let interval = dial
+                .tcp_keep_alive_interval
+                .filter(|&d| !d.is_zero())
+                .unwrap_or_else(|| Duration::from_secs(15));
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(idle)
+                .with_interval(interval);
+            #[cfg(target_os = "linux")]
+            let ka = ka.with_retries(3);
+            let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
+        }
+
+        /// Проверить наличие рабочего глобального маршрута IPv6 (с кэшем 5 сек).
+        pub fn has_usable_ipv6() -> bool {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+            static CACHED_USABLE: AtomicBool = AtomicBool::new(false);
+
+            let now_ms = EPOCH
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis() as u64;
+            let prev = LAST_CHECK_MS.load(Ordering::Relaxed);
+            if prev != 0 && now_ms.saturating_sub(prev) < 5_000 {
+                return CACHED_USABLE.load(Ordering::Relaxed);
+            }
+            let usable = probe_usable_ipv6();
+            CACHED_USABLE.store(usable, Ordering::Relaxed);
+            LAST_CHECK_MS.store(now_ms.max(1), Ordering::Release);
+            usable
+        }
+
+        fn probe_usable_ipv6() -> bool {
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(if_inet6) = std::fs::read_to_string("/proc/net/if_inet6") {
+                    for line in if_inet6.lines() {
+                        if let Some(hex) = line.split_whitespace().next()
+                            && hex.len() == 32
+                            && let Ok(val) = u128::from_str_radix(hex, 16)
+                        {
+                            let v6 = Ipv6Addr::from(val);
+                            if !v6.is_loopback()
+                                && !v6.is_unspecified()
+                                && !v6.is_unicast_link_local()
+                                && (v6.segments()[0] & 0xfe00) != 0xfc00
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                if let Ok(sock) = std::net::UdpSocket::bind("[::]:0")
+                    && sock.connect("[2001:4860:4860::8888]:443").is_ok()
+                    && let Ok(local) = sock.local_addr()
+                    && let IpAddr::V6(v6) = local.ip()
+                {
+                    return !v6.is_loopback()
+                        && !v6.is_unspecified()
+                        && !v6.is_unicast_link_local();
+                }
+                false
+            }
+        }
+
+        /// Чередовать адреса IPv6 и IPv4 по RFC 8305 (`Happy Eyeballs v2`).
+        pub fn interleave_addrs(addrs: &[SocketAddr], prefer_ipv6: bool) -> Vec<SocketAddr> {
+            let mut pref = Vec::new();
+            let mut alt = Vec::new();
+            for &addr in addrs {
+                if addr.is_ipv6() == prefer_ipv6 {
+                    pref.push(addr);
+                } else {
+                    alt.push(addr);
+                }
+            }
+            let mut out = Vec::with_capacity(addrs.len());
+            let mut pi = pref.into_iter();
+            let mut ai = alt.into_iter();
+            loop {
+                match (pi.next(), ai.next()) {
+                    (Some(p), Some(a)) => {
+                        out.push(p);
+                        out.push(a);
+                    }
+                    (Some(p), None) => {
+                        out.push(p);
+                        out.extend(pi);
+                        break;
+                    }
+                    (None, Some(a)) => {
+                        out.push(a);
+                        out.extend(ai);
+                        break;
+                    }
+                    (None, None) => break,
+                }
+            }
+            out
+        }
+
+        /// Упорядочить список целевых адресов по стратегии DNS и RFC 8305 `Happy Eyeballs v2`.
+        pub fn order_addrs_for_strategy(
+            mut addrs: Vec<SocketAddr>,
+            strategy: Option<crate::dns::Strategy>,
+        ) -> Vec<SocketAddr> {
+            let eff = strategy.or_else(|| crate::dns::current().map(|s| s.strategy()));
+            match eff {
+                Some(crate::dns::Strategy::IPv4Only) => {
+                    addrs.retain(SocketAddr::is_ipv4);
+                    addrs
+                }
+                Some(crate::dns::Strategy::IPv6Only) => {
+                    addrs.retain(SocketAddr::is_ipv6);
+                    addrs
+                }
+                Some(crate::dns::Strategy::PreferIPv6) => interleave_addrs(&addrs, true),
+                Some(crate::dns::Strategy::PreferIPv4) => interleave_addrs(&addrs, false),
+                None => {
+                    let has_v4 = addrs.iter().any(SocketAddr::is_ipv4);
+                    let has_v6 = addrs.iter().any(SocketAddr::is_ipv6);
+                    if has_v4 && has_v6 {
+                        interleave_addrs(&addrs, has_usable_ipv6())
+                    } else {
+                        addrs
+                    }
+                }
             }
         }
 
@@ -635,353 +1149,15 @@ pub mod outbound {
         }
 
         pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-            let clean = host.trim().trim_end_matches('.').to_ascii_lowercase();
-            if let Ok(ip) = clean.parse::<IpAddr>() {
-                return Ok(vec![SocketAddr::new(ip, port)]);
-            }
-
-            // 0. Проверяем пользовательские DNS-переопределения (домен=IP / локальный hosts)
-            if let Some(ov_ip) = crate::lists::lookup_custom_dns_override(&clean) {
-                crate::lists::record_dns_mapping(ov_ip, &clean);
-                return Ok(vec![SocketAddr::new(ov_ip, port)]);
-            }
-
-            let dns_mode = CLEAN_DNS_MODE.load(Ordering::Relaxed);
-
-            // 1. Проверяем быстрый кэш в памяти (TTL 240 с)
-            if let Ok(guard) = dns_cache().lock()
-                && let Some((cached_ips, ts)) = guard.get(&clean)
-                && ts.elapsed() < Duration::from_secs(240)
-                && !cached_ips.is_empty()
-            {
-                return Ok(cached_ips
-                    .iter()
-                    .map(|&ip| SocketAddr::new(IpAddr::V4(ip), port))
-                    .collect());
-            }
-
-            // 2. Если включён Чистый DNS (dns_mode != 0) или активен режим TUN, сначала выполняем
-            // прямой анти-спуфинг запрос к внешним резолверам в обход системного Dnscache
-            if (dns_mode != 0 || WIN_OUTBOUND_IF_INDEX.load(Ordering::Relaxed) != 0)
-                && let Ok(ips) = direct_dns_query_v4(&clean).await
-                && !ips.is_empty()
-            {
-                if let Ok(mut guard) = dns_cache().lock() {
-                    if guard.len() > 2048 {
-                        guard.clear();
-                        guard.shrink_to(256);
-                    }
-                    guard.insert(clean.clone(), (ips.clone(), std::time::Instant::now()));
-                }
-                return Ok(ips
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
-                    .collect());
-            }
-
-            if let Ok(iter) = tokio::net::lookup_host(format!("{clean}:{port}")).await {
-                let addrs: Vec<SocketAddr> = iter
-                    .filter(|a| {
-                        if clean.eq_ignore_ascii_case("localhost") {
-                            return true;
-                        }
-                        if a.ip().is_loopback() || a.ip().is_unspecified() {
-                            return false;
-                        }
-                        if let IpAddr::V4(v4) = a.ip()
-                            && is_fake_ip_v4(v4)
-                        {
-                            return false;
-                        }
-                        true
-                    })
-                    .collect();
-                if !addrs.is_empty() {
-                    return Ok(addrs);
-                }
-            }
-
-            // Резервный прямой DNS-резолвер (RFC 1035 A-запрос к 77.88.8.8:1253 / 208.67.222.222:5353 / 8.8.8.8:53),
-            // если системный DNS вернул WSANO_DATA (11004), FakeIP (198.18.0.0/15), NXDOMAIN или заглушку.
-            let fallback_ips = direct_dns_query_v4(&clean).await?;
-            if fallback_ips.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("DNS returned no addresses for {clean}"),
-                ));
-            }
-            if let Ok(mut guard) = dns_cache().lock() {
-                if guard.len() > 2048 {
-                    guard.clear();
-                    guard.shrink_to(256);
-                }
-                guard.insert(
-                    clean.clone(),
-                    (fallback_ips.clone(), std::time::Instant::now()),
-                );
-            }
-            Ok(fallback_ips
-                .into_iter()
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
-                .collect())
+            crate::dns_resolver::resolve_hostname(host, port).await
         }
 
-        /// Переслать сырой DNS-пакет (UDP/53 из TUN) через чистые резолверы с фильтрацией подменённых/FakeIP ответов.
+        /// Переслать сырой DNS-пакет (UDP/53 из TUN) через чистый DNS-резолвер (UDP / DoT / DoH).
         pub async fn forward_clean_dns_udp_packet(
             query_pkt: &[u8],
             orig_dst: SocketAddr,
         ) -> io::Result<Vec<u8>> {
-            // 0. Проверяем пользовательские DNS-переопределения (домен=IP): мгновенный синтетический ответ
-            if let Some((qname, qtype, qend)) = parse_dns_question_section(query_pkt)
-                && let Some(IpAddr::V4(v4)) = crate::lists::lookup_custom_dns_override(&qname)
-                && qtype == 1
-            {
-                crate::lists::record_dns_mapping(IpAddr::V4(v4), &qname);
-                return Ok(build_synthetic_dns_a_response(query_pkt, qend, v4));
-            }
-
-            let raw_sock = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
-            bind_outbound_socket(&raw_sock, false);
-            raw_sock.set_nonblocking(true)?;
-            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-            raw_sock.bind(&bind_addr.into())?;
-            let std_udp: std::net::UdpSocket = raw_sock.into();
-            let sock = UdpSocket::from_std(std_udp)?;
-
-            if CLEAN_DNS_MODE.load(Ordering::Relaxed) != 0 {
-                for &srv in active_dns_servers() {
-                    let _ = sock.send_to(query_pkt, srv).await;
-                }
-            }
-            if orig_dst.is_ipv4() {
-                let _ = sock.send_to(query_pkt, orig_dst).await;
-            }
-
-            let mut buf = [0u8; 1500];
-            let mut fallback_pkt: Option<Vec<u8>> = None;
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(1600);
-            while tokio::time::Instant::now() < deadline {
-                let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let Ok(Ok((n, _))) = tokio::time::timeout(rem, sock.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                if n < 12 {
-                    continue;
-                }
-                let pkt = &buf[..n];
-                crate::lists::snoop_dns_response_packet(pkt);
-                let a_ips = parse_dns_a_records(pkt);
-                if !a_ips.iter().any(|&ip| is_fake_ip_v4(ip)) {
-                    return Ok(pkt.to_vec());
-                }
-                if fallback_pkt.is_none() {
-                    fallback_pkt = Some(pkt.to_vec());
-                }
-            }
-            fallback_pkt.ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "DNS timeout"))
-        }
-
-        #[inline]
-        fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
-            let oct = ip.octets();
-            oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)
-        }
-
-        fn parse_dns_question_section(pkt: &[u8]) -> Option<(String, u16, usize)> {
-            if pkt.len() < 17 {
-                return None;
-            }
-            let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
-            if qdcount == 0 {
-                return None;
-            }
-            let mut pos = 12usize;
-            let mut labels = Vec::with_capacity(4);
-            while pos < pkt.len() {
-                let len = pkt[pos] as usize;
-                if len == 0 {
-                    pos += 1;
-                    break;
-                }
-                if len > 63 || pos + 1 + len > pkt.len() {
-                    return None;
-                }
-                if let Ok(s) = std::str::from_utf8(&pkt[pos + 1..pos + 1 + len]) {
-                    labels.push(s.to_ascii_lowercase());
-                } else {
-                    return None;
-                }
-                pos += 1 + len;
-            }
-            if pos + 4 > pkt.len() || labels.is_empty() {
-                return None;
-            }
-            let qtype = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
-            Some((labels.join("."), qtype, pos + 4))
-        }
-
-        fn build_synthetic_dns_a_response(query_pkt: &[u8], qend: usize, ip: Ipv4Addr) -> Vec<u8> {
-            let mut resp = Vec::with_capacity(qend + 16);
-            resp.extend_from_slice(&query_pkt[..qend]);
-            // Flags: QR=1, RD=1, RA=1, RCODE=0 (0x8180)
-            resp[2] = 0x81;
-            resp[3] = 0x80;
-            // QDCOUNT = 1, ANCOUNT = 1, NSCOUNT = 0, ARCOUNT = 0
-            resp[4] = 0x00;
-            resp[5] = 0x01;
-            resp[6] = 0x00;
-            resp[7] = 0x01;
-            resp[8] = 0x00;
-            resp[9] = 0x00;
-            resp[10] = 0x00;
-            resp[11] = 0x00;
-            // Answer RR: Name pointer 0xC00C, Type A (1), Class IN (1), TTL 120s, RDLENGTH 4, RDATA
-            resp.extend_from_slice(&[
-                0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x04,
-            ]);
-            resp.extend_from_slice(&ip.octets());
-            resp
-        }
-
-        async fn direct_dns_query_v4(host: &str) -> io::Result<Vec<Ipv4Addr>> {
-            let mut pkt = Vec::with_capacity(64);
-            // Header: ID=0x5444, Flags=0x0100 (RD=1), QDCOUNT=1
-            pkt.extend_from_slice(&[
-                0x54, 0x44, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]);
-            for label in host.split('.') {
-                let b = label.as_bytes();
-                if b.is_empty() || b.len() > 63 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid domain",
-                    ));
-                }
-                pkt.push(b.len() as u8);
-                pkt.extend_from_slice(b);
-            }
-            pkt.push(0x00);
-            // QTYPE = A (1), QCLASS = IN (1)
-            pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-
-            let servers = active_dns_servers();
-
-            let raw_sock = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
-            bind_outbound_socket(&raw_sock, false);
-            raw_sock.set_nonblocking(true)?;
-            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-            raw_sock.bind(&bind_addr.into())?;
-            let std_udp: std::net::UdpSocket = raw_sock.into();
-            let sock = UdpSocket::from_std(std_udp)?;
-            for &srv in servers {
-                let _ = sock.send_to(&pkt, srv).await;
-            }
-
-            let mut buf = [0u8; 512];
-            let mut fake_fallback = Vec::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
-            while tokio::time::Instant::now() < deadline {
-                let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let Ok(Ok((n, _))) = tokio::time::timeout(rem, sock.recv_from(&mut buf)).await
-                else {
-                    break;
-                };
-                if n < 12 {
-                    continue;
-                }
-                crate::lists::snoop_dns_response_packet(&buf[..n]);
-                let ips = parse_dns_a_records(&buf[..n]);
-                let real_ips: Vec<Ipv4Addr> = ips
-                    .iter()
-                    .copied()
-                    .filter(|&ip| !is_fake_ip_v4(ip))
-                    .collect();
-                if !real_ips.is_empty() {
-                    return Ok(real_ips);
-                }
-                if fake_fallback.is_empty() && !ips.is_empty() {
-                    fake_fallback = ips;
-                }
-            }
-            if !fake_fallback.is_empty() {
-                return Ok(fake_fallback);
-            }
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Direct DNS lookup failed for {host}"),
-            ))
-        }
-
-        fn parse_dns_a_records(pkt: &[u8]) -> Vec<Ipv4Addr> {
-            let mut out = Vec::new();
-            if pkt.len() < 12 {
-                return out;
-            }
-            let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
-            let ancount = u16::from_be_bytes([pkt[6], pkt[7]]) as usize;
-            let mut pos = 12usize;
-
-            for _ in 0..qdcount {
-                pos = match skip_dns_name(pkt, pos) {
-                    Some(p) if p + 4 <= pkt.len() => p + 4,
-                    _ => return out,
-                };
-            }
-            for _ in 0..ancount {
-                pos = match skip_dns_name(pkt, pos) {
-                    Some(p) => p,
-                    None => break,
-                };
-                if pos + 10 > pkt.len() {
-                    break;
-                }
-                let rtype = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
-                let rdlen = u16::from_be_bytes([pkt[pos + 8], pkt[pos + 9]]) as usize;
-                pos += 10;
-                if pos + rdlen > pkt.len() {
-                    break;
-                }
-                if rtype == 1 && rdlen == 4 {
-                    let ip = Ipv4Addr::new(pkt[pos], pkt[pos + 1], pkt[pos + 2], pkt[pos + 3]);
-                    if !ip.is_loopback() && !ip.is_unspecified() {
-                        out.push(ip);
-                    }
-                }
-                pos += rdlen;
-            }
-            out
-        }
-
-        fn skip_dns_name(pkt: &[u8], mut pos: usize) -> Option<usize> {
-            let mut jumps = 0usize;
-            while pos < pkt.len() {
-                let b = pkt[pos];
-                if b == 0 {
-                    return Some(pos + 1);
-                }
-                if (b & 0xC0) == 0xC0 {
-                    if pos + 2 > pkt.len() {
-                        return None;
-                    }
-                    return Some(pos + 2);
-                }
-                let len = (b & 0x3F) as usize;
-                pos = pos.checked_add(1 + len)?;
-                jumps += 1;
-                if jumps > 64 {
-                    return None;
-                }
-            }
-            None
+            crate::dns_resolver::forward_tun_dns_packet(query_pkt, orig_dst).await
         }
 
         pub async fn connect_tcp_addr(
@@ -1009,7 +1185,9 @@ pub mod outbound {
             };
             bind_outbound_socket(&sock, dst.is_ipv6());
             let _ = sock.set_nodelay(true);
-            if wscale.is_some() && !dst.ip().is_loopback() {
+            #[cfg(target_os = "linux")]
+            apply_tcp_congestion_sock(&sock);
+            if wscale.is_some() && !dst.ip().to_canonical().is_loopback() {
                 super::tlsspoof::apply_preconnect_tcp_window_sock(
                     &socket2::SockRef::from(&sock),
                     wsize,
@@ -1017,9 +1195,16 @@ pub mod outbound {
                 );
             }
 
-            tokio::time::timeout(timeout, sock.connect(dst))
+            let t0 = std::time::Instant::now();
+            let stream = tokio::time::timeout(timeout, sock.connect(dst))
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))?
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))??;
+            let connect_us = t0.elapsed().as_micros() as u64;
+            if !dst.ip().to_canonical().is_loopback() || connect_us >= 5_000 {
+                crate::hardware::record_connect_rtt_us(connect_us);
+            }
+            apply_wan_tcp_keepalive(&stream, dst, dial);
+            Ok(stream)
         }
 
         pub async fn dial_serial<F, Fut, T>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
@@ -1119,14 +1304,31 @@ pub mod outbound {
             port: u16,
             dial: &DialOptions,
         ) -> io::Result<TcpStream> {
-            let addrs = resolve(host, port).await?;
-            let target = addrs
-                .iter()
-                .find(|a| a.is_ipv4())
-                .or_else(|| addrs.first())
-                .copied()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?;
-            connect_tcp_addr(target, dial).await
+            let addrs = order_addrs_for_strategy(resolve(host, port).await?, dial.domain_strategy);
+            if addrs.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no address"));
+            }
+            if ACTIVE_HAPPY_EYEBALLS.load(Ordering::Relaxed) && addrs.len() > 1 {
+                let eff = dial
+                    .domain_strategy
+                    .or_else(|| crate::dns::current().map(|s| s.strategy()));
+                let prefer_ipv6 = matches!(
+                    eff,
+                    Some(crate::dns::Strategy::PreferIPv6 | crate::dns::Strategy::IPv6Only)
+                ) || (eff.is_none() && has_usable_ipv6());
+                let dial_owned = dial.clone();
+                return dial_fast_fallback(
+                    &addrs,
+                    prefer_ipv6,
+                    dial.fallback_delay(),
+                    move |addr| {
+                        let opts = dial_owned.clone();
+                        async move { connect_tcp_addr(addr, &opts).await }
+                    },
+                )
+                .await;
+            }
+            connect_tcp_addr(addrs[0], dial).await
         }
 
         pub async fn connect_udp(dst: SocketAddr, _dial: &DialOptions) -> io::Result<UdpSocket> {

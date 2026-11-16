@@ -4,6 +4,9 @@ use super::RttEstimator;
 
 pub(super) mod no_control;
 
+#[cfg(feature = "socket-tcp-bbr")]
+pub(super) mod bbr;
+
 #[cfg(feature = "socket-tcp-cubic")]
 pub(super) mod cubic;
 
@@ -42,6 +45,9 @@ pub(super) trait Controller {
 pub(super) enum AnyController {
     None(no_control::NoControl),
 
+    #[cfg(feature = "socket-tcp-bbr")]
+    Bbr(bbr::Bbr),
+
     #[cfg(feature = "socket-tcp-reno")]
     Reno(reno::Reno),
 
@@ -65,6 +71,23 @@ impl AnyController {
     #[allow(unreachable_code)]
     #[inline]
     pub fn new() -> Self {
+        #[cfg(feature = "std")]
+        match env_cc() {
+            #[cfg(feature = "socket-tcp-bbr")]
+            EnvCc::Bbr => return AnyController::Bbr(bbr::Bbr::new()),
+            #[cfg(feature = "socket-tcp-cubic")]
+            EnvCc::Cubic => return AnyController::Cubic(cubic::Cubic::new()),
+            #[cfg(feature = "socket-tcp-reno")]
+            EnvCc::Reno => return AnyController::Reno(reno::Reno::new()),
+            EnvCc::None => return AnyController::None(no_control::NoControl),
+            _ => {}
+        }
+
+        #[cfg(feature = "socket-tcp-bbr")]
+        {
+            return AnyController::Bbr(bbr::Bbr::new());
+        }
+
         #[cfg(feature = "socket-tcp-cubic")]
         {
             return AnyController::Cubic(cubic::Cubic::new());
@@ -83,6 +106,9 @@ impl AnyController {
         match self {
             AnyController::None(n) => n,
 
+            #[cfg(feature = "socket-tcp-bbr")]
+            AnyController::Bbr(b) => b,
+
             #[cfg(feature = "socket-tcp-reno")]
             AnyController::Reno(r) => r,
 
@@ -96,6 +122,9 @@ impl AnyController {
         match self {
             AnyController::None(n) => n,
 
+            #[cfg(feature = "socket-tcp-bbr")]
+            AnyController::Bbr(b) => b,
+
             #[cfg(feature = "socket-tcp-reno")]
             AnyController::Reno(r) => r,
 
@@ -103,4 +132,36 @@ impl AnyController {
             AnyController::Cubic(c) => c,
         }
     }
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+enum EnvCc {
+    Default,
+    Bbr,
+    Cubic,
+    Reno,
+    None,
+}
+
+#[cfg(feature = "std")]
+fn env_cc() -> EnvCc {
+    static OVERRIDE: std::sync::OnceLock<EnvCc> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("TACHYON_SMOL_CC") {
+        Ok(val) => {
+            let v = val.trim();
+            if v.eq_ignore_ascii_case("bbr") {
+                EnvCc::Bbr
+            } else if v.eq_ignore_ascii_case("cubic") {
+                EnvCc::Cubic
+            } else if v.eq_ignore_ascii_case("reno") {
+                EnvCc::Reno
+            } else if v.eq_ignore_ascii_case("none") {
+                EnvCc::None
+            } else {
+                EnvCc::Default
+            }
+        }
+        Err(_) => EnvCc::Default,
+    })
 }
