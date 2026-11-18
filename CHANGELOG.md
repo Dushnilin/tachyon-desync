@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.7
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
 ## 0.2.6
 
 ### Исправления и улучшения
