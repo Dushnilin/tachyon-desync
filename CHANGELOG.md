@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## 0.2.28
 
 ### Новые возможности и улучшения
 
@@ -15,6 +15,303 @@
   - **TUN `IPv6` и планировщик**: реализована настройка адресов и маршрутов `::/1`, `8000::/1` на Windows (`netsh`), Linux (`ip -6`) и macOS (`ifconfig`/`route -n`), цикл `run_tun_capture` переведён на `iface.poll_delay(...)`, добавлена аварийная очистка маршрутов `emergency_cleanup_tun_routes()`.
   - **Локальный прокси**: раннее отклонение правил `Block` (`0x05 0x02` для `SOCKS5` и `403 Forbidden` для `HTTP CONNECT`) до DNS-резолва и ответа `200`/`0x00`, нормализация не-`CONNECT` HTTP-запросов, общий 5-секундный таймаут заголовков (`431` при `> 16 KiB`), сохранение/восстановление системного прокси Windows и поддержка KDE Plasma на Linux.
   - **Неблокирующий UI и безопасное обновление**: команды и опрос снимка в `gui.rs` вынесены из главного потока на фоновый воркер `GuiCommand`; в `updater.rs` убран кросс-архитектурный фоллбэк, сверка `SHA256SUMS` сделана обязательной, добавлены проверки `.deb`/`setcap` на Linux и `.app`-бандла на macOS.
+
+## 0.2.27
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.26
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.25
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.24
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.23
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.22
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.21
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.20
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.2` (`d7880479`)**:
+  - добавил разбор ?ed= в пути websocket и проверку лимита early data.
+  - убрал задержку vision на коротких сырых ответах без eof.
+  - починил обработку статусов xudp и смену адреса без сброса сессии.
+  - добавил автовосстановление udp-сессий hysteria2 после обрыва quic.
+  - упорядочил остановку стека masque и перевёл udp_bridge на общий буфер.
+
+## 0.2.19
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.1` (`12b16aeb`)**:
+  - починил head для xhttp, разогнал wireguard и снизил расход памяти в транспортах и dns.
+  - добавил телеметрию, диагностику и сброс кэша dns в clash api.
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+
+## 0.2.18
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.1` (`12b16aeb`)**:
+  - починил head для xhttp, разогнал wireguard и снизил расход памяти в транспортах и dns.
+  - добавил телеметрию, диагностику и сброс кэша dns в clash api.
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+
+## 0.2.17
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.1` (`12b16aeb`)**:
+  - починил head для xhttp, разогнал wireguard и снизил расход памяти в транспортах и dns.
+  - добавил телеметрию, диагностику и сброс кэша dns в clash api.
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+
+## 0.2.16
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.1` (`12b16aeb`)**:
+  - починил head для xhttp, разогнал wireguard и снизил расход памяти в транспортах и dns.
+  - добавил телеметрию, диагностику и сброс кэша dns в clash api.
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+
+## 0.2.15
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.0` (`61e4ce9e`)**:
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+  - убрал предупреждения clippy после разделения потоков.
+  - подогнал окна quic, пулы h2 и пороги dec_worker wireguard под железо и rtt.
+
+## 0.2.14
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.0` (`61e4ce9e`)**:
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+  - убрал предупреждения clippy после разделения потоков.
+  - подогнал окна quic, пулы h2 и пороги dec_worker wireguard под железо и rtt.
+
+## 0.2.13
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.0` (`61e4ce9e`)**:
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+  - убрал предупреждения clippy после разделения потоков.
+  - подогнал окна quic, пулы h2 и пороги dec_worker wireguard под железо и rtt.
+
+## 0.2.12
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.0` (`61e4ce9e`)**:
+  - починил сборку mips без atomicu64 и ограничил rx udp_window по mtu для #66.
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+  - убрал предупреждения clippy после разделения потоков.
+  - подогнал окна quic, пулы h2 и пороги dec_worker wireguard под железо и rtt.
+
+## 0.2.11
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.0` (`92335ec7`)**:
+  - починил раздувание udp_window в awg 3.1 и зависание tx_batch после wouldblock.
+  - добавил откат vmess zero к aead, выровнял батчи под tls и подкрутил окна quic и smoltcp.
+  - убрал предупреждения clippy после разделения потоков.
+  - подогнал окна quic, пулы h2 и пороги dec_worker wireguard под железо и rtt.
+  - ускорил vmess-tls через zero-режим, пул буферов и прямой двухпоточный relay.
+
+## 0.2.10
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.9
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.8
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.7
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.6
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.5
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`ceb31b94`)**:
+  - не перебивать ручную стратегию desync эвристиками на cold-старте.
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+
+## 0.2.4
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`b14b18e5`)**:
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+  - убрать спин в egress_credit и починить полузакрытые tcp-сессии в туннелях (#64).
+
+## 0.2.3
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.9` (`b14b18e5`)**:
+  - добавить udp_fake_payload, udp_out_range и udp_keep_socket в desync (#65).
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+  - убрать спин в egress_credit и починить полузакрытые tcp-сессии в туннелях (#64).
+
+## 0.2.2
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.8` (`ea264337`)**:
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+  - убрать спин в egress_credit и починить полузакрытые tcp-сессии в туннелях (#64).
+  - релиз 0.5.7: сквозной ipv6 и fakeipv6, стабильность desync и кэш-узлов, устранение утечек и защита flash.
+
+## 0.2.1
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.5.8` (`ea264337`)**:
+  - Fix WDTT DialOptions detour propagation, VK cookie auth, chunked HTTP parsing, and srtp_mode/vk_token validation.
+  - целочисленный bbr в smoltcp, tcp_congestion, фоллбэк портов mieru и защита fakeip lru.
+  - добавить credit guard в masque и wireguard при падении стека (#64).
+  - убрать спин в egress_credit и починить полузакрытые tcp-сессии в туннелях (#64).
+  - релиз 0.5.7: сквозной ipv6 и fakeipv6, стабильность desync и кэш-узлов, устранение утечек и защита flash.
 
 ## 0.2.0
 
