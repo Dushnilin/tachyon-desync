@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.32
+
+### Исправления и улучшения
+
+- **Автоматическая синхронизация с апстримным движком `tachyon-core v0.6.9` (`d1914b14`)**:
+  - починили tuic udp под tproxy, tun на macos и xray fallbackTag с header-custom (#73, #74, #75).
+  - дофлашили буфер vmess при ожидании чтения и заменили сброс xhttp на backpressure.
+  - починили разыменование TrackedStream в ветках lock-free релея для mieru, anytls и vmess.
+  - устранили краш WS-фрейминга, голодание NaiveProxy, лишний CPU в Snell и рост RSS.
+  - починили согласование окна и автотюнинг smoltcp в userspace-стеках.
+
 ## 0.2.31
 
 ### Исправления и улучшения
