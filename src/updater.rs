@@ -252,6 +252,14 @@ fn download_url_to_file(
     Err("Не удалось скачать файл обновления с GitHub Releases".to_string())
 }
 
+/// Подобрать релизный артефакт строго для текущей ОС и архитектуры (без кросс-платформенного фоллбэка).
+fn select_platform_asset<'a>(
+    assets: &'a [GithubAssetDto],
+    want_asset: &str,
+) -> Option<&'a GithubAssetDto> {
+    assets.iter().find(|a| a.name == want_asset)
+}
+
 /// Проверить наличие новой версии `Tachyon Desync` на GitHub Releases.
 pub fn check_for_updates(proxy_port: Option<u16>) -> Result<UpdateCheckResult, String> {
     let raw = fetch_url_bytes(RELEASES_API_URL, proxy_port, 15)?;
@@ -263,15 +271,7 @@ pub fn check_for_updates(proxy_port: Option<u16>) -> Result<UpdateCheckResult, S
     let update_available = is_newer_version(CURRENT_VERSION, &latest_version);
 
     let want_asset = expected_platform_asset_name();
-    let matched_asset = rel
-        .assets
-        .iter()
-        .find(|a| a.name == want_asset)
-        .or_else(|| {
-            rel.assets
-                .iter()
-                .find(|a| a.name.ends_with(".exe") || a.name.ends_with(".tar.gz"))
-        });
+    let matched_asset = select_platform_asset(&rel.assets, want_asset);
 
     let (asset_name, asset_url, asset_size) = match matched_asset {
         Some(a) => (a.name.clone(), a.browser_download_url.clone(), a.size),
@@ -336,26 +336,186 @@ pub fn parse_sha256sums_for_asset(sums_text: &str, asset_name: &str) -> Option<S
     None
 }
 
+/// Проверить, запущен ли бинарник изнутри подписанного пакета `.app/Contents/MacOS/` на macOS.
+#[cfg(any(target_os = "macos", test))]
+fn is_inside_macos_app_bundle(exe_path: &Path) -> bool {
+    let Some(macos_dir) = exe_path.parent() else {
+        return false;
+    };
+    let Some(contents_dir) = macos_dir.parent() else {
+        return false;
+    };
+    let Some(app_dir) = contents_dir.parent() else {
+        return false;
+    };
+    macos_dir.file_name().and_then(|n| n.to_str()) == Some("MacOS")
+        && contents_dir.file_name().and_then(|n| n.to_str()) == Some("Contents")
+        && app_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"))
+}
+
+/// Проверить, можно ли безопасно выполнить самообновление для `current_exe` и метаданных `info`.
+fn validate_update_preconditions(
+    info: &UpdateCheckResult,
+    current_exe: &Path,
+) -> Result<(), String> {
+    if info.asset_url.is_empty() {
+        return Err("В релизе ещё не опубликована сборка для вашей платформы".to_string());
+    }
+    if info
+        .sha256sums_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return Err(
+            "В релизе отсутствует файл контрольных сумм SHA256SUMS — обновление отклонено из соображений безопасности"
+                .to_string(),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if is_inside_macos_app_bundle(current_exe) {
+        return Err(
+            "Приложение запущено из пакета .app — для обновления скачайте новый образ .dmg со страницы релизов GitHub вместо замены бинарного файла внутри бандла."
+                .to_string(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(parent_dir) = current_exe.parent() {
+        let probe_path = parent_dir.join(format!(".tachyon-update-probe-{}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe_path);
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Нет прав на запись в каталог установки ({}). Если приложение установлено из системного пакета (.deb), обновите его через пакетный менеджер или запустите обновление с правами sudo.",
+                    parent_dir.display()
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = current_exe;
+
+    Ok(())
+}
+
+/// Проверить SHA-256 скачанного файла обновления по сырому содержимому `SHA256SUMS`.
+fn verify_downloaded_sha256(
+    downloaded_bytes: &[u8],
+    sums_raw: &[u8],
+    asset_name: &str,
+) -> Result<(), String> {
+    let sums_text = std::str::from_utf8(sums_raw)
+        .map_err(|_| "Файл SHA256SUMS содержит некорректную кодировку UTF-8".to_string())?;
+    let expected_hash = parse_sha256sums_for_asset(sums_text, asset_name).ok_or_else(|| {
+        format!("В файле SHA256SUMS отсутствует запись для артефакта {asset_name}")
+    })?;
+    let actual_hash = sha256_hex(downloaded_bytes);
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "Контрольная сумма SHA-256 не совпала (ожидалось {}, получено {})",
+            &expected_hash[..12],
+            &actual_hash[..12]
+        ));
+    }
+    Ok(())
+}
+
+/// Извлечь строку capabilities из вывода `getcap`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_getcap_cap_spec(stdout: &str) -> Option<String> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if let Some((_, rhs)) = line.rsplit_once(" = ") {
+        let caps = rhs.trim();
+        if !caps.is_empty() {
+            return Some(caps.to_string());
+        }
+    }
+    if let Some((_, rhs)) = line.rsplit_once(char::is_whitespace) {
+        let caps = rhs.trim();
+        if caps.contains('=') || caps.contains('+') {
+            return Some(caps.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_file_caps(exe_path: &Path) -> Option<String> {
+    for getcap in ["getcap", "/usr/sbin/getcap", "/sbin/getcap"] {
+        if let Ok(out) = Command::new(getcap).arg(exe_path).output()
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(caps) = parse_getcap_cap_spec(&stdout) {
+                return Some(caps);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_net_admin_caps(exe_path: &Path, saved_caps: Option<&str>) {
+    let Some(caps) = saved_caps.filter(|c| c.to_ascii_lowercase().contains("cap_net_admin")) else {
+        return;
+    };
+    for setcap in ["setcap", "/usr/sbin/setcap", "/sbin/setcap"] {
+        if let Ok(status) = Command::new(setcap).arg(caps).arg(exe_path).status()
+            && status.success()
+        {
+            break;
+        }
+    }
+}
+
 /// Скачать релизный артефакт, проверить его `SHA-256` и атомарно заменить текущий исполняемый файл.
 /// Возвращает путь к обновлённому исполняемому файлу для последующего перезапуска.
 pub fn download_and_apply_update(
     info: &UpdateCheckResult,
     proxy_port: Option<u16>,
 ) -> Result<PathBuf, String> {
-    if info.asset_url.is_empty() {
-        return Err("В релизе ещё не опубликована сборка для вашей платформы".to_string());
-    }
-
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("Не удалось определить путь к исполняемому файлу: {e}"))?;
+    validate_update_preconditions(info, &current_exe)?;
+
+    let sums_url = info
+        .sha256sums_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "В релизе отсутствует файл контрольных сумм SHA256SUMS — обновление отклонено"
+                .to_string()
+        })?;
+
     let tmp_download = with_appended_ext(&current_exe, "update.tmp");
     let _ = std::fs::remove_file(&tmp_download);
 
     // 1. Скачиваем артефакт
     download_url_to_file(&info.asset_url, &tmp_download, proxy_port)?;
 
-    let downloaded_bytes = std::fs::read(&tmp_download)
-        .map_err(|e| format!("Не удалось прочитать скачанный файл обновления: {e}"))?;
+    let downloaded_bytes = match std::fs::read(&tmp_download) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_download);
+            return Err(format!(
+                "Не удалось прочитать скачанный файл обновления: {e}"
+            ));
+        }
+    };
     if downloaded_bytes.len() < 256 * 1024 {
         let _ = std::fs::remove_file(&tmp_download);
         return Err(format!(
@@ -364,21 +524,19 @@ pub fn download_and_apply_update(
         ));
     }
 
-    // 2. Проверяем контрольную сумму SHA-256, если в релизе опубликован SHA256SUMS
-    if let Some(ref sums_url) = info.sha256sums_url
-        && let Ok(sums_raw) = fetch_url_bytes(sums_url, proxy_port, 15)
-        && let Ok(sums_text) = String::from_utf8(sums_raw)
-        && let Some(expected_hash) = parse_sha256sums_for_asset(&sums_text, &info.asset_name)
-    {
-        let actual_hash = sha256_hex(&downloaded_bytes);
-        if actual_hash != expected_hash {
+    // 2. Обязательно скачиваем SHA256SUMS и проверяем контрольную сумму SHA-256
+    let sums_raw = match fetch_url_bytes(sums_url, proxy_port, 15) {
+        Ok(raw) => raw,
+        Err(e) => {
             let _ = std::fs::remove_file(&tmp_download);
             return Err(format!(
-                "Контрольная сумма SHA-256 не совпала (ожидалось {}, получено {})",
-                &expected_hash[..12],
-                &actual_hash[..12]
+                "Не удалось скачать SHA256SUMS для проверки целостности: {e}"
             ));
         }
+    };
+    if let Err(e) = verify_downloaded_sha256(&downloaded_bytes, &sums_raw, &info.asset_name) {
+        let _ = std::fs::remove_file(&tmp_download);
+        return Err(e);
     }
 
     // 3. Готовим новый исполняемый файл (.new)
@@ -391,10 +549,14 @@ pub fn download_and_apply_update(
             .unwrap_or_else(|| Path::new("."))
             .join(".tachyon-update-extract");
         let _ = std::fs::remove_dir_all(&extract_dir);
-        std::fs::create_dir_all(&extract_dir)
-            .map_err(|e| format!("Не удалось создать временный каталог распаковки: {e}"))?;
+        if let Err(e) = std::fs::create_dir_all(&extract_dir) {
+            let _ = std::fs::remove_file(&tmp_download);
+            return Err(format!(
+                "Не удалось создать временный каталог распаковки: {e}"
+            ));
+        }
 
-        let status = hidden_command("tar")
+        let status = match hidden_command("tar")
             .args([
                 "-xzf",
                 &tmp_download.to_string_lossy(),
@@ -402,7 +564,14 @@ pub fn download_and_apply_update(
                 &extract_dir.to_string_lossy(),
             ])
             .status()
-            .map_err(|e| format!("Ошибка запуска tar для распаковки обновления: {e}"))?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_download);
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                return Err(format!("Ошибка запуска tar для распаковки обновления: {e}"));
+            }
+        };
         let _ = std::fs::remove_file(&tmp_download);
 
         if !status.success() {
@@ -443,6 +612,9 @@ pub fn download_and_apply_update(
             .map_err(|e| format!("Не удалось подготовить файл обновления: {e}"))?;
     }
 
+    #[cfg(target_os = "linux")]
+    let saved_caps = read_linux_file_caps(&current_exe);
+
     // 4. Атомарная замена: переименовываем текущий работающий бинарник в `.old` и ставим `.new` на его место
     let old_exe = with_appended_ext(&current_exe, "old");
     let _ = std::fs::remove_file(&old_exe);
@@ -457,6 +629,9 @@ pub fn download_and_apply_update(
         let _ = std::fs::rename(&old_exe, &current_exe);
         return Err(format!("Не удалось установить новый исполняемый файл: {e}"));
     }
+
+    #[cfg(target_os = "linux")]
+    restore_linux_net_admin_caps(&current_exe, saved_caps.as_deref());
 
     Ok(current_exe)
 }
@@ -505,5 +680,119 @@ mod tests {
             parse_sha256sums_for_asset(sums, "tachyon-desync-windows-amd64.exe").as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    #[test]
+    fn test_parse_sha256sums_handles_prefixes_and_rejects_invalid_entries() {
+        let sums = "\
+# comment line should be ignored\n\
+\n\
+short_hash  tachyon-desync-linux-amd64.tar.gz\n\
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  tachyon-desync-linux-amd64.tar.gz\n\
+BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD *./tachyon-desync-linux-amd64.tar.gz\n";
+        assert_eq!(
+            parse_sha256sums_for_asset(sums, "tachyon-desync-linux-amd64.tar.gz").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            parse_sha256sums_for_asset(sums, "tachyon-desync-linux-arm64.tar.gz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_platform_asset_strict_without_cross_arch_fallback() {
+        let assets = vec![
+            GithubAssetDto {
+                name: "tachyon-desync-windows-amd64.exe".to_string(),
+                browser_download_url: "https://example.invalid/win.exe".to_string(),
+                size: 100,
+            },
+            GithubAssetDto {
+                name: "tachyon-desync-linux-amd64.tar.gz".to_string(),
+                browser_download_url: "https://example.invalid/linux-amd64.tar.gz".to_string(),
+                size: 100,
+            },
+        ];
+        assert!(select_platform_asset(&assets, "tachyon-desync-linux-arm64.tar.gz").is_none());
+        assert!(select_platform_asset(&assets, "tachyon-desync-macos-arm64.tar.gz").is_none());
+        assert_eq!(
+            select_platform_asset(&assets, "tachyon-desync-linux-amd64.tar.gz")
+                .map(|a| a.name.as_str()),
+            Some("tachyon-desync-linux-amd64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn test_strict_sha256_verification_policy() {
+        let payload = b"abc";
+        let valid_sums =
+            b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  tachyon-desync-windows-amd64.exe\n";
+        assert!(
+            verify_downloaded_sha256(payload, valid_sums, "tachyon-desync-windows-amd64.exe")
+                .is_ok()
+        );
+
+        // Невалидный UTF-8 -> Err
+        assert!(
+            verify_downloaded_sha256(
+                payload,
+                &[0xff, 0xfe, 0xfd],
+                "tachyon-desync-windows-amd64.exe"
+            )
+            .is_err()
+        );
+
+        // Отсутствующий ассет в SHA256SUMS -> Err
+        assert!(
+            verify_downloaded_sha256(payload, valid_sums, "tachyon-desync-linux-amd64.tar.gz")
+                .is_err()
+        );
+
+        // Несовпадение контрольной суммы -> Err
+        assert!(
+            verify_downloaded_sha256(b"tampered", valid_sums, "tachyon-desync-windows-amd64.exe")
+                .is_err()
+        );
+
+        // Отсутствие SHA256SUMS в релизе -> Err
+        let missing_sums_info = UpdateCheckResult {
+            current_version: "0.2.0".to_string(),
+            latest_version: "0.3.0".to_string(),
+            latest_tag: "v0.3.0".to_string(),
+            update_available: true,
+            release_url: String::new(),
+            published_at: String::new(),
+            release_notes: String::new(),
+            asset_name: "tachyon-desync-windows-amd64.exe".to_string(),
+            asset_url: "https://example.invalid/win.exe".to_string(),
+            asset_size: 100,
+            sha256sums_url: None,
+        };
+        assert!(
+            validate_update_preconditions(&missing_sums_info, Path::new("tachyon-desync.exe"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_macos_app_bundle_and_linux_getcap_parsing() {
+        assert!(is_inside_macos_app_bundle(Path::new(
+            "/Applications/Tachyon Desync.app/Contents/MacOS/tachyon-desync"
+        )));
+        assert!(!is_inside_macos_app_bundle(Path::new(
+            "/usr/local/bin/tachyon-desync"
+        )));
+
+        assert_eq!(
+            parse_getcap_cap_spec("/usr/bin/tachyon-desync cap_net_admin=eip\n").as_deref(),
+            Some("cap_net_admin=eip")
+        );
+        assert_eq!(
+            parse_getcap_cap_spec("/usr/bin/tachyon-desync = cap_net_admin,cap_net_raw+eip\n")
+                .as_deref(),
+            Some("cap_net_admin,cap_net_raw+eip")
+        );
+        assert_eq!(parse_getcap_cap_spec(""), None);
     }
 }

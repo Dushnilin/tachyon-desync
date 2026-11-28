@@ -479,7 +479,7 @@ mod tests {
             None,
             3200,
             true,
-            false,
+            true,
             t0,
         )
         .await;
@@ -491,5 +491,61 @@ mod tests {
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(t0.elapsed() < Duration::from_secs(4));
         cli.abort();
+    }
+
+    #[tokio::test]
+    async fn non_adaptive_stream_never_aborted_by_watchdog() {
+        let (mut client_app, mut proxy_client) = tokio::io::duplex(32768);
+        let (mut proxy_remote, mut server_app) = tokio::io::duplex(32768);
+
+        let srv = tokio::spawn(async move {
+            let mut up = [0u8; 1024];
+            let n = server_app.read(&mut up).await.unwrap();
+            assert_eq!(n, 640);
+            // Однонаправленный / медленный не-адаптивный поток: сервер молчит дольше окна cap-watchdog (> 3.2 с)
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            server_app.write_all(&[0x55u8; 128]).await.unwrap();
+            let _ = server_app.shutdown().await;
+        });
+
+        let cli = tokio::spawn(async move {
+            client_app.write_all(&vec![0x33u8; 640]).await.unwrap();
+            let mut down = Vec::new();
+            client_app.read_to_end(&mut down).await.unwrap();
+            assert_eq!(down.len(), 128);
+            let _ = client_app.shutdown().await;
+        });
+
+        let counters = crate::proxy::TrafficCounters::default();
+        let fg = register_flow(
+            "TCP",
+            None,
+            Some("slow-nonadaptive.example.org"),
+            "198.51.100.20:443".parse().unwrap(),
+            "FakeSplit".to_string(),
+            true,
+            true,
+        );
+        let res = copy_bidirectional_desync_live(
+            &mut proxy_client,
+            &mut proxy_remote,
+            &counters,
+            &fg.record,
+            Some("slow-nonadaptive.example.org"),
+            None,
+            3200,
+            true,
+            false,
+            Instant::now(),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "non-adaptive stream (report_adaptive = false) must never be aborted by cap watchdog: {res:?}"
+        );
+        let (u, d, _) = res.unwrap();
+        assert_eq!((u, d), (640, 128));
+        let _ = tokio::join!(srv, cli);
     }
 }

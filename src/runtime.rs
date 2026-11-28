@@ -19,14 +19,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
 const MAX_LOG_ENTRIES: usize = 300;
 const MAX_CUSTOM_PROFILES: usize = 64;
+const MAX_CONTROL_REQ_BYTES: u64 = 64 * 1024;
 
 /// Режим перехвата сетевого трафика.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -143,12 +146,246 @@ pub struct UiSnapshot {
     pub logs: Vec<LogEntry>,
 }
 
+/// Структурированный диагностический отчёт для CLI `doctor` и экспорта из GUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticReport {
+    pub version: String,
+    pub os: String,
+    pub arch: String,
+    pub data_dir: String,
+    pub running: bool,
+    pub active_mode: String,
+    pub capture_mode: String,
+    pub listen_port: u16,
+    pub is_admin: bool,
+    pub recipes_count: usize,
+    pub learned_domains_count: usize,
+    pub dns_enabled: bool,
+    pub dns_protocol: String,
+    pub dns_servers: Vec<String>,
+    pub dns_cache_hits: u64,
+    pub dns_total_queries: u64,
+    pub network_cc: String,
+    pub tun_mtu: u16,
+    pub tun_ipv6: bool,
+    pub total_ram_mb: u64,
+    pub cpu_cores: usize,
+    pub last_rtt_us: u64,
+    pub recent_logs: Vec<LogEntry>,
+    pub checks: Vec<(String, bool, String)>,
+}
+
+impl DiagnosticReport {
+    /// Сформировать табличный текстовый отчёт диагностики (без эмодзи).
+    pub fn format_text(&self, is_en: bool) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(2048);
+        if is_en {
+            let _ = writeln!(out, "Tachyon Desync Diagnostic Report");
+            let _ = writeln!(out, "================================");
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({}/{})",
+                "Version / Platform", self.version, self.os, self.arch
+            );
+            let _ = writeln!(out, "{:<22} : {}", "Data Directory", self.data_dir);
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({})",
+                "Service Status",
+                if self.running { "running" } else { "stopped" },
+                self.active_mode
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} :{}",
+                "Capture / Listen Port", self.capture_mode, self.listen_port
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {}",
+                "Privileges",
+                if self.is_admin {
+                    "administrator / root"
+                } else {
+                    "standard user"
+                }
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} recipes, {} learned domains",
+                "Adaptive Engine", self.recipes_count, self.learned_domains_count
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({}, servers: {})",
+                "DNS Resolver",
+                if self.dns_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                self.dns_protocol,
+                if self.dns_servers.is_empty() {
+                    "-".to_string()
+                } else {
+                    self.dns_servers.join(", ")
+                }
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} hits / {} queries",
+                "DNS Cache Stats", self.dns_cache_hits, self.dns_total_queries
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : CC={}, MTU={}, IPv6={}",
+                "Network Stack", self.network_cc, self.tun_mtu, self.tun_ipv6
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} MiB RAM, {} CPU cores, last RTT {} us",
+                "Hardware / RTT", self.total_ram_mb, self.cpu_cores, self.last_rtt_us
+            );
+            let _ = writeln!(out, "\nChecks:");
+            for (name, ok, detail) in &self.checks {
+                let tag = if *ok { "[PASS]" } else { "[WARN]" };
+                let _ = writeln!(out, "  {tag} {:<24} {}", name, detail);
+            }
+            let _ = writeln!(out, "\nRecent Logs ({}):", self.recent_logs.len());
+            if self.recent_logs.is_empty() {
+                let _ = writeln!(out, "  (empty)");
+            } else {
+                for entry in &self.recent_logs {
+                    let _ = writeln!(
+                        out,
+                        "  [{}] [{}] [{}] {}",
+                        entry.ts_ms, entry.level, entry.category, entry.message
+                    );
+                }
+            }
+        } else {
+            let _ = writeln!(out, "Диагностический отчёт Tachyon Desync");
+            let _ = writeln!(out, "======================================");
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({}/{})",
+                "Версия / Платформа", self.version, self.os, self.arch
+            );
+            let _ = writeln!(out, "{:<22} : {}", "Каталог данных", self.data_dir);
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({})",
+                "Состояние службы",
+                if self.running {
+                    "активна"
+                } else {
+                    "остановлена"
+                },
+                self.active_mode
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} :{}",
+                "Режим / Порт", self.capture_mode, self.listen_port
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {}",
+                "Права доступа",
+                if self.is_admin {
+                    "администратор / root"
+                } else {
+                    "обычный пользователь"
+                }
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} рецептов, {} обученных доменов",
+                "Адаптивный движок", self.recipes_count, self.learned_domains_count
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} ({}, серверы: {})",
+                "DNS-резолвер",
+                if self.dns_enabled {
+                    "включён"
+                } else {
+                    "выключен"
+                },
+                self.dns_protocol,
+                if self.dns_servers.is_empty() {
+                    "-".to_string()
+                } else {
+                    self.dns_servers.join(", ")
+                }
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} попаданий / {} запросов",
+                "Кэш DNS", self.dns_cache_hits, self.dns_total_queries
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : CC={}, MTU={}, IPv6={}",
+                "Сетевой стек", self.network_cc, self.tun_mtu, self.tun_ipv6
+            );
+            let _ = writeln!(
+                out,
+                "{:<22} : {} МиБ ОЗУ, {} ядер CPU, RTT {} мкс",
+                "Ресурсы / RTT", self.total_ram_mb, self.cpu_cores, self.last_rtt_us
+            );
+            let _ = writeln!(out, "\nПроверки:");
+            for (name, ok, detail) in &self.checks {
+                let tag = if *ok { "[PASS]" } else { "[WARN]" };
+                let _ = writeln!(out, "  {tag} {:<24} {}", name, detail);
+            }
+            let _ = writeln!(
+                out,
+                "\nПоследние записи журнала ({}):",
+                self.recent_logs.len()
+            );
+            if self.recent_logs.is_empty() {
+                let _ = writeln!(out, "  (пусто)");
+            } else {
+                for entry in &self.recent_logs {
+                    let _ = writeln!(
+                        out,
+                        "  [{}] [{}] [{}] {}",
+                        entry.ts_ms, entry.level, entry.category, entry.message
+                    );
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlEndpointInfo {
+    port: u16,
+    token: String,
+    pid: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlRequest {
+    token: String,
+    action: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
 /// Рабочая среда `tachyon-desync`.
 pub struct DesyncRuntime {
     data_dir: PathBuf,
     running: AtomicBool,
     stop_flag: Mutex<Arc<AtomicBool>>,
     bg_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    control_stop: Arc<AtomicBool>,
+    control_notify: Arc<tokio::sync::Notify>,
+    control_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    control_port: AtomicU16,
     active_mode_label: RwLock<String>,
     started_at: Mutex<Option<Instant>>,
     config: RwLock<AppStateConfig>,
@@ -160,15 +397,21 @@ pub struct DesyncRuntime {
 
 impl DesyncRuntime {
     pub fn new() -> Arc<Self> {
-        Self::new_internal(true)
+        Self::new_with_data_dir(resolve_app_data_dir())
+    }
+
+    pub fn new_with_data_dir(data_dir: PathBuf) -> Arc<Self> {
+        Self::new_internal(true, Some(data_dir))
     }
 
     pub fn new_for_test() -> Arc<Self> {
-        Self::new_internal(false)
+        Self::new_internal(false, None)
     }
 
-    fn new_internal(use_persistent_files: bool) -> Arc<Self> {
-        let data_dir = if use_persistent_files {
+    fn new_internal(use_persistent_files: bool, custom_dir: Option<PathBuf>) -> Arc<Self> {
+        let data_dir = if let Some(dir) = custom_dir {
+            dir
+        } else if use_persistent_files {
             resolve_app_data_dir()
         } else {
             std::env::temp_dir().join("tachyon-desync-test")
@@ -222,6 +465,10 @@ impl DesyncRuntime {
             running: AtomicBool::new(false),
             stop_flag: Mutex::new(Arc::new(AtomicBool::new(false))),
             bg_tasks: Mutex::new(Vec::new()),
+            control_stop: Arc::new(AtomicBool::new(false)),
+            control_notify: Arc::new(tokio::sync::Notify::new()),
+            control_task: Mutex::new(None),
+            control_port: AtomicU16::new(0),
             active_mode_label: RwLock::new("Остановлен".to_string()),
             started_at: Mutex::new(None),
             config: RwLock::new(cfg),
@@ -236,7 +483,7 @@ impl DesyncRuntime {
         rt.push_log(
             "info",
             "system",
-            "Движок десинхронизации Tachyon Desync инициализирован (апстрим tachyon-core, 24 адаптивных рецепта)",
+            "Движок десинхронизации Tachyon Desync инициализирован (апстрим tachyon-core, 28 адаптивных рецептов)",
         );
         for w in startup_warnings {
             rt.push_log("warn", "config", &w);
@@ -434,6 +681,36 @@ impl DesyncRuntime {
         }
     }
 
+    /// Вернуть рабочий каталог данных приложения.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Переопределить режим перехвата и/или порт в памяти на текущую сессию из аргументов CLI.
+    pub async fn apply_cli_overrides(&self, mode: Option<CaptureMode>, port: Option<u16>) {
+        let updated_cfg = {
+            let mut cfg = self.config.write().await;
+            let mut changed = false;
+            if let Some(m) = mode
+                && cfg.capture_mode != m
+            {
+                cfg.capture_mode = m;
+                changed = true;
+            }
+            if let Some(p) = port
+                && p > 0
+                && cfg.listen_port != p
+            {
+                cfg.listen_port = p;
+                changed = true;
+            }
+            changed.then(|| cfg.clone())
+        };
+        if let Some(cfg) = updated_cfg {
+            *self.matcher.write().await = Self::compile_matcher(&cfg);
+        }
+    }
+
     /// Быстрое чтение атомарных счётчиков трафика `(rx_bytes, tx_bytes)` для тултипа системного трея.
     pub fn traffic_bytes(&self) -> (u64, u64) {
         (
@@ -627,8 +904,430 @@ impl DesyncRuntime {
             g.store(true, Ordering::SeqCst);
         }
         self.abort_bg_tasks();
-        let _ = set_os_system_proxy(false, 7897);
+        self.stop_control_server_sync();
+        crate::proxy::emergency_disable_system_proxy();
+        crate::tun::emergency_cleanup_tun_routes();
         flush_persistent_cache();
+    }
+
+    /// Собрать структурированный диагностический отчёт для CLI `doctor` и GUI.
+    pub async fn build_diagnostic_report(&self) -> DiagnosticReport {
+        let running = self.running.load(Ordering::Relaxed);
+        let active_mode = self.active_mode_label.read().await.clone();
+        let cfg = self.config.read().await.clone();
+        let is_admin = crate::tray::is_running_as_admin();
+        let learned_domains_count = get_learned_domains_snapshot().len();
+        let dns_status = crate::dns_resolver::current_dns_status();
+        let hw = crate::hardware::HardwareProfile::detect();
+        let last_rtt_us = crate::hardware::last_connect_rtt_us();
+        let recent_logs = self
+            .logs
+            .lock()
+            .map(|q| {
+                let skip = q.len().saturating_sub(25);
+                q.iter().skip(skip).cloned().collect()
+            })
+            .unwrap_or_default();
+
+        let capture_mode = match cfg.capture_mode {
+            CaptureMode::Tun => "tun",
+            CaptureMode::SystemProxy => "system_proxy",
+            CaptureMode::LocalProxy => "local_proxy",
+        }
+        .to_string();
+
+        let is_en = cfg.language.eq_ignore_ascii_case("en");
+        let mut checks = Vec::with_capacity(4);
+
+        // 1. Права для TUN
+        let (priv_ok, priv_msg) = match cfg.capture_mode {
+            CaptureMode::Tun => {
+                if is_admin {
+                    (
+                        true,
+                        if is_en {
+                            "Administrator/root privileges verified for TUN".to_string()
+                        } else {
+                            "Права администратора/root подтверждены для TUN".to_string()
+                        },
+                    )
+                } else {
+                    (
+                        false,
+                        if is_en {
+                            "TUN requires administrator/root privileges (fallback to SystemProxy)"
+                                .to_string()
+                        } else {
+                            "Для TUN требуются права администратора/root (откат на SystemProxy)"
+                                .to_string()
+                        },
+                    )
+                }
+            }
+            _ => (
+                true,
+                if is_en {
+                    "Proxy capture mode does not require elevated privileges".to_string()
+                } else {
+                    "Режим прокси не требует повышенных привилегий".to_string()
+                },
+            ),
+        };
+        checks.push((
+            if is_en {
+                "TUN Privileges".to_string()
+            } else {
+                "Права TUN".to_string()
+            },
+            priv_ok,
+            priv_msg,
+        ));
+
+        // 2. Наличие DNS-серверов
+        let (dns_ok, dns_msg) = if cfg.dns.enabled {
+            if cfg.dns.servers.is_empty() {
+                (
+                    false,
+                    if is_en {
+                        "DNS resolver enabled but upstream server list is empty".to_string()
+                    } else {
+                        "DNS-резолвер включён, но список апстримов пуст".to_string()
+                    },
+                )
+            } else {
+                (
+                    true,
+                    if is_en {
+                        format!(
+                            "{} upstream server(s) configured ({})",
+                            cfg.dns.servers.len(),
+                            cfg.dns.protocol.as_str()
+                        )
+                    } else {
+                        format!(
+                            "Настроено апстримов: {} ({})",
+                            cfg.dns.servers.len(),
+                            cfg.dns.protocol.as_str()
+                        )
+                    },
+                )
+            }
+        } else {
+            (
+                true,
+                if is_en {
+                    "Internal DNS resolver disabled (using OS DNS)".to_string()
+                } else {
+                    "Внутренний DNS-резолвер отключён (системный DNS)".to_string()
+                },
+            )
+        };
+        checks.push((
+            if is_en {
+                "DNS Servers".to_string()
+            } else {
+                "DNS-серверы".to_string()
+            },
+            dns_ok,
+            dns_msg,
+        ));
+
+        // 3. Размер кэша DNS и AdaptiveBrain
+        let (cache_ok, cache_msg) = if cfg.dns.enabled && cfg.dns.local_cache {
+            let ok = dns_status.cache_capacity > 0;
+            let msg = if is_en {
+                format!(
+                    "DNS cache {}/{} (~{} KiB), learned domains: {}",
+                    dns_status.cache_entries,
+                    dns_status.cache_capacity,
+                    dns_status.approx_ram_kb,
+                    learned_domains_count
+                )
+            } else {
+                format!(
+                    "DNS-кэш {}/{} (~{} КиБ), обученных доменов: {}",
+                    dns_status.cache_entries,
+                    dns_status.cache_capacity,
+                    dns_status.approx_ram_kb,
+                    learned_domains_count
+                )
+            };
+            (ok, msg)
+        } else {
+            (
+                true,
+                if is_en {
+                    format!(
+                        "DNS local cache disabled; learned domains: {}",
+                        learned_domains_count
+                    )
+                } else {
+                    format!(
+                        "Локальный DNS-кэш выключен; обученных доменов: {}",
+                        learned_domains_count
+                    )
+                },
+            )
+        };
+        checks.push((
+            if is_en {
+                "Cache Sizing".to_string()
+            } else {
+                "Размер кэша".to_string()
+            },
+            cache_ok,
+            cache_msg,
+        ));
+
+        // 4. Конфликтные настройки
+        let mut conflicts = Vec::new();
+        if cfg.listen_port < 1024 {
+            conflicts.push(if is_en {
+                format!("privileged listen_port={}", cfg.listen_port)
+            } else {
+                format!("привилегированный порт listen_port={}", cfg.listen_port)
+            });
+        }
+        if cfg.app_filter_mode == AppFilterMode::Include && cfg.selected_apps.is_empty() {
+            conflicts.push(if is_en {
+                "app_filter_mode=include with empty selected_apps".to_string()
+            } else {
+                "режим include при пустом списке selected_apps".to_string()
+            });
+        }
+        if cfg.upstream_proxy.trim().is_empty()
+            && cfg
+                .lists
+                .iter()
+                .any(|l| l.enabled && l.strategy == ListStrategy::UpstreamProxy)
+        {
+            conflicts.push(if is_en {
+                "upstream_proxy list enabled without upstream_proxy address".to_string()
+            } else {
+                "активен список с внешним прокси, но адрес upstream_proxy пуст".to_string()
+            });
+        }
+        if !(1280..=9000).contains(&cfg.network.tun_mtu) {
+            conflicts.push(if is_en {
+                format!("out-of-range tun_mtu={}", cfg.network.tun_mtu)
+            } else {
+                format!("некорректный tun_mtu={}", cfg.network.tun_mtu)
+            });
+        }
+        let (conf_ok, conf_msg) = if conflicts.is_empty() {
+            (
+                true,
+                if is_en {
+                    "No configuration conflicts detected".to_string()
+                } else {
+                    "Конфликтов конфигурации не обнаружено".to_string()
+                },
+            )
+        } else {
+            (false, conflicts.join("; "))
+        };
+        checks.push((
+            if is_en {
+                "Config Conflicts".to_string()
+            } else {
+                "Конфликты настроек".to_string()
+            },
+            conf_ok,
+            conf_msg,
+        ));
+
+        DiagnosticReport {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            data_dir: self.data_dir.display().to_string(),
+            running,
+            active_mode,
+            capture_mode,
+            listen_port: cfg.listen_port,
+            is_admin,
+            recipes_count: crate::desync::RECIPE_TITLES.len(),
+            learned_domains_count,
+            dns_enabled: cfg.dns.enabled,
+            dns_protocol: cfg.dns.protocol.as_str().to_string(),
+            dns_servers: cfg.dns.servers,
+            dns_cache_hits: dns_status.cache_hits,
+            dns_total_queries: dns_status.total_queries,
+            network_cc: cfg.network.tcp_congestion.as_str().to_string(),
+            tun_mtu: cfg.network.tun_mtu,
+            tun_ipv6: cfg.network.tun_ipv6,
+            total_ram_mb: hw.total_ram_mb,
+            cpu_cores: hw.cpu_count,
+            last_rtt_us,
+            recent_logs,
+            checks,
+        }
+    }
+
+    fn remove_control_file_if_owned(&self) {
+        let my_port = self.control_port.load(Ordering::Relaxed);
+        if my_port == 0 {
+            return;
+        }
+        let path = self.data_dir.join(".control.json");
+        if let Ok(raw) = std::fs::read_to_string(&path)
+            && let Ok(info) = serde_json::from_str::<ControlEndpointInfo>(&raw)
+            && info.pid == std::process::id()
+            && info.port == my_port
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    fn stop_control_server_sync(&self) {
+        self.control_stop.store(true, Ordering::SeqCst);
+        self.control_notify.notify_waiters();
+        if let Ok(mut guard) = self.control_task.lock()
+            && let Some(h) = guard.take()
+        {
+            h.abort();
+        }
+        self.remove_control_file_if_owned();
+    }
+
+    /// Запустить локальный loopback Control-IPC сервер для CLI-клиентов.
+    pub async fn start_control_server(self: &Arc<Self>) -> io::Result<u16> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+
+        let mut token_bytes = [0u8; 16];
+        getrandom::fill(&mut token_bytes).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut token = String::with_capacity(32);
+        for b in token_bytes {
+            use std::fmt::Write;
+            let _ = write!(&mut token, "{b:02x}");
+        }
+
+        self.stop_control_server_sync();
+        self.control_stop.store(false, Ordering::SeqCst);
+        self.control_port.store(port, Ordering::SeqCst);
+
+        std::fs::create_dir_all(&self.data_dir)?;
+        let control_path = self.data_dir.join(".control.json");
+        let info = ControlEndpointInfo {
+            port,
+            token: token.clone(),
+            pid: std::process::id(),
+        };
+        let json = serde_json::to_string(&info).map_err(|e| io::Error::other(e.to_string()))?;
+
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let _ = std::fs::remove_file(&control_path);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&control_path)?;
+            file.write_all(json.as_bytes())?;
+            std::fs::set_permissions(&control_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&control_path, json.as_bytes())?;
+        }
+
+        let weak_rt = Arc::downgrade(self);
+        let control_stop = self.control_stop.clone();
+        let control_notify = self.control_notify.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                if control_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let notified = control_notify.notified();
+                tokio::pin!(notified);
+                let accept_res = tokio::select! {
+                    res = listener.accept() => res,
+                    _ = &mut notified => break,
+                };
+                let (stream, _) = match accept_res {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        if control_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(rt) = weak_rt.upgrade() else {
+                    break;
+                };
+                if Self::handle_control_connection(&rt, stream, &token).await {
+                    break;
+                }
+            }
+        });
+
+        if let Ok(mut guard) = self.control_task.lock() {
+            *guard = Some(handle);
+        }
+        Ok(port)
+    }
+
+    async fn handle_control_connection(
+        rt: &Arc<DesyncRuntime>,
+        stream: tokio::net::TcpStream,
+        expected_token: &str,
+    ) -> bool {
+        let (reader, mut writer) = stream.into_split();
+        let mut limited = BufReader::new(reader.take(MAX_CONTROL_REQ_BYTES + 1));
+        let mut line = String::new();
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            limited.read_line(&mut line),
+        )
+        .await;
+        match read_res {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+            Ok(Ok(_)) => {}
+        }
+        if line.len() as u64 > MAX_CONTROL_REQ_BYTES {
+            let _ = writer
+                .write_all(b"{\"ok\":false,\"error\":\"request_too_large\"}\n")
+                .await;
+            let _ = writer.flush().await;
+            return false;
+        }
+        let Ok(req) = serde_json::from_str::<ControlRequest>(line.trim()) else {
+            let _ = writer
+                .write_all(b"{\"ok\":false,\"error\":\"invalid_json\"}\n")
+                .await;
+            let _ = writer.flush().await;
+            return false;
+        };
+        if !bool::from(req.token.as_bytes().ct_eq(expected_token.as_bytes())) {
+            let _ = writer
+                .write_all(b"{\"ok\":false,\"error\":\"unauthorized\"}\n")
+                .await;
+            let _ = writer.flush().await;
+            return false;
+        }
+        if req.action == "stop_process" {
+            crate::tray::request_app_exit();
+            rt.stop().await;
+            rt.control_stop.store(true, Ordering::SeqCst);
+            rt.remove_control_file_if_owned();
+            let _ = writer.write_all(b"{\"ok\":true}\n").await;
+            let _ = writer.flush().await;
+            return true;
+        }
+        let resp = rt.handle_ipc_action(&req.action, req.payload).await;
+        let mut out = serde_json::to_string(&resp)
+            .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"encode_error\"}".to_string());
+        out.push('\n');
+        let _ = writer.write_all(out.as_bytes()).await;
+        let _ = writer.flush().await;
+        false
     }
 
     /// Собрать полный снимок состояния для GUI.
@@ -1710,6 +2409,23 @@ impl DesyncRuntime {
                 }
                 serde_json::to_value(self.snapshot().await).unwrap_or_default()
             }
+            "export_diagnostics" => {
+                let rep = self.build_diagnostic_report().await;
+                let is_en = match payload
+                    .get("language")
+                    .or_else(|| payload.get("lang"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(lang) => lang.eq_ignore_ascii_case("en"),
+                    None => self.config.read().await.language.eq_ignore_ascii_case("en"),
+                };
+                let text = rep.format_text(is_en);
+                serde_json::json!({
+                    "ok": true,
+                    "report": rep,
+                    "text": text,
+                })
+            }
             _ => serde_json::json!({ "error": format!("Неизвестная команда: {action}") }),
         }
     }
@@ -1717,13 +2433,15 @@ impl DesyncRuntime {
 
 impl Drop for DesyncRuntime {
     fn drop(&mut self) {
+        self.stop_control_server_sync();
         if self.running.swap(false, Ordering::Relaxed) {
             crate::dns_resolver::set_dns_service_active(false);
             if let Ok(flag) = self.stop_flag.lock() {
                 flag.store(true, Ordering::Relaxed);
             }
             self.abort_bg_tasks();
-            let _ = set_os_system_proxy(false, 7897);
+            crate::proxy::emergency_disable_system_proxy();
+            crate::tun::emergency_cleanup_tun_routes();
             flush_persistent_cache();
         } else {
             self.abort_bg_tasks();
@@ -1731,7 +2449,50 @@ impl Drop for DesyncRuntime {
     }
 }
 
-fn resolve_app_data_dir() -> PathBuf {
+/// Отправить синхронную команду работающему процессу через loopback Control-IPC (`.control.json`).
+pub fn try_send_control_command(
+    data_dir: &Path,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    let control_path = data_dir.join(".control.json");
+    let raw = std::fs::read_to_string(&control_path)
+        .map_err(|e| format!("failed to read {}: {e}", control_path.display()))?;
+    let info: ControlEndpointInfo =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid .control.json: {e}"))?;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), info.port);
+    let timeout = std::time::Duration::from_secs(3);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("control connect error: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let req = serde_json::json!({
+        "token": info.token,
+        "action": action,
+        "payload": payload,
+    });
+    let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("control write error: {e}"))?;
+
+    let mut resp_line = String::new();
+    StdBufReader::new(&stream)
+        .read_line(&mut resp_line)
+        .map_err(|e| format!("control read error: {e}"))?;
+    if resp_line.trim().is_empty() {
+        return Err("empty response from control server".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(resp_line.trim())
+        .map_err(|e| format!("invalid control response json: {e}"))
+}
+
+pub fn resolve_app_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Ok(appdata) = std::env::var("LOCALAPPDATA").or_else(|_| std::env::var("APPDATA")) {
@@ -1756,6 +2517,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let _ov_guard = crate::lists::test_dns_override_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
             let s0 = app
                 .handle_ipc_action("get_state", serde_json::json!({}))
@@ -1813,6 +2575,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let _ov_guard = crate::lists::test_dns_override_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
             let mut c1 = DesyncConfig::from_preset(DesyncPreset::FakeSplit);
             c1.fake_ttl = 5;
@@ -1883,6 +2646,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let _ov_guard = crate::lists::test_dns_override_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
             let mut legacy_cfg = AppStateConfig {
                 default_strategy: ListStrategy::CustomProfile("missing_def".to_string()),
@@ -2013,6 +2777,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let _ov_guard = crate::lists::test_dns_override_lock().lock().await;
             let app = DesyncRuntime::new_for_test();
 
             // 1. Схема v2 с explicit youtube.block_quic = true и dns_mode = "cloudflare"
@@ -2156,5 +2921,117 @@ mod tests {
                 &crate::upstream_compat::NetworkTuningConfig::default(),
             );
         });
+    }
+
+    #[test]
+    fn test_control_server_ipc_auth_and_cleanup() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let test_dir = std::env::temp_dir().join(format!(
+            "tachyon-desync-ctrl-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        let control_path = test_dir.join(".control.json");
+        rt.block_on(async {
+            let _dns_lock = crate::dns_resolver::test_dns_state_lock().lock().await;
+            let _ov_guard = crate::lists::test_dns_override_lock().lock().await;
+
+            let app = DesyncRuntime::new_internal(false, Some(test_dir.clone()));
+            assert_eq!(app.data_dir(), test_dir.as_path());
+
+            app.apply_cli_overrides(Some(CaptureMode::LocalProxy), Some(17991))
+                .await;
+            {
+                let cfg = app.config.read().await;
+                assert_eq!(cfg.capture_mode, CaptureMode::LocalProxy);
+                assert_eq!(cfg.listen_port, 17991);
+            }
+
+            let port = app.start_control_server().await.unwrap();
+            assert!(port > 0);
+            assert!(control_path.exists(), ".control.json must exist while server is active");
+
+            let dir_for_state = test_dir.clone();
+            let state_resp = tokio::task::spawn_blocking(move || {
+                try_send_control_command(&dir_for_state, "get_state", serde_json::json!({}))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                state_resp.get("running").and_then(|v| v.as_bool()),
+                Some(false)
+            );
+            assert_eq!(
+                state_resp
+                    .pointer("/config/listen_port")
+                    .and_then(|v| v.as_u64()),
+                Some(17991)
+            );
+
+            let dir_for_diag = test_dir.clone();
+            let diag_resp = tokio::task::spawn_blocking(move || {
+                try_send_control_command(
+                    &dir_for_diag,
+                    "export_diagnostics",
+                    serde_json::json!({ "language": "en" }),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(diag_resp.get("ok").and_then(|v| v.as_bool()), Some(true));
+            assert!(
+                diag_resp
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.contains("Tachyon Desync Diagnostic Report"))
+            );
+            assert_eq!(
+                diag_resp
+                    .pointer("/report/recipes_count")
+                    .and_then(|v| v.as_u64()),
+                Some(crate::desync::RECIPE_TITLES.len() as u64)
+            );
+
+            let unauth_resp = tokio::task::spawn_blocking(move || {
+                use std::io::{BufRead, BufReader as StdBufReader, Write};
+                let mut s = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                s.write_all(
+                    b"{\"token\":\"00000000000000000000000000000000\",\"action\":\"get_state\",\"payload\":{}}\n",
+                )
+                .unwrap();
+                s.flush().unwrap();
+                let mut line = String::new();
+                StdBufReader::new(&s).read_line(&mut line).unwrap();
+                serde_json::from_str::<serde_json::Value>(line.trim()).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(unauth_resp.get("ok").and_then(|v| v.as_bool()), Some(false));
+            assert_eq!(
+                unauth_resp.get("error").and_then(|v| v.as_str()),
+                Some("unauthorized")
+            );
+
+            drop(app);
+            assert!(
+                !control_path.exists(),
+                ".control.json must be removed when DesyncRuntime drops"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

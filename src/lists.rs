@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 /// Действие, назначаемое списку доменов/подсетей.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListStrategy {
-    /// Адаптивный автоподбор из 24 рецептов (`AdaptiveBrain`).
+    /// Адаптивный автоподбор из 28 рецептов (`AdaptiveBrain`).
     Auto,
     /// Конкретный именованный пресет (`fake_split`, `fake_disorder`, `tlsrec`, `multi_disorder`, `seven_point_disorder`, `host_fake_split`, `pad_encap`, `multi_split`, `split`, `disorder`, `oob`, `disoob`).
     Preset(String),
@@ -1009,6 +1009,12 @@ fn custom_dns_overrides_store() -> &'static Mutex<DnsOverrideList> {
     OVERRIDES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+#[cfg(test)]
+pub(crate) fn test_dns_override_lock() -> &'static tokio::sync::Mutex<()> {
+    static TEST_DNS_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &TEST_DNS_OVERRIDE_LOCK
+}
+
 pub fn refresh_dns_overrides_from_config(
     lists: &[ListProfile],
     explicit_map: &std::collections::BTreeMap<String, String>,
@@ -1610,6 +1616,7 @@ mod tests {
 
     #[test]
     fn test_compiled_matcher_and_dns_snooping() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
 
@@ -1686,6 +1693,7 @@ mod tests {
 
     #[test]
     fn test_per_application_filtering_include_and_exclude() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let lists = default_builtin_lists();
 
         // 1. Whitelist (Include): только discord.exe
@@ -1749,6 +1757,7 @@ mod tests {
 
     #[test]
     fn test_per_app_strategy_upstream_proxy_and_dns_overrides() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let mut lists = default_builtin_lists();
         if let Some(ai) = lists.iter_mut().find(|l| l.id == "ai_all") {
             ai.strategy = ListStrategy::UpstreamProxy;
@@ -1830,6 +1839,7 @@ mod tests {
 
     #[test]
     fn test_anticheat_and_game_udp_direct_bypass() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
 
@@ -1870,6 +1880,7 @@ mod tests {
 
     #[test]
     fn test_multiple_named_custom_profiles_per_list_and_app() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let s = ListStrategy::from_code("Profile:YT_Split");
         assert_eq!(s, ListStrategy::CustomProfile("yt_split".to_string()));
         assert_eq!(s.as_code(), "profile:yt_split");
@@ -1956,6 +1967,7 @@ mod tests {
 
     #[test]
     fn test_discord_voice_udp_ports_and_list_udp_ttl() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let mut lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
         let finland_relay: IpAddr = "35.217.14.88".parse().unwrap();
@@ -1997,6 +2009,7 @@ mod tests {
 
     #[test]
     fn test_lists_override_game_bypass_for_cloudfront_cdn() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let mut lists = default_builtin_lists();
         lists.insert(
             0,
@@ -2065,6 +2078,7 @@ mod tests {
 
     #[test]
     fn tdd_youtube_default_allows_quic_udp443_with_udp_fake() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let mut lists = default_builtin_lists();
         let yt = lists
             .iter()
@@ -2112,6 +2126,7 @@ mod tests {
 
     #[test]
     fn tdd_missing_custom_profile_falls_back_to_auto_never_block_or_poisoned_global() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let mut poisoned_global = DesyncConfig::from_preset(DesyncPreset::None);
         poisoned_global.enabled = false;
         poisoned_global.auto = false;
@@ -2218,6 +2233,7 @@ mod tests {
 
     #[test]
     fn tdd_discord_media_alternative_cloudflare_ports_tcp() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
 
@@ -2245,6 +2261,7 @@ mod tests {
 
     #[test]
     fn tdd_discord_voice_subnets_strict_udp_port_isolation_from_games_and_tcp() {
+        let _dns_ov_guard = test_dns_override_lock().blocking_lock();
         let lists = default_builtin_lists();
         let matcher = CompiledMatcher::build(&lists, ListStrategy::Auto, DesyncConfig::default());
         let cf_voice_ip: IpAddr = "104.16.50.10".parse().unwrap();

@@ -169,6 +169,7 @@ enum FlowSortColumn {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum ToastKind {
     Info,
     Success,
@@ -264,11 +265,22 @@ fn try_acquire_busy(flag: &Arc<Mutex<bool>>) -> Option<BusyFlagGuard> {
     Some(BusyFlagGuard(flag.clone()))
 }
 
+enum GuiCommand {
+    Action(String, serde_json::Value),
+    RefreshSnapshot,
+}
+
 pub struct TachyonGuiApp {
     rt: Arc<DesyncRuntime>,
     tokio_handle: tokio::runtime::Handle,
     snap: UiSnapshot,
     last_refresh: Instant,
+    ipc_tx: tokio::sync::mpsc::UnboundedSender<GuiCommand>,
+    latest_snap: Arc<Mutex<Option<(u64, UiSnapshot)>>>,
+    force_sync_fields: Arc<AtomicBool>,
+    snapshot_in_flight: Arc<AtomicBool>,
+    last_applied_snap_seq: u64,
+    egui_ctx: Arc<Mutex<Option<egui::Context>>>,
     active_tab: ActiveTab,
     chart_mode: ChartMode,
     telemetry: VecDeque<TelemetryPoint>,
@@ -361,6 +373,9 @@ pub struct TachyonGuiApp {
     start_minimized_done: bool,
     start_minimized: bool,
     update_state: Arc<Mutex<GuiUpdateState>>,
+    diag_in_progress: Arc<Mutex<bool>>,
+    diag_pending_text: Arc<Mutex<Option<String>>>,
+    diag_copied_toast_until: Option<Instant>,
 }
 
 impl TachyonGuiApp {
@@ -370,6 +385,46 @@ impl TachyonGuiApp {
         start_minimized: bool,
     ) -> Self {
         let initial_snap = tokio_handle.block_on(rt.snapshot());
+        let (ipc_tx, mut ipc_rx) = tokio::sync::mpsc::unbounded_channel::<GuiCommand>();
+        let latest_snap: Arc<Mutex<Option<(u64, UiSnapshot)>>> = Arc::new(Mutex::new(None));
+        let force_sync_fields = Arc::new(AtomicBool::new(false));
+        let snapshot_in_flight = Arc::new(AtomicBool::new(false));
+        let egui_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
+
+        {
+            let rt_bg = rt.clone();
+            let latest_snap_bg = latest_snap.clone();
+            let force_sync_bg = force_sync_fields.clone();
+            let in_flight_bg = snapshot_in_flight.clone();
+            let egui_ctx_bg = egui_ctx.clone();
+            tokio_handle.spawn(async move {
+                let mut snap_seq: u64 = 0;
+                while let Some(cmd) = ipc_rx.recv().await {
+                    let is_action = match cmd {
+                        GuiCommand::Action(action, payload) => {
+                            let _ = rt_bg.handle_ipc_action(&action, payload).await;
+                            true
+                        }
+                        GuiCommand::RefreshSnapshot => false,
+                    };
+                    let snap = rt_bg.snapshot().await;
+                    snap_seq = snap_seq.wrapping_add(1);
+                    if is_action {
+                        force_sync_bg.store(true, Ordering::Release);
+                    } else {
+                        in_flight_bg.store(false, Ordering::Release);
+                    }
+                    if let Ok(mut guard) = latest_snap_bg.lock() {
+                        *guard = Some((snap_seq, snap));
+                    }
+                    if let Ok(guard) = egui_ctx_bg.lock()
+                        && let Some(ctx) = guard.as_ref()
+                    {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
         let builder_cfg = initial_snap.config.custom_global_config.clone();
         let upstream_proxy_input = initial_snap.config.upstream_proxy.clone();
         let dns_overrides_input = initial_snap
@@ -412,6 +467,12 @@ impl TachyonGuiApp {
             tokio_handle,
             snap: initial_snap,
             last_refresh: Instant::now() - Duration::from_secs(2),
+            ipc_tx,
+            latest_snap,
+            force_sync_fields,
+            snapshot_in_flight,
+            last_applied_snap_seq: 0,
+            egui_ctx,
             active_tab: ActiveTab::Overview,
             chart_mode: ChartMode::Traffic,
             telemetry,
@@ -484,6 +545,9 @@ impl TachyonGuiApp {
             start_minimized_done: false,
             start_minimized,
             update_state,
+            diag_in_progress: Arc::new(Mutex::new(false)),
+            diag_pending_text: Arc::new(Mutex::new(None)),
+            diag_copied_toast_until: None,
         }
     }
 
@@ -645,22 +709,41 @@ impl TachyonGuiApp {
     }
 
     fn dispatch_ipc(&mut self, action: &str, payload: serde_json::Value) {
-        let rt = self.rt.clone();
         let _ = self
-            .tokio_handle
-            .block_on(rt.handle_ipc_action(action, payload));
-        self.snap = self.tokio_handle.block_on(self.rt.snapshot());
-        self.sync_editable_fields_from_snap();
+            .ipc_tx
+            .send(GuiCommand::Action(action.to_string(), payload));
     }
 
     fn poll_snapshot_if_due(&mut self) {
+        let incoming = self.latest_snap.lock().ok().and_then(|mut g| {
+            if let Some((seq, _)) = *g
+                && seq > self.last_applied_snap_seq
+            {
+                g.take()
+            } else {
+                None
+            }
+        });
+        if let Some((seq, snap)) = incoming {
+            self.last_applied_snap_seq = seq;
+            self.snap = snap;
+            let _forced = self.force_sync_fields.swap(false, Ordering::AcqRel);
+            self.sync_editable_fields_from_snap();
+            self.update_telemetry_from_snap();
+        }
+
         if self.last_refresh.elapsed() < Duration::from_millis(500) {
             return;
         }
         self.last_refresh = Instant::now();
-        self.snap = self.tokio_handle.block_on(self.rt.snapshot());
-        self.sync_editable_fields_from_snap();
+        if !self.snapshot_in_flight.swap(true, Ordering::AcqRel)
+            && self.ipc_tx.send(GuiCommand::RefreshSnapshot).is_err()
+        {
+            self.snapshot_in_flight.store(false, Ordering::Release);
+        }
+    }
 
+    fn update_telemetry_from_snap(&mut self) {
         let now = Instant::now();
         let rx = self.snap.rx_bytes;
         let tx = self.snap.tx_bytes;
@@ -697,6 +780,71 @@ impl TachyonGuiApp {
             self.prev_tx_bytes = Some(tx);
             self.prev_desync_count = Some(desynced);
             self.prev_sample_ts = Some(now);
+        }
+    }
+
+    fn trigger_copy_diagnostics(&self) {
+        if let Ok(mut g) = self.diag_in_progress.lock() {
+            if *g {
+                return;
+            }
+            *g = true;
+        }
+        let rt = self.rt.clone();
+        let is_en = self.is_en();
+        let in_prog = self.diag_in_progress.clone();
+        let pending = self.diag_pending_text.clone();
+        let egui_ctx = self.egui_ctx.clone();
+        self.tokio_handle.spawn(async move {
+            let text = rt.build_diagnostic_report().await.format_text(is_en);
+            if let Ok(mut p) = pending.lock() {
+                *p = Some(text);
+            }
+            if let Ok(mut g) = in_prog.lock() {
+                *g = false;
+            }
+            if let Ok(guard) = egui_ctx.lock()
+                && let Some(ctx) = guard.as_ref()
+            {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn render_copy_diagnostics_button(&mut self, ui: &mut egui::Ui, is_en: bool) {
+        let diag_busy = self.diag_in_progress.lock().map(|g| *g).unwrap_or(false);
+        let diag_toast = self
+            .diag_copied_toast_until
+            .is_some_and(|t| Instant::now() < t);
+        let lbl = if diag_busy {
+            RichText::new("...").size(10.0).color(TEXT_MUTED)
+        } else if diag_toast {
+            RichText::new(if is_en {
+                "Copied ✓"
+            } else {
+                "Скопировано ✓"
+            })
+            .size(10.0)
+            .color(SEMANTIC_OK)
+        } else {
+            RichText::new(if is_en {
+                "Copy Diagnostics"
+            } else {
+                "Диагностика"
+            })
+            .size(10.0)
+            .color(active_tokens().accent)
+        };
+        if ui
+            .add_enabled(!diag_busy, egui::Button::new(lbl).small())
+            .on_hover_text(if is_en {
+                "Build full diagnostic report and copy to clipboard"
+            } else {
+                "Сформировать полный диагностический отчёт и скопировать в буфер обмена"
+            })
+            .clicked()
+        {
+            self.trigger_copy_diagnostics();
         }
     }
 
@@ -1514,9 +1662,9 @@ impl TachyonGuiApp {
             let cur_strat_display = match cur_strat.as_str() {
                 "auto" => {
                     if is_en {
-                        "Auto (24 recipes)".to_string()
+                        "Auto (28 recipes)".to_string()
                     } else {
-                        "Авто (24 рецепта)".to_string()
+                        "Авто (28 рецептов)".to_string()
                     }
                 }
                 "direct" => {
@@ -1630,9 +1778,9 @@ impl TachyonGuiApp {
                                 (
                                     "auto",
                                     if is_en {
-                                        "Auto (24 recipes)"
+                                        "Auto (28 recipes)"
                                     } else {
-                                        "Авто (24 рецепта)"
+                                        "Авто (28 рецептов)"
                                     },
                                 ),
                                 (
@@ -3521,13 +3669,15 @@ impl TachyonGuiApp {
             .map(|g| *g)
             .unwrap_or(false);
 
-        // 1. Панель генератора стратегий (24 рецепта)
+        let total_recipes = self.snap.recipes_catalog.len();
+
+        // 1. Панель генератора стратегий (28 рецептов)
         Self::panel_frame().show(ui, |ui| {
             ui.label(
                 RichText::new(if is_en {
-                    "Strategy Generator (24 recipes)"
+                    format!("Strategy Generator ({total_recipes} recipes)")
                 } else {
-                    "Генератор стратегий (24 рецепта)"
+                    format!("Генератор стратегий ({total_recipes} рецептов)")
                 })
                 .strong()
                 .size(12.0),
@@ -3564,13 +3714,17 @@ impl TachyonGuiApp {
 
                 ui.add_enabled_ui(!is_probing && !is_calib_ttl, |ui| {
                     let full_lbl = if is_probing {
-                        if is_en { "Scan..." } else { "Скан..." }
+                        if is_en {
+                            "Scan...".to_string()
+                        } else {
+                            "Скан...".to_string()
+                        }
                     } else if is_en {
-                        "Generate (24)"
+                        format!("Generate ({total_recipes})")
                     } else {
-                        "Подобрать (24)"
+                        format!("Подобрать ({total_recipes})")
                     };
-                    if ui.add(Self::primary_button(full_lbl)).clicked() {
+                    if ui.add(Self::primary_button(&full_lbl)).clicked() {
                         self.start_probe_scan(true);
                     }
 
@@ -4263,14 +4417,14 @@ impl TachyonGuiApp {
                         format!("Профиль удалён: {pname}")
                     },
                     if is_en {
-                        "Linked lists reverted to Auto (24 recipes)"
+                        "Linked lists reverted to Auto (28 recipes)"
                     } else {
                         "Привязанные списки переключены обратно на Авто"
                     },
                 );
             }
 
-            // Выбор шаблона из 24 рецептов
+            // Выбор шаблона из 28 рецептов
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(if is_en { "Template:" } else { "Шаблон:" })
@@ -4367,6 +4521,9 @@ impl TachyonGuiApp {
                                 "md5_badack",
                                 "badseq_badack_badsum",
                                 "hopbyhop",
+                                "ip6_destopt",
+                                "ip6_ah",
+                                "finrst",
                             ] {
                                 if ui
                                     .selectable_label(self.builder_cfg.fooling == f, f)
@@ -4678,6 +4835,60 @@ impl TachyonGuiApp {
                     "Block QUIC UDP/443 -> TCP",
                 )
                 .changed()
+                {
+                    self.builder_dirty = true;
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("UDP Payload (Hex):")
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                );
+                if ui
+                    .add(
+                        TextEdit::singleline(&mut self.builder_cfg.udp_fake_payload)
+                            .hint_text("0x...")
+                            .font(TextStyle::Monospace)
+                            .desired_width(140.0),
+                    )
+                    .changed()
+                {
+                    self.builder_dirty = true;
+                }
+
+                ui.label(
+                    RichText::new("UDP Range:")
+                        .size(10.0)
+                        .color(TEXT_SECONDARY),
+                );
+                if ui
+                    .add(
+                        TextEdit::singleline(&mut self.builder_cfg.udp_out_range)
+                            .hint_text("1-2")
+                            .font(TextStyle::Monospace)
+                            .desired_width(64.0),
+                    )
+                    .changed()
+                {
+                    self.builder_dirty = true;
+                }
+
+                if ui
+                    .checkbox(
+                        &mut self.builder_cfg.udp_keep_socket,
+                        RichText::new("Keep UDP Socket")
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                    )
+                    .on_hover_text(if is_en {
+                        "Keep UDP socket open across desync fake bursts"
+                    } else {
+                        "Удерживать UDP-сокет открытым между сериями десинк-пакетов"
+                    })
+                    .changed()
                 {
                     self.builder_dirty = true;
                 }
@@ -5864,6 +6075,8 @@ impl TachyonGuiApp {
                         );
                     }
 
+                    self.render_copy_diagnostics_button(ui, is_en);
+
                     egui::ComboBox::from_id_salt("combo_log_cat")
                         .width(120.0)
                         .selected_text(
@@ -6049,9 +6262,15 @@ impl TachyonGuiApp {
     fn save_dns_overrides_input(&mut self) {
         self.dns_overrides_dirty = false;
         let txt = self.dns_overrides_input.clone();
+        let cnt = txt
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#') && t.contains('=')
+            })
+            .count();
         self.dispatch_ipc("set_dns_overrides", serde_json::json!({ "text": txt }));
         let is_en = self.is_en();
-        let cnt = self.snap.config.dns_overrides.len();
         self.push_toast(
             ToastKind::Success,
             if is_en {
@@ -8529,11 +8748,14 @@ impl TachyonGuiApp {
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Tachyon Binary License v1.0 · Copyright (c) 2026 Dushnilin")
-                        .monospace()
-                        .size(10.0)
-                        .color(TEXT_MUTED),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Tachyon Binary License v1.0 · Copyright (c) 2026 Dushnilin")
+                            .monospace()
+                            .size(10.0)
+                            .color(TEXT_MUTED),
+                    )
+                    .truncate(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let close_lbl = if is_en { "Close" } else { "Закрыть" };
@@ -8548,6 +8770,7 @@ impl TachyonGuiApp {
                     {
                         self.about_modal_open = false;
                     }
+                    self.render_copy_diagnostics_button(ui, is_en);
                 });
             });
         });
@@ -8972,11 +9195,17 @@ impl TachyonGuiApp {
                     "Генератор"
                 },
                 if is_en {
-                    "Generate Strategy: Full Scan (24 Recipes)".to_string()
+                    format!(
+                        "Generate Strategy: Full Scan ({} Recipes)",
+                        self.snap.recipes_catalog.len()
+                    )
                 } else {
-                    "Подобрать стратегию: Полный скан (24 рецепта)".to_string()
+                    format!(
+                        "Подобрать стратегию: Полный скан ({} рецептов)",
+                        self.snap.recipes_catalog.len()
+                    )
                 },
-                "24 Rec",
+                "28 Rec",
             ),
             (
                 "probe_12".to_string(),
@@ -9380,33 +9609,23 @@ impl TachyonGuiApp {
                     let was_running = self.snap.running;
                     self.dispatch_ipc("toggle_running", serde_json::json!({}));
                     let mode_str = self.snap.active_mode.clone();
-                    if was_running && !self.snap.running {
+                    if was_running {
                         self.push_toast(
-                            ToastKind::Warn,
+                            ToastKind::Info,
                             if is_en {
-                                "Capture stopped"
+                                "Stopping capture..."
                             } else {
-                                "Перехват остановлен"
-                            },
-                            mode_str,
-                        );
-                    } else if self.snap.running {
-                        self.push_toast(
-                            ToastKind::Success,
-                            if is_en {
-                                "Capture active"
-                            } else {
-                                "Перехват запущен"
+                                "Остановка перехвата..."
                             },
                             mode_str,
                         );
                     } else {
                         self.push_toast(
-                            ToastKind::Error,
+                            ToastKind::Info,
                             if is_en {
-                                "Failed to start capture"
+                                "Starting capture..."
                             } else {
-                                "Не удалось запустить перехват"
+                                "Запуск перехвата..."
                             },
                             mode_str,
                         );
@@ -9638,6 +9857,11 @@ impl TachyonGuiApp {
 
 impl eframe::App for TachyonGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(mut g) = self.egui_ctx.lock()
+            && g.is_none()
+        {
+            *g = Some(ctx.clone());
+        }
         self.configure_gpui_theme(ctx);
         Self::handle_custom_window_resize(ctx);
 
@@ -9671,6 +9895,31 @@ impl eframe::App for TachyonGuiApp {
         }
 
         self.poll_snapshot_if_due();
+
+        let pending_diag = self
+            .diag_pending_text
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(diag_text) = pending_diag {
+            let lines_cnt = diag_text.lines().count();
+            ctx.copy_text(diag_text);
+            self.diag_copied_toast_until = Some(Instant::now() + Duration::from_millis(1600));
+            let is_en = self.is_en();
+            self.push_toast(
+                ToastKind::Success,
+                if is_en {
+                    "Diagnostics copied"
+                } else {
+                    "Диагностика скопирована"
+                },
+                if is_en {
+                    format!("{lines_cnt} lines copied to clipboard")
+                } else {
+                    format!("Скопировано строк в буфер: {lines_cnt}")
+                },
+            );
+        }
 
         if self.dns_auto_apply_on_finish.load(Ordering::Acquire) {
             let bench_done = self.dns_bench_state.lock().ok().and_then(|st| {
@@ -9776,7 +10025,7 @@ impl eframe::App for TachyonGuiApp {
 fn strategy_options(en: bool) -> [(&'static str, &'static str); 12] {
     if en {
         [
-            ("auto", "Auto (24 recipes)"),
+            ("auto", "Auto (28 recipes)"),
             ("custom", "Generator Profile"),
             ("fake_split", "FakeSplit (midsld)"),
             ("fake_disorder", "FakeDisorder (midsld)"),
@@ -9791,7 +10040,7 @@ fn strategy_options(en: bool) -> [(&'static str, &'static str); 12] {
         ]
     } else {
         [
-            ("auto", "Авто (24 рецепта)"),
+            ("auto", "Авто (28 рецептов)"),
             ("custom", "Профиль Генератора"),
             ("fake_split", "FakeSplit (midsld)"),
             ("fake_disorder", "FakeDisorder (midsld)"),
@@ -9925,6 +10174,10 @@ const RECIPE_TITLES_EN: &[&str] = &[
     "#21 FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap + seqovl=10)",
     "#22 FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)",
     "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)",
+    "#24 FakeDisorder + IPFrag (midsld, Md5BadAck, max.ru)",
+    "#25 5-Seg HostFakeSplit (Md5BadAck, vk.com)",
+    "#26 FakeDisorder FinRst + PadEncap (midsld)",
+    "#27 IPv6 DestOpt2 + FakeDisorder + TlsRec (fonts.google.com)",
 ];
 
 const LIST_LOCALE_EN: &[(&str, &str, &str)] = &[

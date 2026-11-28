@@ -659,6 +659,27 @@ fn build_tun_udp_response(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> O
     }
 }
 
+/// Вычислить задержку ожидания пакета TUN на основе таймеров виртуального стека `smoltcp`.
+fn compute_tun_poll_timeout(
+    poll_delay: Option<smoltcp::time::Duration>,
+    has_active_tcp: bool,
+) -> Duration {
+    const MIN_DELAY: Duration = Duration::from_millis(1);
+    const IDLE_MAX_DELAY: Duration = Duration::from_millis(250);
+    const ACTIVE_FALLBACK_DELAY: Duration = Duration::from_millis(25);
+
+    match poll_delay {
+        Some(delay) => Duration::from_micros(delay.total_micros()).clamp(MIN_DELAY, IDLE_MAX_DELAY),
+        None => {
+            if has_active_tcp {
+                ACTIVE_FALLBACK_DELAY
+            } else {
+                IDLE_MAX_DELAY
+            }
+        }
+    }
+}
+
 /// Запустить системный режим перехвата TUN (`Wintun` на Windows, `/dev/net/tun` на Linux).
 pub async fn run_tun_capture(
     interface_name: &str,
@@ -737,9 +758,13 @@ pub async fn run_tun_capture(
         }
 
         // 3. Ожидаем следующий пакет из TUN или сигнал от виртуального потока
+        let wait_timeout = compute_tun_poll_timeout(
+            iface.poll_delay(SmolInstant::now(), &sockets),
+            !tcp_sessions.is_empty(),
+        );
         tokio::select! {
             biased;
-            read_res = tokio::time::timeout(Duration::from_millis(25), platform_dev.read_packet(&mut pkt_buf)) => {
+            read_res = tokio::time::timeout(wait_timeout, platform_dev.read_packet(&mut pkt_buf)) => {
                 if let Ok(Ok(n)) = read_res && n > 0 {
                     let pkt = &pkt_buf[..n];
                     if let Some((proto, src, dst, flags, payload_off)) = parse_ip_packet_meta(pkt) {
@@ -1424,6 +1449,65 @@ fn pump_virtual_tcp(
 // Платформенная обёртка TUN (Windows Wintun / Linux /dev/net/tun / macOS utun)
 // ============================================================================
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveTunRoutes {
+    adapter_name: String,
+    ipv4_gw: Option<Ipv4Addr>,
+    has_v6: bool,
+}
+
+static ACTIVE_TUN_ROUTES: std::sync::Mutex<Option<ActiveTunRoutes>> = std::sync::Mutex::new(None);
+
+fn register_active_tun_routes(adapter_name: String, ipv4_gw: Option<Ipv4Addr>, has_v6: bool) {
+    let mut guard = ACTIVE_TUN_ROUTES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = Some(ActiveTunRoutes {
+        adapter_name,
+        ipv4_gw,
+        has_v6,
+    });
+}
+
+fn clear_active_tun_routes() {
+    let mut guard = ACTIVE_TUN_ROUTES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = None;
+}
+
+fn take_active_tun_routes() -> Option<ActiveTunRoutes> {
+    ACTIVE_TUN_ROUTES
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+}
+
+fn cleanup_platform_tun_routes(adapter_name: &str, ipv4_gw: Option<Ipv4Addr>, has_v6: bool) {
+    #[cfg(target_os = "windows")]
+    windows_tun::cleanup_routes(adapter_name, ipv4_gw, has_v6);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = ipv4_gw;
+        linux_tun::cleanup_routes(adapter_name, has_v6);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ipv4_gw;
+        macos_tun::cleanup_routes(adapter_name, has_v6);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    let _ = (adapter_name, ipv4_gw, has_v6);
+}
+
+/// Аварийно удалить добавленные маршруты TUN при завершении по сигналу или панике.
+pub fn emergency_cleanup_tun_routes() {
+    let Some(active) = take_active_tun_routes() else {
+        return;
+    };
+    cleanup_platform_tun_routes(&active.adapter_name, active.ipv4_gw, active.has_v6);
+}
+
 pub enum PlatformTunHandle {
     #[cfg(target_os = "windows")]
     Windows(windows_tun::WinTunDevice),
@@ -1450,14 +1534,13 @@ impl PlatformTunHandle {
         }
         #[cfg(target_os = "linux")]
         {
-            let _ = v6_addrs;
-            let dev = linux_tun::LinuxTunDevice::open(name, mtu, v4_addrs, auto_route)?;
+            let dev = linux_tun::LinuxTunDevice::open(name, mtu, v4_addrs, v6_addrs, auto_route)?;
             Ok(Self::Linux(dev))
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = (name, v6_addrs);
-            let dev = macos_tun::MacosTunDevice::open(mtu, v4_addrs, auto_route)?;
+            let _ = name;
+            let dev = macos_tun::MacosTunDevice::open(mtu, v4_addrs, v6_addrs, auto_route)?;
             Ok(Self::Macos(dev))
         }
         #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -1513,7 +1596,7 @@ impl PlatformTunHandle {
 #[cfg(target_os = "linux")]
 mod linux_tun {
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use tokio::io::unix::AsyncFd;
 
@@ -1532,6 +1615,61 @@ mod linux_tun {
         async_fd: AsyncFd<OwnedFd>,
         name: String,
         auto_route: bool,
+        has_v6: bool,
+    }
+
+    pub(super) fn cleanup_routes(_name: &str, has_v6: bool) {
+        crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE
+            .store(0, std::sync::atomic::Ordering::Release);
+        for mark_arg in ["0x2022/0xffff", "0x2022"] {
+            let _ = std::process::Command::new("ip")
+                .args([
+                    "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022", "pref", "9000",
+                ])
+                .status();
+        }
+        let _ = std::process::Command::new("ip")
+            .args([
+                "rule",
+                "del",
+                "fwmark",
+                "0x40000000/0x40000000",
+                "lookup",
+                "main",
+                "pref",
+                "8998",
+            ])
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["route", "flush", "table", "2022"])
+            .status();
+
+        if has_v6 {
+            for mark_arg in ["0x2022/0xffff", "0x2022"] {
+                let _ = std::process::Command::new("ip")
+                    .args([
+                        "-6", "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022", "pref",
+                        "9000",
+                    ])
+                    .status();
+            }
+            let _ = std::process::Command::new("ip")
+                .args([
+                    "-6",
+                    "rule",
+                    "del",
+                    "fwmark",
+                    "0x40000000/0x40000000",
+                    "lookup",
+                    "main",
+                    "pref",
+                    "8998",
+                ])
+                .status();
+            let _ = std::process::Command::new("ip")
+                .args(["-6", "route", "flush", "table", "2022"])
+                .status();
+        }
     }
 
     impl LinuxTunDevice {
@@ -1539,6 +1677,7 @@ mod linux_tun {
             name: &str,
             mtu: usize,
             v4_addrs: &[(Ipv4Addr, u8)],
+            v6_addrs: &[(Ipv6Addr, u8)],
             auto_route: bool,
         ) -> io::Result<Self> {
             let raw_fd =
@@ -1565,6 +1704,19 @@ mod linux_tun {
             for &(ip, prefix) in v4_addrs {
                 let _ = std::process::Command::new("ip")
                     .args(["addr", "add", &format!("{ip}/{prefix}"), "dev", name])
+                    .status();
+            }
+            let has_v6 = !v6_addrs.is_empty();
+            for &(ip6, prefix6) in v6_addrs {
+                let _ = std::process::Command::new("ip")
+                    .args([
+                        "-6",
+                        "addr",
+                        "add",
+                        &format!("{ip6}/{prefix6}"),
+                        "dev",
+                        name,
+                    ])
                     .status();
             }
             let async_fd = unsafe { AsyncFd::register(fd) }?;
@@ -1628,11 +1780,91 @@ mod linux_tun {
                         ])
                         .status();
                 }
+
+                if has_v6 {
+                    // Не падаем, если IPv6 отключён в ядре/контейнере
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "-6", "route", "replace", "::/1", "dev", name, "metric", "10", "table",
+                            "2022",
+                        ])
+                        .status();
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "-6", "route", "replace", "8000::/1", "dev", name, "metric", "10",
+                            "table", "2022",
+                        ])
+                        .status();
+                    for mark_arg in ["0x2022/0xffff", "0x2022"] {
+                        let _ = std::process::Command::new("ip")
+                            .args([
+                                "-6", "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022",
+                                "pref", "9000",
+                            ])
+                            .status();
+                    }
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "-6",
+                            "rule",
+                            "del",
+                            "fwmark",
+                            "0x40000000/0x40000000",
+                            "lookup",
+                            "main",
+                            "pref",
+                            "8998",
+                        ])
+                        .status();
+                    let _ = std::process::Command::new("ip")
+                        .args([
+                            "-6",
+                            "rule",
+                            "add",
+                            "fwmark",
+                            "0x40000000/0x40000000",
+                            "lookup",
+                            "main",
+                            "pref",
+                            "8998",
+                        ])
+                        .status();
+                    let v6_masked_ok = std::process::Command::new("ip")
+                        .args([
+                            "-6",
+                            "rule",
+                            "add",
+                            "not",
+                            "fwmark",
+                            "0x2022/0xffff",
+                            "lookup",
+                            "2022",
+                            "pref",
+                            "9000",
+                        ])
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !v6_masked_ok {
+                        let _ = std::process::Command::new("ip")
+                            .args([
+                                "-6", "rule", "add", "not", "fwmark", "0x2022", "lookup", "2022",
+                                "pref", "9000",
+                            ])
+                            .status();
+                    }
+                }
+
+                super::register_active_tun_routes(
+                    name.to_string(),
+                    v4_addrs.first().map(|&(ip, _)| ip),
+                    has_v6,
+                );
             }
             Ok(Self {
                 async_fd,
                 name: name.to_string(),
                 auto_route,
+                has_v6,
             })
         }
 
@@ -1690,31 +1922,8 @@ mod linux_tun {
     impl Drop for LinuxTunDevice {
         fn drop(&mut self) {
             if self.auto_route {
-                crate::upstream_compat::LINUX_TUN_AUTO_ROUTE_ACTIVE
-                    .store(0, std::sync::atomic::Ordering::Release);
-                for mark_arg in ["0x2022/0xffff", "0x2022"] {
-                    let _ = std::process::Command::new("ip")
-                        .args([
-                            "rule", "del", "not", "fwmark", mark_arg, "lookup", "2022", "pref",
-                            "9000",
-                        ])
-                        .status();
-                }
-                let _ = std::process::Command::new("ip")
-                    .args([
-                        "rule",
-                        "del",
-                        "fwmark",
-                        "0x40000000/0x40000000",
-                        "lookup",
-                        "main",
-                        "pref",
-                        "8998",
-                    ])
-                    .status();
-                let _ = std::process::Command::new("ip")
-                    .args(["route", "flush", "table", "2022"])
-                    .status();
+                super::clear_active_tun_routes();
+                cleanup_routes(&self.name, self.has_v6);
             }
         }
     }
@@ -1725,7 +1934,7 @@ mod macos_tun {
     use crate::upstream_compat::MACOS_OUTBOUND_IF_INDEX;
     use std::ffi::CString;
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::Ordering;
     use tokio::io::unix::AsyncFd;
@@ -1756,6 +1965,25 @@ mod macos_tun {
         async_fd: AsyncFd<OwnedFd>,
         name: String,
         auto_route: bool,
+        has_v6: bool,
+    }
+
+    pub(super) fn cleanup_routes(name: &str, has_v6: bool) {
+        MACOS_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-net", "0.0.0.0/1", "-interface", name])
+            .status();
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", "-net", "128.0.0.0/1", "-interface", name])
+            .status();
+        if has_v6 {
+            let _ = std::process::Command::new("route")
+                .args(["-n", "delete", "-inet6", "::/1", "-interface", name])
+                .status();
+            let _ = std::process::Command::new("route")
+                .args(["-n", "delete", "-inet6", "8000::/1", "-interface", name])
+                .status();
+        }
     }
 
     fn detect_macos_default_if_index() -> Option<u32> {
@@ -1779,7 +2007,12 @@ mod macos_tun {
     }
 
     impl MacosTunDevice {
-        pub fn open(mtu: usize, v4_addrs: &[(Ipv4Addr, u8)], auto_route: bool) -> io::Result<Self> {
+        pub fn open(
+            mtu: usize,
+            v4_addrs: &[(Ipv4Addr, u8)],
+            v6_addrs: &[(Ipv6Addr, u8)],
+            auto_route: bool,
+        ) -> io::Result<Self> {
             if auto_route && let Some(idx) = detect_macos_default_if_index() {
                 MACOS_OUTBOUND_IF_INDEX.store(idx, Ordering::Release);
             }
@@ -1848,7 +2081,14 @@ mod macos_tun {
                     ])
                     .status();
             }
+            let has_v6 = !v6_addrs.is_empty();
+            for &(ip6, prefix6) in v6_addrs {
+                let _ = std::process::Command::new("ifconfig")
+                    .args([&if_name, "inet6", &format!("{ip6}/{prefix6}"), "up"])
+                    .status();
+            }
 
+            let async_fd = unsafe { AsyncFd::register(fd) }?;
             if auto_route {
                 let _ = std::process::Command::new("route")
                     .args(["-n", "add", "-net", "0.0.0.0/1", "-interface", &if_name])
@@ -1856,13 +2096,26 @@ mod macos_tun {
                 let _ = std::process::Command::new("route")
                     .args(["-n", "add", "-net", "128.0.0.0/1", "-interface", &if_name])
                     .status();
+                if has_v6 {
+                    let _ = std::process::Command::new("route")
+                        .args(["-n", "add", "-inet6", "::/1", "-interface", &if_name])
+                        .status();
+                    let _ = std::process::Command::new("route")
+                        .args(["-n", "add", "-inet6", "8000::/1", "-interface", &if_name])
+                        .status();
+                }
+                super::register_active_tun_routes(
+                    if_name.clone(),
+                    v4_addrs.first().map(|&(ip, _)| ip),
+                    has_v6,
+                );
             }
 
-            let async_fd = unsafe { AsyncFd::register(fd) }?;
             Ok(Self {
                 async_fd,
                 name: if_name,
                 auto_route,
+                has_v6,
             })
         }
 
@@ -1936,27 +2189,8 @@ mod macos_tun {
     impl Drop for MacosTunDevice {
         fn drop(&mut self) {
             if self.auto_route {
-                MACOS_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
-                let _ = std::process::Command::new("route")
-                    .args([
-                        "-n",
-                        "delete",
-                        "-net",
-                        "0.0.0.0/1",
-                        "-interface",
-                        &self.name,
-                    ])
-                    .status();
-                let _ = std::process::Command::new("route")
-                    .args([
-                        "-n",
-                        "delete",
-                        "-net",
-                        "128.0.0.0/1",
-                        "-interface",
-                        &self.name,
-                    ])
-                    .status();
+                super::clear_active_tun_routes();
+                cleanup_routes(&self.name, self.has_v6);
             }
         }
     }
@@ -3303,6 +3537,35 @@ mod windows_tun {
         }
     }
 
+    pub(super) fn cleanup_routes(name: &str, ipv4_gw: Option<Ipv4Addr>, has_v6: bool) {
+        WIN_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
+        if let Some(gw) = ipv4_gw {
+            let gw_str = gw.to_string();
+            run_netsh(&[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                "0.0.0.0/1",
+                name,
+                &gw_str,
+            ]);
+            run_netsh(&[
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                "128.0.0.0/1",
+                name,
+                &gw_str,
+            ]);
+        }
+        if has_v6 {
+            run_netsh(&["interface", "ipv6", "delete", "route", "::/1", name]);
+            run_netsh(&["interface", "ipv6", "delete", "route", "8000::/1", name]);
+        }
+    }
+
     pub struct WinTunDevice {
         session: std::sync::Arc<NativeRingSession>,
         _adapter: NativeAdapter,
@@ -3349,6 +3612,10 @@ mod windows_tun {
                         &gw_str,
                     ]);
                 }
+                if !v6_addrs.is_empty() {
+                    run_netsh(&["interface", "ipv6", "delete", "route", "::/1", name]);
+                    run_netsh(&["interface", "ipv6", "delete", "route", "8000::/1", name]);
+                }
                 let rc = unsafe { GetBestInterface(0x0808_0808, &mut best_if) };
                 if rc == 0 && best_if != 0 {
                     WIN_OUTBOUND_IF_INDEX.store(best_if, Ordering::Release);
@@ -3373,6 +3640,7 @@ mod windows_tun {
                     stop_event: usize,
                     effective_name: String,
                     routes_added_v4: Option<Ipv4Addr>,
+                    routes_added_v6: bool,
                     armed: bool,
                 }
 
@@ -3402,6 +3670,24 @@ mod windows_tun {
                                 &gw_str,
                             ]);
                         }
+                        if self.routes_added_v6 {
+                            run_netsh(&[
+                                "interface",
+                                "ipv6",
+                                "delete",
+                                "route",
+                                "::/1",
+                                &self.effective_name,
+                            ]);
+                            run_netsh(&[
+                                "interface",
+                                "ipv6",
+                                "delete",
+                                "route",
+                                "8000::/1",
+                                &self.effective_name,
+                            ]);
+                        }
                         if self.stop_event != 0 {
                             unsafe {
                                 CloseHandle(self.stop_event as Handle);
@@ -3414,6 +3700,7 @@ mod windows_tun {
                     stop_event: stop_event as usize,
                     effective_name: effective_name.clone(),
                     routes_added_v4: None,
+                    routes_added_v6: false,
                     armed: true,
                 };
 
@@ -3443,31 +3730,127 @@ mod windows_tun {
                     "store=active",
                 ]);
 
-                if auto_route && let Some(gw) = ipv4_gw {
-                    open_guard.routes_added_v4 = Some(gw);
-                    let gw_str = gw.to_string();
+                let has_v6 = !v6_addrs.is_empty();
+                if has_v6 {
+                    for &(ip6, prefix6) in v6_addrs {
+                        run_netsh(&[
+                            "interface",
+                            "ipv6",
+                            "delete",
+                            "address",
+                            &format!("interface={effective_name}"),
+                            &format!("address={ip6}"),
+                            "store=active",
+                        ]);
+                        run_netsh(&[
+                            "interface",
+                            "ipv6",
+                            "add",
+                            "address",
+                            &format!("interface={effective_name}"),
+                            &format!("address={ip6}/{prefix6}"),
+                            "store=active",
+                        ]);
+                    }
                     run_netsh(&[
                         "interface",
-                        "ipv4",
-                        "add",
-                        "route",
-                        "0.0.0.0/1",
+                        "ipv6",
+                        "set",
+                        "subinterface",
                         &effective_name,
-                        &gw_str,
-                        "metric=1",
+                        &format!("mtu={mtu}"),
                         "store=active",
                     ]);
-                    run_netsh(&[
-                        "interface",
-                        "ipv4",
-                        "add",
-                        "route",
-                        "128.0.0.0/1",
-                        &effective_name,
-                        &gw_str,
-                        "metric=1",
-                        "store=active",
-                    ]);
+                }
+
+                if auto_route {
+                    if let Some(gw) = ipv4_gw {
+                        let gw_str = gw.to_string();
+                        if effective_name != name {
+                            run_netsh(&[
+                                "interface",
+                                "ipv4",
+                                "delete",
+                                "route",
+                                "0.0.0.0/1",
+                                &effective_name,
+                                &gw_str,
+                            ]);
+                            run_netsh(&[
+                                "interface",
+                                "ipv4",
+                                "delete",
+                                "route",
+                                "128.0.0.0/1",
+                                &effective_name,
+                                &gw_str,
+                            ]);
+                        }
+                        open_guard.routes_added_v4 = Some(gw);
+                        run_netsh(&[
+                            "interface",
+                            "ipv4",
+                            "add",
+                            "route",
+                            "0.0.0.0/1",
+                            &effective_name,
+                            &gw_str,
+                            "metric=1",
+                            "store=active",
+                        ]);
+                        run_netsh(&[
+                            "interface",
+                            "ipv4",
+                            "add",
+                            "route",
+                            "128.0.0.0/1",
+                            &effective_name,
+                            &gw_str,
+                            "metric=1",
+                            "store=active",
+                        ]);
+                    }
+                    if has_v6 {
+                        if effective_name != name {
+                            run_netsh(&[
+                                "interface",
+                                "ipv6",
+                                "delete",
+                                "route",
+                                "::/1",
+                                &effective_name,
+                            ]);
+                            run_netsh(&[
+                                "interface",
+                                "ipv6",
+                                "delete",
+                                "route",
+                                "8000::/1",
+                                &effective_name,
+                            ]);
+                        }
+                        open_guard.routes_added_v6 = true;
+                        run_netsh(&[
+                            "interface",
+                            "ipv6",
+                            "add",
+                            "route",
+                            "::/1",
+                            &effective_name,
+                            "metric=1",
+                            "store=active",
+                        ]);
+                        run_netsh(&[
+                            "interface",
+                            "ipv6",
+                            "add",
+                            "route",
+                            "8000::/1",
+                            &effective_name,
+                            "metric=1",
+                            "store=active",
+                        ]);
+                    }
                 }
 
                 let (rx_tx, rx_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -3499,6 +3882,9 @@ mod windows_tun {
                     })?;
 
                 open_guard.armed = false;
+                if auto_route {
+                    super::register_active_tun_routes(effective_name.clone(), ipv4_gw, has_v6);
+                }
 
                 Ok(Self {
                     session,
@@ -3509,7 +3895,7 @@ mod windows_tun {
                     name: effective_name,
                     auto_route,
                     ipv4_gw,
-                    has_v6: !v6_addrs.is_empty(),
+                    has_v6,
                 })
             })();
 
@@ -3550,39 +3936,8 @@ mod windows_tun {
                 let _ = handle.join();
             }
             if self.auto_route {
-                WIN_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
-                if let Some(gw) = self.ipv4_gw {
-                    let gw_str = gw.to_string();
-                    run_netsh(&[
-                        "interface",
-                        "ipv4",
-                        "delete",
-                        "route",
-                        "0.0.0.0/1",
-                        &self.name,
-                        &gw_str,
-                    ]);
-                    run_netsh(&[
-                        "interface",
-                        "ipv4",
-                        "delete",
-                        "route",
-                        "128.0.0.0/1",
-                        &self.name,
-                        &gw_str,
-                    ]);
-                }
-                if self.has_v6 {
-                    run_netsh(&["interface", "ipv6", "delete", "route", "::/1", &self.name]);
-                    run_netsh(&[
-                        "interface",
-                        "ipv6",
-                        "delete",
-                        "route",
-                        "8000::/1",
-                        &self.name,
-                    ]);
-                }
+                super::clear_active_tun_routes();
+                cleanup_routes(&self.name, self.ipv4_gw, self.has_v6);
             }
             unsafe {
                 CloseHandle(self.stop_event as Handle);
@@ -3779,5 +4134,69 @@ mod tests {
         );
         s.set_congestion_control(SmolCongestionControl::Bbr);
         assert_eq!(s.congestion_control(), SmolCongestionControl::Bbr);
+    }
+
+    #[test]
+    fn compute_tun_poll_timeout_clamps_and_adapts_to_idle() {
+        assert_eq!(
+            compute_tun_poll_timeout(None, false),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            compute_tun_poll_timeout(None, true),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            compute_tun_poll_timeout(Some(smoltcp::time::Duration::from_millis(0)), true),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compute_tun_poll_timeout(Some(smoltcp::time::Duration::from_micros(500)), false),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compute_tun_poll_timeout(Some(smoltcp::time::Duration::from_millis(12)), true),
+            Duration::from_millis(12)
+        );
+        assert_eq!(
+            compute_tun_poll_timeout(Some(smoltcp::time::Duration::from_millis(1000)), true),
+            Duration::from_millis(250)
+        );
+
+        let mut vdev = VirtualTunDevice::new(1500);
+        let mut iconfig = IfaceConfig::new(HardwareAddress::Ip);
+        iconfig.random_seed = 1;
+        let mut iface = Interface::new(iconfig, &mut vdev, SmolInstant::now());
+        let sockets = SocketSet::new(Vec::new());
+        let delay = iface.poll_delay(SmolInstant::now(), &sockets);
+        assert_eq!(
+            compute_tun_poll_timeout(delay, false),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn tun_route_tracker_register_clear_and_emergency_take() {
+        // Сначала сбрасываем возможный остаток и убеждаемся, что пустой emergency_cleanup безопасен.
+        let _ = take_active_tun_routes();
+        emergency_cleanup_tun_routes();
+        assert!(take_active_tun_routes().is_none());
+
+        let gw = Ipv4Addr::new(172, 19, 0, 1);
+        register_active_tun_routes("tachyon-test0".to_string(), Some(gw), true);
+        let taken = take_active_tun_routes().expect("registered active routes");
+        assert_eq!(
+            taken,
+            ActiveTunRoutes {
+                adapter_name: "tachyon-test0".to_string(),
+                ipv4_gw: Some(gw),
+                has_v6: true,
+            }
+        );
+        assert!(take_active_tun_routes().is_none());
+
+        register_active_tun_routes("tachyon-test1".to_string(), None, false);
+        clear_active_tun_routes();
+        assert!(take_active_tun_routes().is_none());
     }
 }

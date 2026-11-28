@@ -125,6 +125,11 @@ fn stage_upstream_desync(manifest_dir: &Path, out_dir: &Path) {
         content = content.replace("\r\n", "\n");
         content = content.replace("core_tls::", "crate::core_tls::");
         content = content.replace("crate::crate::core_tls::", "crate::core_tls::");
+        content = content.replace("core_config::", "crate::upstream_compat::core_config::");
+        content = content.replace(
+            "crate::crate::upstream_compat::core_config::",
+            "crate::upstream_compat::core_config::",
+        );
         content = content.replace("portable_atomic::", "std::sync::atomic::");
 
         let dst_path = out_desync_dir.join(out_name);

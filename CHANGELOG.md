@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1
+
+### Новые возможности и улучшения
+
+- **Синхронизация с `tachyon-core v0.6.9` (`28` рецептов десинхронизации)**:
+  - Матрица адаптивных рецептов расширена с 24 до **28** (`#24 FakeDisorder + IPFrag`, `#25 5-Seg HostFakeSplit`, `#26 FakeDisorder FinRst + PadEncap`, `#27 IPv6 DestOpt2 + FakeDisorder`), обновлены слой совместимости `build.rs` / `upstream_compat.rs` (`core_config`, `HardwareProfile` метрики и `PreconnectSyndata`).
+  - В Конструкторе, профилях и ядре поддержаны расширенные методы `ip6_destopt`, `ip6_ah`, `finrst`, флаг `ipfrag` и UDP-параметры `udp_fake_payload`, `udp_out_range`, `udp_keep_socket`.
+- **Полноценный CLI-режим, локальный Control-IPC и диагностика (`doctor`)**:
+  - Подключён консольный вывод на Windows в `release`-сборках (`AttachConsole`) и единый механизм защиты от дубля процесса на Unix (`flock` по `.instance.lock`).
+  - Реализованы CLI-команды с поддержкой `--json`: `run` (`--mode`, `--port`, `--config`, `--no-autostart`), `probe <domain>` (`--stream-192k`, `--ttl`, `--recipe`), `dns bench [--apply]`, `dns speed`, `dns flush`, `doctor`, `recipes`, `config export|import`, а также управление живым процессом через защищённый loopback Control-IPC (`status`, `flows`, `logs`, `toggle`, `stop`, `reload`, `pin`).
+  - В интерфейс («Журнал» и «О программе») добавлена кнопка копирования полного диагностического отчёта (`DiagnosticReport`), а палитра команд `Ctrl+K` обновлена под 28 рецептов.
+- **Исправления в `TUN`, локальном прокси, GUI и самообновлении**:
+  - **TUN `IPv6` и планировщик**: реализована настройка адресов и маршрутов `::/1`, `8000::/1` на Windows (`netsh`), Linux (`ip -6`) и macOS (`ifconfig`/`route -n`), цикл `run_tun_capture` переведён на `iface.poll_delay(...)`, добавлена аварийная очистка маршрутов `emergency_cleanup_tun_routes()`.
+  - **Локальный прокси**: раннее отклонение правил `Block` (`0x05 0x02` для `SOCKS5` и `403 Forbidden` для `HTTP CONNECT`) до DNS-резолва и ответа `200`/`0x00`, нормализация не-`CONNECT` HTTP-запросов, общий 5-секундный таймаут заголовков (`431` при `> 16 KiB`), сохранение/восстановление системного прокси Windows и поддержка KDE Plasma на Linux.
+  - **Неблокирующий UI и безопасное обновление**: команды и опрос снимка в `gui.rs` вынесены из главного потока на фоновый воркер `GuiCommand`; в `updater.rs` убран кросс-архитектурный фоллбэк, сверка `SHA256SUMS` сделана обязательной, добавлены проверки `.deb`/`setcap` на Linux и `.app`-бандла на macOS.
+
 ## 0.2.0
 
 ### Новые возможности и улучшения

@@ -8,7 +8,7 @@
 <img src="assets/readme/hero-board.svg" width="100%" alt="Tachyon Desync — кроссплатформенный десктопный движок адаптивной десинхронизации пакетов L3/L4/L7">
 
 <p>
-  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.2.0-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.2.0"></a>
+  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.2.1-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.2.1"></a>
   <img src="https://img.shields.io/badge/Rust-2024_Edition-f97316?style=flat-square&logo=rust&logoColor=white&labelColor=0f172a" alt="Rust 2024">
   <img src="https://img.shields.io/badge/UI-Native_OpenGL_(egui)-38bdf8?style=flat-square&labelColor=0f172a" alt="Native OpenGL UI">
   <img src="https://img.shields.io/badge/Capture-Wintun_%7C_utun_%7C_tun_L3_%2B_SOCKS5-10b981?style=flat-square&labelColor=0f172a" alt="Wintun + utun + tun L3 + SOCKS5">
@@ -18,14 +18,15 @@
 
 <p>
   <strong>Нативный кроссплатформенный десктопный комплекс адаптивной доставки трафика, фрагментации TLS-записей и пакетной десинхронизации L3/L4/L7 для Windows, любого Linux и любого macOS.</strong><br>
-  Трёхуровневый селектор <code>AdaptiveBrain L1–L3</code> (24 TCP + 6 UDP рецептов) · гейт верификации <code>32 / 192 КиБ</code> · виртуальный адаптер <code>Wintun / utun / tun L3</code> со стеком <code>smoltcp</code> (<code>BBR</code>/<code>CUBIC</code>/<code>Reno</code>) · фильтрация по процессам (PID) · чистый DNS (<code>DoH</code> / <code>DoT</code> / <code>UDP</code> + бенчмарк) · авто-калибровка TTL · собственная рамка окна на <code>OpenGL</code> без WebView2 и браузерных процессов.
+  Трёхуровневый селектор <code>AdaptiveBrain L1–L3</code> (28 TCP + 6 UDP рецептов) · гейт верификации <code>32 / 192 КиБ</code> · виртуальный адаптер <code>Wintun / utun / tun L3</code> (IPv4 + IPv6) со стеком <code>smoltcp</code> (<code>BBR</code>/<code>CUBIC</code>/<code>Reno</code>) · фильтрация по процессам (PID) · чистый DNS (<code>DoH</code> / <code>DoT</code> / <code>UDP</code> + бенчмарк) · полноценный <code>CLI</code> + локальный IPC · авто-калибровка TTL · собственная рамка окна на <code>OpenGL</code>.
 </p>
 
 <p>
   <a href="#быстрый-старт-и-готовые-сборки">Быстрый старт</a> ·
   <a href="#ключевые-возможности-и-интерфейс">Возможности</a> ·
-  <a href="#конвейер-десинхронизации-и-24-рецепта">Рецепты L1–L3</a> ·
+  <a href="#конвейер-десинхронизации-и-28-рецептов">Рецепты L1–L3</a> ·
   <a href="#режимы-перехвата-и-маршрутизация-по-процессам">TUN L3 и процессы</a> ·
+  <a href="#интерфейс-командной-строки-cli-и-горячие-клавиши">CLI</a> ·
   <a href="#сборка-из-исходного-кода">Сборка</a>
 </p>
 
@@ -53,11 +54,11 @@
 - **Трёхуровневый селектор `AdaptiveBrain L1–L3`**:
   - **`L1` (память домена, TTL 7 суток)**: мгновенно применяет проверенный рабочий рецепт для конкретного хоста (`SNI` / `Host`) из энергонезависимого кэша `runtime-state.json`.
   - **`L2` (память подсети `/24`)**: если новый поддомен обращается к уже известной серверной подсети `/24`, автоматически подставляет рецепт этой подсети без лишнего перебора.
-  - **`L3` (глобальный рейтинг канала)**: ранжирует все 24 рецепта по целочисленной статистике `RecipeStats` (вероятность успеха + `EWMA RTT`) и пассивному профилю маршрута `IspFingerprint`.
-- **Контрольный гейт `32 КиБ` и защита от тихого сброса сессии**: рецепт признаётся рабочим и закрепляется за доменом только после подтверждённой прикладной передачи (как в боевом потоке с живым закреплением на `256 КиБ` и учётом интервалов тишины `active_elapsed`, так и при конвейерной 1-RTT `TLS 1.3` верификации `> 32 КиБ` в Генераторе и Конструкторе). При серии сбросов (`TCP RST`) запускается автоматическое фоновое переобучение.
+  - **`L3` (глобальный рейтинг канала)**: ранжирует все 28 рецептов по целочисленной статистике `RecipeStats` (вероятность успеха + `EWMA RTT`) и пассивному профилю маршрута `IspFingerprint`.
+- **Контрольный гейт `32 КиБ` и защита от тихого сброса сессии**: рецепт признаётся рабочим и закрепляется за доменом только после подтверждённой прикладной передачи (как в боевом потоке с живым закреплением на `256 КиБ` и учётом интервалов тишины `active_elapsed`, так и при конвейерной 1-RTT `TLS 1.3` верификации `> 32 КиБ` / `192 КиБ` в Генераторе и Конструкторе). При серии сбросов (`TCP RST`) запускается автоматическое фоновое переобучение.
 - **Чистый DNS (`DoH` / `DoT` / `UDP`), бенчмарк и локальный `hosts`**: встроенный резолвер поддерживает `DoH` (`RFC 8484`), `DoT` (`RFC 7858`, keep-alive) с десинхронизацией (`desync_doh_dot`), нестандартные UDP-порты (`77.88.8.8:1253`, `208.67.222.222:5353`), раздельную маршрутизацию локальных/`.ru` доменов (`split_local_ru`), `PTR` `.arpa`, `Turbo Cache`, 2-фазный бенчмарк с авторекомендацией и встроенный редактор `hosts` без изменения системных файлов.
 - **Генератор стратегий, авто-калибровка TTL и визуализатор `ClientHello`**:
-  - Активный перебор всех 24 рецептов для любого домена в один клик с верификацией чтения `> 32 КиБ`, измерением задержки (`RTT ms`), глубоким поиском комбинаций и сохранением именованных пользовательских профилей.
+  - Активный перебор всех 28 рецептов для любого домена в один клик с верификацией чтения `> 32 КиБ` или потоковым зондом `192 КиБ`, измерением задержки (`RTT ms`), глубоким поиском комбинаций и сохранением именованных пользовательских профилей.
   - Поиск минимального рабочего `Auto-TTL` в диапазоне хопов `2..10` до целевого узла без доставки фейкового сегмента конечному серверу.
   - Пошаговая диаграмма нарезки `TLS ClientHello` (`SNI`, `SLD`, `midsld`, `endhost`, 7-точечный `Split`, `TlsRec`, `Fake`) и живой предпросмотр JSON-конфигурации.
 - **10 преднастроенных категорий и маршрутизация по процессам**: готовые списки доменов и подсетей с индивидуальными `UDP портами` и `UDP TTL` (YouTube, Discord, Telegram, ИИ-платформы, стриминг, игровые сервисы, разработка, внутренние ресурсы), приоритет списков поверх встроенного игрового байпаса, выбор процессов в один клик и поддержка каскадной пересылки через внешний прокси (`SOCKS5://` или `HTTP://`).
@@ -67,19 +68,19 @@
 | **`Авто` (`Auto`)** | Сводные карточки (`Активные потоки`, `После десинка`, `Трафик RX/TX`, `Кэш доменов`), 60-секундный график телеметрии, панель **`Network Stack & Tuning`** (`BBR`/`CUBIC`, пресеты `Turbo 4K` / `Default`, автотюнинг буферов и MTU), настройка Чистого DNS и локального `hosts`, проверка 6 сервисов в один клик, панель категорий, таблица закреплённых доменов и сброс кэша `AdaptiveBrain`. |
 | **`DNS`** | Настройка транспортов `DoH` / `DoT` / `UDP`, выбор `Parallel`/`Sequential` failover, `Turbo Cache`, `desync_doh_dot`, `split_local_ru`, 2-фазный бенчмарк с автонастройкой (`Применить по завершении`), многодоменный тест скорости и сброс DNS-кэша. |
 | **`Потоки` (`Flows`)** | Живой монитор активных и недавних TCP/UDP сессий с отображением процесса, целевого домена/IP, применённого рецепта, счётчиков приёма/отдачи и кнопками быстрой отправки домена в Генератор или в список исключений (`Прямое`). |
-| **`Генератор` (`Generator`)** | Автоматический подбор рецепта по 24 стратегиям (`32 / 192 КиБ`), калибровка оптимального `Auto-TTL` (`2..10` хопов), диаграмма разрезов `ClientHello`, именованные профили, сброс кэша и конструктор (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, пул SNI, `Fake Payload Hex`, `IPv6 Ext`, `QUIC`). |
+| **`Генератор` (`Generator`)** | Автоматический подбор рецепта по 28 стратегиям (`32 / 192 КиБ`), калибровка оптимального `Auto-TTL` (`2..10` хопов), диаграмма разрезов `ClientHello`, именованные профили, сброс кэша и конструктор (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, пул SNI, `Fake Payload Hex`, `IPv6 Ext` / `ah` / `finrst` / `ipfrag`, `udp_fake_payload` / `udp_out_range` / `udp_keep_socket`). |
 | **`Списки` (`Lists`)** | Управление фильтрацией по процессам и работой списков поверх игрового байпаса, индивидуальная привязка стратегии к процессу, каскадный прокси (`Upstream SOCKS5/HTTP`), экспорт/импорт бэкапа и редактирование 10 списков доменов/CIDR (`UDP порты`, `UDP TTL`). |
-| **`Журнал` (`Logs`)** | Сворачиваемый рейтинг 24 рецептов на канале (`L3 Scoreboard`), фильтрация событий по категориям (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), копирование любой строки по клику и выгрузка журнала в буфер обмена. |
+| **`Журнал` (`Logs`)** | Сворачиваемый рейтинг 28 рецептов на канале (`L3 Scoreboard`), фильтрация событий по категориям (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), копирование лога и полного диагностического отчёта (`DiagnosticReport`) в буфер обмена. |
 
 ---
 
 <p align="center">
-  <img src="assets/readme/section-pipeline.svg" width="100%" alt="Конвейер десинхронизации и 24 рецепта">
+  <img src="assets/readme/section-pipeline.svg" width="100%" alt="Конвейер десинхронизации и 28 рецептов">
 </p>
 
-## Конвейер десинхронизации и 24 рецепта
+## Конвейер десинхронизации и 28 рецептов
 
-При установке соединения в режиме **`Авто (24 рецепта)`** движок анализирует первое исходящее сообщение (`TLS ClientHello` или `HTTP Request`), вычисляет семантические смещения внутри пакета (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`) и применяет один из 24 рецептов TCP или 6 рецептов UDP/QUIC:
+При установке соединения в режиме **`Авто (28 рецептов)`** движок анализирует первое исходящее сообщение (`TLS ClientHello` или `HTTP Request`), вычисляет семантические смещения внутри пакета (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`) и применяет один из 28 рецептов TCP или 6 рецептов UDP/QUIC:
 
 | ID | Название рецепта | Техника трансформации на линии |
 | :---: | :--- | :--- |
@@ -107,6 +108,10 @@
 | **`#21`** | `FakeDisorder SYNData (декой в SYN + Md5BadAck + PadEncap)` | Инжекция полезной нагрузки на фазе `SYN` (`Linux SOCK_RAW`) либо `PadEncap + seqovl=10` с `Md5BadAck`. |
 | **`#22`** | `FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)` | Сжатие приёмного окна `wsize=64` на рукопожатии + дробление TLS-записи и разрез `host+1` с `BadSum`. |
 | **`#23`** | `MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del)` | Внепорядочная нарезка по `midsld` с предконнектным окном `wsize=1`, `TCP Window Scale = 1`, `AutoTTL` и клоном без `SNI`. |
+| **`#24`** | `FakeDisorder + IPFrag (midsld, Md5BadAck, max.ru)` | Обратная IP-фрагментация (`ipfrag`) в сочетании с `FakeDisorder`, `Md5BadAck` и профилем `max.ru`. |
+| **`#25`** | `5-Seg HostFakeSplit (Md5BadAck, vk.com)` | Пятисегментный `HostFakeSplit` с пред- и пост-декоями `vk.com` и `Md5BadAck`. |
+| **`#26`** | `FakeDisorder FinRst + PadEncap (midsld)` | Подменный пакет `Md5BadAck` с ограниченным по хопам `FIN\|RST\|ACK`-декоем сброса состояния и инкапсуляцией `PadEncap`. |
+| **`#27`** | `IPv6 DestOpt2 + FakeDisorder + TlsRec (fonts.google.com)` | Двойной заголовок расширения IPv6 `Destination Options` с `FakeDisorder`, `TlsRec` и шаблоном `fonts.google.com`. |
 
 Для протокола **UDP / QUIC** и голосовых датаграмм автоматически применяются 6 специализированных рецептов (`#0..#5`: серии подменных датаграмм `QUIC Initial`, псевдослучайные 24-байтные `opaque`-пакеты с выравниванием `udplen`, заголовки `IPv6 HopByHop` и многошаговый `TTL 2..5`), а для браузерного трафика поддерживается мгновенный перевод `QUIC UDP/443 -> TCP/TLS` через `ICMP Port Unreachable`.
 
@@ -140,13 +145,42 @@
 | **macOS 11+ (Universal: Apple Silicon & Intel)** | `Universal` (`M1–M4` + `x86_64`) | `tachyon-desync-macos-universal.dmg` | Откройте `.dmg` и перетащите **`Tachyon Desync.app`** в папку `/Applications`. Для активации `utun` приложение запросит права администратора через стандартное окно macOS. |
 | **macOS 11+ (Отдельные бинарники)** | `ARM64` (`M1–M4`)<br>`Intel` (`x86_64`) | `tachyon-desync-macos-arm64.tar.gz`<br>`tachyon-desync-macos-amd64.tar.gz` | Архивы с нативным исполняемым файлом `tachyon-desync` для запуска из терминала или собственных скриптов. |
 
-### Параметры командной строки и горячие клавиши
+### Интерфейс командной строки (CLI) и горячие клавиши
 
-- `tachyon-desync --minimized` (или `--tray`) — запуск в фоновом режиме (в системном трее) с автоматическим стартом перехвата; используется при включении галочки **«Автозапуск»**.
+Все CLI-команды автоматически подключаются к родительской консоли на Windows (`AttachConsole`) и поддерживают машинный вывод `--json`:
+
+```bash
+# Справка, версия и список 28 рецептов
+tachyon-desync --help
+tachyon-desync --version --json
+tachyon-desync recipes
+
+# Консольный режим (headless) с переопределением режима и порта
+tachyon-desync run --mode tun --port 7897
+
+# Подбор стратегии, проверка 192 КиБ, авто-TTL и диагностика окружения
+tachyon-desync probe youtube.com --stream-192k --ttl
+tachyon-desync dns bench --apply
+tachyon-desync dns speed
+tachyon-desync doctor
+
+# Управление уже запущенным GUI/фоновым процессом через локальный Control-IPC
+tachyon-desync status
+tachyon-desync flows
+tachyon-desync pin example.com 14
+tachyon-desync toggle
+tachyon-desync stop --exit
+
+# Экспорт/импорт конфигурации и запуск свёрнутым в трей
+tachyon-desync config export backup-state.json
+tachyon-desync --minimized
+```
+
 - **`Ctrl + Alt + D`** — глобальная комбинация клавиш для мгновенного запуска или остановки перехвата из любого окна.
-- **Файлы состояния и конфигурации** создаются автоматически рядом с исполняемым файлом в каталоге `data/`:
-  - `data/config.json` — выбранный режим перехвата, язык интерфейса (`ru` / `en`), списки доменов/подсетей, выбранные процессы, локальный `hosts` и пользовательский профиль генератора;
-  - `data/runtime-state.json` — обученная память `AdaptiveBrain` (`L1` домены, `L2` подсети `/24`, `L3` счётчики рецептов).
+- **Файлы состояния и конфигурации** сохраняются в системном каталоге данных (`%LOCALAPPDATA%\TachyonDesync` на Windows, `~/.config/tachyon-desync` на Linux/macOS):
+  - `state.json` — схема `v4`: режим перехвата, настройки `DNS` (`DoH`/`DoT`/`UDP`), сетевого стека (`BBR`/`MTU`/`IPv6`), списки доменов/подсетей, процессы и пользовательские профили;
+  - `adaptive_cache.json` — обученная память `AdaptiveBrain` (`L1` домены, `L2` подсети `/24`, `L3` рейтинг рецептов);
+  - `.control.json` — эфемерный порт и токен локального Control-IPC (удаляется при выходе).
 
 ---
 
@@ -182,6 +216,7 @@ sudo apt-get install -y pkg-config libx11-dev libxcb-render0-dev libxcb-shape0-d
 Если Tachyon помогает в работе, вы можете поддержать развитие проекта:
 
 - **Boosty:** [boosty.to/tachyon](https://boosty.to/tachyon)
+- **СБП (Ozon Банк):** [finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
 - **Карты РФ и СБП (CloudTips):** [pay.cloudtips.ru/p/449c5ef9](https://pay.cloudtips.ru/p/449c5ef9)
 - **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
 - **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`

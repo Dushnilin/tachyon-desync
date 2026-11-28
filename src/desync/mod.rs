@@ -22,8 +22,8 @@ pub const MIN_VERIFIED_TRANSFER_BYTES: u64 = upstream::DPI_CAP_WINDOW_BYTES;
 /// Порог живого продвижения активного потока на лету (256 КиБ) из апстрима `0.5.0`.
 pub const DESYNC_LIVE_PROMOTE_BYTES: u64 = upstream::DESYNC_LIVE_PROMOTE_BYTES;
 
-/// Описание каждого из 24 рецептов апстримного `ADAPTIVE_RECIPES` для отображения в GUI.
-pub const RECIPE_TITLES: [(&str, &str); 24] = [
+/// Описание каждого из 28 рецептов апстримного `ADAPTIVE_RECIPES` для отображения в GUI.
+pub const RECIPE_TITLES: [(&str, &str); 28] = [
     (
         "r0_fakesplit_md5_midsld",
         "#0 FakeSplit (midsld, MD5 клон ClientHello)",
@@ -120,7 +120,25 @@ pub const RECIPE_TITLES: [(&str, &str); 24] = [
         "r23_multidisorder_wsize1_scale1",
         "#23 MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del, googlevideo)",
     ),
+    (
+        "r24_fakedisorder_md5badack_ipfrag",
+        "#24 FakeDisorder + IPFrag (midsld, Md5BadAck, max.ru)",
+    ),
+    (
+        "r25_hostfakesplit_5seg_md5badack",
+        "#25 5-Seg HostFakeSplit (Md5BadAck, vk.com)",
+    ),
+    (
+        "r26_fakedisorder_finrst_padencap",
+        "#26 FakeDisorder FinRst + PadEncap (midsld)",
+    ),
+    (
+        "r27_ip6_destopt2_fakedisorder",
+        "#27 IPv6 DestOpt2 + FakeDisorder + TlsRec (fonts.google.com)",
+    ),
 ];
+
+const ALL_RECIPES_MASK: u32 = (1u32 << RECIPE_TITLES.len()) - 1;
 
 /// Справочная структура рецепта для GUI.
 #[derive(Debug, Clone, Copy)]
@@ -130,7 +148,7 @@ pub struct RecipeSummary {
     pub title: &'static str,
 }
 
-pub fn all_recipe_summaries() -> [RecipeSummary; 24] {
+pub fn all_recipe_summaries() -> [RecipeSummary; 28] {
     std::array::from_fn(|i| RecipeSummary {
         id: i as u8,
         code: RECIPE_TITLES[i].0,
@@ -250,6 +268,12 @@ pub struct DesyncConfig {
     #[serde(default)]
     pub explicit_udp_fake_ttl: bool,
     pub udplen: usize,
+    #[serde(default)]
+    pub udp_fake_payload: String,
+    #[serde(default)]
+    pub udp_out_range: String,
+    #[serde(default)]
+    pub udp_keep_socket: bool,
     pub block_quic: bool,
     #[serde(default = "default_quic_desync")]
     pub quic_desync: bool,
@@ -283,6 +307,9 @@ impl Default for DesyncConfig {
             udp_fake_ttl: 6,
             explicit_udp_fake_ttl: false,
             udplen: 0,
+            udp_fake_payload: String::new(),
+            udp_out_range: String::new(),
+            udp_keep_socket: false,
             block_quic: false,
             quic_desync: true,
             quic_repeats: 0,
@@ -291,7 +318,7 @@ impl Default for DesyncConfig {
 }
 
 impl DesyncConfig {
-    /// Построить полную конфигурацию GUI из одного из 24 рецептов апстримного `ADAPTIVE_RECIPES`.
+    /// Построить полную конфигурацию GUI из одного из 28 рецептов апстримного `ADAPTIVE_RECIPES`.
     pub fn from_recipe_id(id: u8) -> Self {
         let idx = (id as usize).min(upstream::ADAPTIVE_RECIPES.len() - 1);
         let r = upstream::ADAPTIVE_RECIPES[idx];
@@ -316,9 +343,12 @@ impl DesyncConfig {
             upstream::DesyncFooling::BadSum => "badsum",
             upstream::DesyncFooling::AutoTtl => "autottl",
             upstream::DesyncFooling::HopByHop => "hopbyhop",
+            upstream::DesyncFooling::Ip6DestOpt => "ip6_destopt",
+            upstream::DesyncFooling::Ip6Ah => "ip6_ah",
             upstream::DesyncFooling::BadSeqBadAckBadSum => "badseq_badack_badsum",
             upstream::DesyncFooling::Md5BadAck => "md5_badack",
             upstream::DesyncFooling::DataNoAck => "datanoack",
+            upstream::DesyncFooling::FinRst => "finrst",
         };
         let split_pos_str = match r.split_pos {
             upstream::SplitPos::Byte(n) => n.to_string(),
@@ -355,12 +385,15 @@ impl DesyncConfig {
             wsize: u32::from(r.wsize),
             wscale: r.wscale,
             syndata: r.syndata,
-            ipfrag: false,
+            ipfrag: r.ipfrag,
             udp_fake: true,
             udp_repeats: 3,
             udp_fake_ttl: 6,
             explicit_udp_fake_ttl: false,
             udplen: 0,
+            udp_fake_payload: String::new(),
+            udp_out_range: String::new(),
+            udp_keep_socket: false,
             block_quic: false,
             quic_desync: true,
             quic_repeats: 0,
@@ -446,6 +479,21 @@ impl DesyncConfig {
         );
         if self.udplen > 0 {
             obj.insert("udplen".to_string(), serde_json::json!(self.udplen));
+        }
+        if !self.udp_fake_payload.trim().is_empty() {
+            obj.insert(
+                "udp_fake_payload".to_string(),
+                serde_json::json!(self.udp_fake_payload.trim()),
+            );
+        }
+        if !self.udp_out_range.trim().is_empty() {
+            obj.insert(
+                "udp_out_range".to_string(),
+                serde_json::json!(self.udp_out_range.trim()),
+            );
+        }
+        if self.udp_keep_socket {
+            obj.insert("udp_keep_socket".to_string(), serde_json::json!(true));
         }
         obj.insert(
             "quic_desync".to_string(),
@@ -591,7 +639,7 @@ impl DesyncConfig {
         } else {
             upstream::DesyncPreset::from_str(&self.mode).ok()
         };
-        u.fooling = upstream::DesyncFooling::from_str(&self.fooling)
+        u.fooling = upstream::DesyncFooling::from_str(self.fooling.trim())
             .unwrap_or(upstream::DesyncFooling::Md5);
         u.explicit_fooling = !self.auto;
         let parse_one_pos = |s: &str| -> Option<upstream::SplitPos> {
@@ -665,6 +713,24 @@ impl DesyncConfig {
         u.udp_fake_ttl = self.udp_fake_ttl.clamp(1, 64);
         u.explicit_udp_fake_ttl = self.explicit_udp_fake_ttl || !self.auto;
         u.udplen = self.udplen;
+        u.udp_fake_payload = if !self.udp_fake_payload.trim().is_empty() {
+            crate::upstream_compat::core_config::desync::parse_udp_fake_payload_hex(
+                &serde_json::Value::String(self.udp_fake_payload.trim().to_string()),
+            )
+            .ok()
+            .map(Arc::from)
+        } else {
+            None
+        };
+        u.udp_out_range = if !self.udp_out_range.trim().is_empty() {
+            upstream::UdpOutRange::from_json_value(&serde_json::Value::String(
+                self.udp_out_range.trim().to_string(),
+            ))
+            .ok()
+        } else {
+            None
+        };
+        u.udp_keep_socket = self.udp_keep_socket;
         u.quic_desync = self.quic_desync && !self.block_quic;
         u.explicit_quic_desync = true;
         u.quic_repeats = if self.quic_repeats > 0 {
@@ -954,7 +1020,7 @@ pub fn notify_domain_connection_result(host: &str, ok: bool) {
                         "relearn",
                         &format!(
                             "Авто-переобучение: для {clean} после сбоя подобран кандидат {title} (ожидает проверки 32 KiB, исключено маской: {})",
-                            (banned & 0xFF_FFFF).count_ones()
+                            (banned & ALL_RECIPES_MASK).count_ones()
                         ),
                     );
                 }
@@ -1528,7 +1594,7 @@ pub fn get_learned_domains_snapshot() -> Vec<LearnedDomainView> {
                 recipe_title: title.to_string(),
                 verified: d.verified_32k,
                 failures: d.consecutive_fails,
-                banned_count: (d.banned_mask & 0xFF_FFFF).count_ones(),
+                banned_count: (d.banned_mask & ALL_RECIPES_MASK).count_ones(),
             }
         })
         .collect()
@@ -1651,7 +1717,7 @@ fn pick_best_target_addr(addrs: Vec<SocketAddr>) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "IP не найден"))
 }
 
-/// Полный генератор и сканер стратегий по домену: тестирует 12 или все 24 рецепта параллельными волнами,
+/// Полный генератор и сканер стратегий по домену: тестирует 12 или все 28 рецептов параллельными волнами,
 /// проверяет полное чтение `> 32 КиБ` (или `> 192 КиБ`) по TLS 1.3 и синтезирует оптимальную конфигурацию.
 pub async fn generate_domain_strategy(
     domain: &str,
@@ -1756,11 +1822,11 @@ async fn generate_domain_strategy_with_mask(
 
     let mut cap_mask = 0u32;
     for r in &results {
-        if r.block_reason == "cap_16k" && (r.recipe_id as usize) < 24 {
+        if r.block_reason == "cap_16k" && (r.recipe_id as usize) < RECIPE_TITLES.len() {
             cap_mask |= 1u32 << r.recipe_id;
         }
     }
-    let effective_banned = (banned_mask | cap_mask) & 0xFF_FFFF;
+    let effective_banned = (banned_mask | cap_mask) & ALL_RECIPES_MASK;
 
     let passed: Vec<&RecipeProbeResult> = results.iter().filter(|r| r.ok).collect();
     let passed_count = passed.len();
@@ -1817,7 +1883,7 @@ async fn generate_domain_strategy_with_mask(
     } else {
         let fallback = DesyncConfig::from_preset(DesyncPreset::SevenPointDisorder);
         let diag = format!(
-            "Ни один из {total_tested} проверенных рецептов не прошёл контроль чтения >{depth_label} для {clean_domain} ({dst}) (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}). Рекомендуется полное сканирование 24 рецептов или режим TUN."
+            "Ни один из {total_tested} проверенных рецептов не прошёл контроль чтения >{depth_label} для {clean_domain} ({dst}) (Cap <32K: {cap_count}, RST: {rst_count}, Blackhole: {timeout_count}). Рекомендуется полное сканирование {total_recipes} рецептов или режим TUN."
         );
         (None, fallback, diag)
     };
@@ -2443,5 +2509,101 @@ mod tests {
         assert!(!white_sni_pool().is_empty());
         assert!(is_quic_long_header(&[0xc3u8; 32]));
         assert!(!is_quic_long_header(&[0x40u8; 32]));
+    }
+
+    #[test]
+    fn recipes_28_and_new_foolings_sync_with_upstream() {
+        assert_eq!(RECIPE_TITLES.len(), 28);
+        let summaries = all_recipe_summaries();
+        assert_eq!(summaries.len(), 28);
+        assert_eq!(summaries[27].id, 27);
+        assert_eq!(summaries[27].code, "r27_ip6_destopt2_fakedisorder");
+
+        let r24 = DesyncConfig::from_recipe_id(24);
+        assert_eq!(r24.mode, "fake_disorder");
+        assert_eq!(r24.fooling, "md5_badack");
+        assert!(r24.ipfrag);
+        assert!(r24.to_upstream().ipfrag);
+
+        let r25 = DesyncConfig::from_recipe_id(25);
+        assert_eq!(r25.mode, "fake_split");
+        assert_eq!(r25.fooling, "md5_badack");
+        assert!(r25.host_fake);
+        assert!(r25.to_upstream().host_fake);
+
+        let r26 = DesyncConfig::from_recipe_id(26);
+        assert_eq!(r26.mode, "fake_disorder");
+        assert_eq!(r26.fooling, "finrst");
+        assert_eq!(r26.fake_sni, "padencap");
+        assert_eq!(r26.to_upstream().fooling, upstream::DesyncFooling::FinRst);
+
+        let r27 = DesyncConfig::from_recipe_id(27);
+        assert_eq!(r27.mode, "fake_disorder");
+        assert_eq!(r27.fooling, "ip6_destopt");
+        assert!(r27.tlsrec_first);
+        assert_eq!(
+            r27.to_upstream().fooling,
+            upstream::DesyncFooling::Ip6DestOpt
+        );
+
+        for (alias, expected) in [
+            ("ip6_destopt", upstream::DesyncFooling::Ip6DestOpt),
+            ("destopt", upstream::DesyncFooling::Ip6DestOpt),
+            ("destopt2", upstream::DesyncFooling::Ip6DestOpt),
+            ("ip6_ah", upstream::DesyncFooling::Ip6Ah),
+            ("ah", upstream::DesyncFooling::Ip6Ah),
+            ("finrst", upstream::DesyncFooling::FinRst),
+            ("fin_rst", upstream::DesyncFooling::FinRst),
+        ] {
+            let cfg = DesyncConfig {
+                auto: false,
+                fooling: alias.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(cfg.to_upstream().fooling, expected, "alias={alias}");
+        }
+    }
+
+    #[test]
+    fn udp_extra_fields_propagate_to_upstream_and_json() {
+        let mut cfg = DesyncConfig {
+            auto: false,
+            udp_fake_payload: "0x000100002112a442".to_string(),
+            udp_out_range: "1-2".to_string(),
+            udp_keep_socket: true,
+            ..Default::default()
+        };
+        let up = cfg.to_upstream();
+        assert_eq!(
+            up.udp_fake_payload.as_deref(),
+            Some(&[0x00u8, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42][..])
+        );
+        assert_eq!(
+            up.udp_out_range,
+            Some(upstream::UdpOutRange { start: 1, end: 2 })
+        );
+        assert!(up.udp_keep_socket);
+
+        let json = cfg.to_core_outbound_json();
+        assert_eq!(
+            json.get("udp_fake_payload").and_then(|v| v.as_str()),
+            Some("0x000100002112a442")
+        );
+        assert_eq!(
+            json.get("udp_out_range").and_then(|v| v.as_str()),
+            Some("1-2")
+        );
+        assert_eq!(
+            json.get("udp_keep_socket").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        cfg.udp_fake_payload = "bad-hex".to_string();
+        cfg.udp_out_range = "999-1000".to_string();
+        cfg.udp_keep_socket = false;
+        let up_bad = cfg.to_upstream();
+        assert!(up_bad.udp_fake_payload.is_none());
+        assert!(up_bad.udp_out_range.is_none());
+        assert!(!up_bad.udp_keep_socket);
     }
 }

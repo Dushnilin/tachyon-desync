@@ -122,15 +122,172 @@ pub mod logging {
     pub fn warn(_args: std::fmt::Arguments<'_>) {}
 }
 
-/// Вспомогательные монотонные часы, ожидаемые апстримным `tlsspoof.rs` (`crate::util::mono_now_ms`).
+/// Вспомогательные монотонные часы, ожидаемые апстримным `tlsspoof.rs` и `engine.rs` (`crate::util::mono_now_ms` / `mono_now_sec`).
 pub mod util {
     use std::sync::OnceLock;
     use std::time::Instant;
 
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
     #[inline]
     pub fn mono_now_ms() -> u64 {
-        static EPOCH: OnceLock<Instant> = OnceLock::new();
         EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    #[inline]
+    pub fn mono_now_sec() -> u64 {
+        EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_secs()
+            .saturating_add(1)
+    }
+}
+
+/// Минимальный совместимый модуль `core_config`, ожидаемый апстримным `desync/config.rs`.
+pub mod core_config {
+    pub mod desync {
+        use serde_json::Value;
+
+        /// Максимальная декодированная длина `udp_fake_payload` в байтах (1500 - 20 - 8).
+        pub const MAX_UDP_FAKE_PAYLOAD_BYTES: usize = 1472;
+
+        /// Максимальный индекс датаграммы (включительно) для `udp_out_range`.
+        pub const MAX_UDP_OUT_RANGE: u32 = 256;
+
+        /// Включённый 1-based диапазон исходящих UDP-датаграмм, перед которыми отправляются фейки.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct UdpOutRange {
+            pub start: u32,
+            pub end: u32,
+        }
+
+        impl UdpOutRange {
+            #[inline]
+            pub const fn contains(self, pkt_no: u64) -> bool {
+                pkt_no >= self.start as u64 && pkt_no <= self.end as u64
+            }
+
+            pub fn from_json_value(v: &Value) -> Result<Self, String> {
+                match v {
+                    Value::Number(n) => {
+                        let Some(end) = n.as_u64() else {
+                            return Err(
+                                "expected integer (1..=256) or range string (e.g. \"1-2\"), got number"
+                                    .to_string(),
+                            );
+                        };
+                        if !(1..=u64::from(MAX_UDP_OUT_RANGE)).contains(&end) {
+                            return Err(format!(
+                                "udp_out_range {end} must be between 1 and {MAX_UDP_OUT_RANGE}"
+                            ));
+                        }
+                        Ok(Self {
+                            start: 1,
+                            end: end as u32,
+                        })
+                    }
+                    Value::String(raw) => {
+                        let s = raw.trim();
+                        if s.is_empty() {
+                            return Err("udp_out_range cannot be empty".to_string());
+                        }
+                        let sep_count = s.bytes().filter(|&b| b == b'-' || b == b':').count();
+                        if sep_count > 1 {
+                            return Err(format!("invalid udp_out_range string {raw:?}"));
+                        }
+                        if sep_count == 1 {
+                            let (a, b) = s
+                                .split_once('-')
+                                .or_else(|| s.split_once(':'))
+                                .expect("sep_count == 1");
+                            if a.is_empty()
+                                || b.is_empty()
+                                || !a.bytes().all(|c| c.is_ascii_digit())
+                                || !b.bytes().all(|c| c.is_ascii_digit())
+                            {
+                                return Err(format!("invalid udp_out_range string {raw:?}"));
+                            }
+                            let start: u32 = a
+                                .parse()
+                                .map_err(|_| format!("invalid udp_out_range string {raw:?}"))?;
+                            let end: u32 = b
+                                .parse()
+                                .map_err(|_| format!("invalid udp_out_range string {raw:?}"))?;
+                            if start < 1 || end > MAX_UDP_OUT_RANGE || start > end {
+                                return Err(format!(
+                                    "udp_out_range {start}..={end} must satisfy 1 <= start <= end <= {MAX_UDP_OUT_RANGE}"
+                                ));
+                            }
+                            Ok(Self { start, end })
+                        } else {
+                            if !s.bytes().all(|c| c.is_ascii_digit()) {
+                                return Err(format!("invalid udp_out_range string {raw:?}"));
+                            }
+                            let end: u32 = s
+                                .parse()
+                                .map_err(|_| format!("invalid udp_out_range string {raw:?}"))?;
+                            if !(1..=MAX_UDP_OUT_RANGE).contains(&end) {
+                                return Err(format!(
+                                    "udp_out_range {end} must be between 1 and {MAX_UDP_OUT_RANGE}"
+                                ));
+                            }
+                            Ok(Self { start: 1, end })
+                        }
+                    }
+                    other => Err(format!(
+                        "expected integer (1..=256) or range string (e.g. \"1-2\"), got {}",
+                        json_value_kind(other)
+                    )),
+                }
+            }
+        }
+
+        pub fn parse_udp_fake_payload_hex(v: &Value) -> Result<Vec<u8>, String> {
+            let Some(s) = v.as_str() else {
+                return Err(format!(
+                    "expected hex string (e.g. \"0x0001...\"), got {}",
+                    json_value_kind(v)
+                ));
+            };
+            let hex_s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
+            if s.is_empty() || hex_s.is_empty() {
+                return Err("udp_fake_payload cannot be empty".to_string());
+            }
+            if !hex_s.len().is_multiple_of(2) {
+                return Err("udp_fake_payload hex string must have even length".to_string());
+            }
+            if !hex_s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("udp_fake_payload contains invalid hex digits".to_string());
+            }
+            let decoded_len = hex_s.len() / 2;
+            if decoded_len > MAX_UDP_FAKE_PAYLOAD_BYTES {
+                return Err(format!(
+                    "udp_fake_payload decoded length {decoded_len} exceeds maximum {MAX_UDP_FAKE_PAYLOAD_BYTES} bytes"
+                ));
+            }
+            let mut out = Vec::with_capacity(decoded_len);
+            for i in (0..hex_s.len()).step_by(2) {
+                let byte = u8::from_str_radix(&hex_s[i..i + 2], 16)
+                    .map_err(|_| "udp_fake_payload contains invalid hex digits".to_string())?;
+                out.push(byte);
+            }
+            Ok(out)
+        }
+
+        pub fn json_value_kind(v: &Value) -> &'static str {
+            match v {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            }
+        }
     }
 }
 
@@ -322,6 +479,14 @@ pub mod hardware {
         pub total_ram_mb: u64,
         pub cpu_count: usize,
         pub tun_max_tcp_sessions: usize,
+        pub bdp_bytes: usize,
+        pub h2_conn_window: u32,
+        pub udp_socket_buffer: usize,
+    }
+
+    #[inline]
+    pub fn is_memory_pressured() -> bool {
+        false
     }
 
     static LAST_CONNECT_RTT_US: AtomicU64 = AtomicU64::new(0);
@@ -398,10 +563,26 @@ pub mod hardware {
                 } else {
                     4096
                 };
+                let rtt_us = last_connect_rtt_us();
+                let eff_rtt_us = if rtt_us > 0 { rtt_us } else { 40_000 };
+                let raw_bdp = (100u64.saturating_mul(eff_rtt_us) / 8_000).saturating_mul(1024);
+                let bdp_bytes = (raw_bdp as usize).clamp(256 * 1024, 6 * 1024 * 1024);
+                let h2_conn_window = ((total_ram_mb as u32).saturating_mul(4096))
+                    .clamp(1024 * 1024, 16 * 1024 * 1024);
+                let udp_socket_buffer = if total_ram_mb >= 2048 {
+                    2 * 1024 * 1024
+                } else if total_ram_mb >= 512 {
+                    1024 * 1024
+                } else {
+                    512 * 1024
+                };
                 Self {
                     total_ram_mb,
                     cpu_count,
                     tun_max_tcp_sessions,
+                    bdp_bytes,
+                    h2_conn_window,
+                    udp_socket_buffer,
                 }
             })
         }
@@ -524,6 +705,10 @@ pub mod cache_file {
             self.flush_to_disk();
             self.last_flush = std::time::Instant::now();
             Ok(())
+        }
+
+        pub fn release_lock(&self) {
+            self.flush_to_disk();
         }
 
         pub fn flush_to_disk(&self) {
@@ -1160,11 +1345,30 @@ pub mod outbound {
             crate::dns_resolver::forward_tun_dns_packet(query_pkt, orig_dst).await
         }
 
+        #[derive(Clone, Copy, Debug)]
+        pub struct PreconnectSyndata<'a> {
+            pub payload: &'a [u8],
+            pub ttl: u8,
+            pub use_badsum: bool,
+        }
+
         pub async fn connect_tcp_addr(
             dst: SocketAddr,
             dial: &DialOptions,
         ) -> io::Result<TcpStream> {
             connect_tcp_addr_with_window(dst, dial, 0, None).await
+        }
+
+        pub async fn connect_tcp_addr_with_window_and_syndata(
+            dst: SocketAddr,
+            dial: &DialOptions,
+            wsize: u32,
+            wscale: Option<u8>,
+            _syndata: Option<PreconnectSyndata<'_>>,
+        ) -> io::Result<(TcpStream, bool)> {
+            connect_tcp_addr_with_window(dst, dial, wsize, wscale)
+                .await
+                .map(|s| (s, false))
         }
 
         pub async fn connect_tcp_addr_with_window(

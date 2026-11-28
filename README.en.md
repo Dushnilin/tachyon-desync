@@ -8,7 +8,7 @@
 <img src="assets/readme/hero-board.en.svg" width="100%" alt="Tachyon Desync — Cross-Platform Desktop L3/L4/L7 Adaptive Packet Desynchronizer">
 
 <p>
-  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.2.0-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.2.0"></a>
+  <a href="https://github.com/Dushnilin/tachyon-desync/releases/latest"><img src="https://img.shields.io/badge/release-v0.2.1-38bdf8?style=flat-square&labelColor=0f172a" alt="Release v0.2.1"></a>
   <img src="https://img.shields.io/badge/Rust-2024_Edition-f97316?style=flat-square&logo=rust&logoColor=white&labelColor=0f172a" alt="Rust 2024">
   <img src="https://img.shields.io/badge/UI-Native_OpenGL_(egui)-38bdf8?style=flat-square&labelColor=0f172a" alt="Native OpenGL UI">
   <img src="https://img.shields.io/badge/Capture-Wintun_%7C_utun_%7C_tun_L3_%2B_SOCKS5-10b981?style=flat-square&labelColor=0f172a" alt="Wintun + utun + tun L3 + SOCKS5">
@@ -18,14 +18,15 @@
 
 <p>
   <strong>Native cross-platform desktop suite for adaptive traffic delivery, TLS record fragmentation, and L3/L4/L7 packet desynchronization across Windows, any Linux distribution, and any macOS system.</strong><br>
-  Three-tier <code>AdaptiveBrain L1–L3</code> selector (24 TCP + 6 UDP recipes) · <code>32 / 192 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter with userspace <code>smoltcp</code> stack (<code>BBR</code>/<code>CUBIC</code>/<code>Reno</code>) · per-process PID filtering · Clean DNS (<code>DoH</code> / <code>DoT</code> / <code>UDP</code> + benchmark) · Auto-TTL calibration · custom hardware-accelerated <code>OpenGL</code> window frame with zero WebView2 or browser processes.
+  Three-tier <code>AdaptiveBrain L1–L3</code> selector (28 TCP + 6 UDP recipes) · <code>32 / 192 KiB</code> inbound verification gate · virtual <code>Wintun / utun / tun L3</code> adapter (IPv4 + IPv6) with userspace <code>smoltcp</code> stack (<code>BBR</code>/<code>CUBIC</code>/<code>Reno</code>) · per-process PID filtering · Clean DNS (<code>DoH</code> / <code>DoT</code> / <code>UDP</code> + benchmark) · full <code>CLI</code> &amp; Control-IPC · Auto-TTL calibration · custom <code>OpenGL</code> window frame.
 </p>
 
 <p>
   <a href="#quick-start--prebuilt-binaries">Quick Start</a> ·
   <a href="#key-capabilities--interface">Capabilities</a> ·
-  <a href="#desynchronization-pipeline--24-recipes">L1–L3 Recipes</a> ·
+  <a href="#desynchronization-pipeline--28-recipes">L1–L3 Recipes</a> ·
   <a href="#capture-modes--per-process-routing">TUN L3 &amp; Process Filter</a> ·
+  <a href="#command-line-interface-cli--hotkeys">CLI</a> ·
   <a href="#building-from-source">Build</a>
 </p>
 
@@ -53,11 +54,11 @@
 - **Three-Tier `AdaptiveBrain L1–L3` Selector**:
   - **`L1` (Domain Memory, 7-day TTL)**: immediately applies the verified winning recipe for a known hostname (`SNI` / `Host`) from persistent `runtime-state.json`.
   - **`L2` (`/24` Subnet Cache)**: when connecting to a new subdomain hosted on an already learned `/24` IPv4 prefix, reuses the subnet's winning recipe without probing overhead.
-  - **`L3` (Global Channel Scoreboard)**: ranks all 24 TCP recipes using integer `RecipeStats` (success probability + `EWMA RTT`) and passive `IspFingerprint` path profiling.
-- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (both on live streams with `256 KiB` promotion and `active_elapsed` idle subtraction, and via pipelined 1-RTT `TLS 1.3` `> 32 KiB` probing in the Generator and Constructor). Consecutive `TCP RST` bursts automatically trigger background re-probing.
+  - **`L3` (Global Channel Scoreboard)**: ranks all 28 TCP recipes using integer `RecipeStats` (success probability + `EWMA RTT`) and passive `IspFingerprint` path profiling.
+- **`32 KiB` Verification Gate & Silent-Drop Protection**: a candidate recipe is promoted to `L1`/`L2` only after verified application payload transfer (both on live streams with `256 KiB` promotion and `active_elapsed` idle subtraction, and via pipelined 1-RTT `TLS 1.3` `> 32 KiB` / `192 KiB` probing in the Generator and Constructor). Consecutive `TCP RST` bursts automatically trigger background re-probing.
 - **Clean DNS (`DoH` / `DoT` / `UDP`), Benchmark & Local `hosts` Overrides**: built-in resolver supports `DoH` (`RFC 8484`), `DoT` (`RFC 7858`, keep-alive) with optional packet desynchronization (`desync_doh_dot`), non-standard UDP ports (`77.88.8.8:1253`, `208.67.222.222:5353`), split `.ru`/domestic routing (`split_local_ru`), `PTR` `.arpa`, `Turbo Cache`, a 2-phase benchmark with auto-recommendation, and a built-in `hosts` editor without modifying OS files.
 - **Strategy Generator, Auto-TTL Calibration & `ClientHello` Visualizer**:
-  - One-click `> 32 KiB` probing across all 24 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
+  - One-click `32 / 192 KiB` probing across all 28 reference recipes for any target domain with `RTT ms` measurement, automatic deep combination search, and named custom profiles.
   - Active `Auto-TTL` hop discovery (`2..10` hops) to find the exact minimum TTL that reaches transit middleboxes without reaching the destination server.
   - Interactive `TLS ClientHello` slice diagram (`SNI`, `SLD`, `midsld`, `endhost`, 7-point `Split`, `TlsRec`, `Fake`) and live JSON configuration preview.
 - **10 Built-in Service Categories & Per-Process Routing**: curated domain/CIDR lists with per-list `UDP ports` and `UDP TTL` (YouTube, Discord, Telegram, AI Platforms, Streaming, Gaming, Development, Domestic Direct), domain-list priority over built-in game/anticheat bypass, one-click process picker, and optional upstream proxy chaining (`SOCKS5://` or `HTTP://`).
@@ -67,19 +68,19 @@
 | **`Auto`** | Four summary metric cards (`Active flows`, `Desynced`, `Traffic RX/TX`, `Domain cache`), 60-second telemetry chart, **`Network Stack & Tuning`** panel (`BBR`/`CUBIC`, `Turbo 4K` / `Default` presets, buffer auto-tuning & MTU), Clean DNS & local `hosts` controls, one-click service health check, category grid, pinned domain table, and `AdaptiveBrain` cache reset. |
 | **`DNS`** | `DoH` / `DoT` / `UDP` transport setup, `Parallel`/`Sequential` failover, `Turbo Cache`, `desync_doh_dot`, `split_local_ru`, 2-phase benchmark with auto-apply recommendation, multi-domain speed test, and DNS cache flush. |
 | **`Flows`** | Live monitor of active and recent TCP/UDP flows showing process name, target domain/IP, applied recipe, RX/TX byte counters, and quick actions to send a domain to the Generator or bypass list (`Direct`). |
-| **`Generator`** | Automated 24-recipe per-domain `32 / 192 KiB` probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, cache reset, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, SNI pool, `Fake Payload Hex`, `IPv6 Ext`, `QUIC`). |
+| **`Generator`** | Automated 28-recipe per-domain `32 / 192 KiB` probing, `Auto-TTL` hop calibration (`2..10` hops), visual `ClientHello` offset inspector, named profiles, cache reset, and custom profile builder (`Split`, `TlsRec`, `Fake`, `Disorder`, `OOB`, `wsize` / `scale`, SNI pool, `Fake Payload Hex`, `IPv6 Ext` / `ah` / `finrst` / `ipfrag`, `udp_fake_payload` / `udp_out_range` / `udp_keep_socket`). |
 | **`Lists`** | Per-application process filter and list priority over game bypass, per-process strategy overrides, upstream proxy chaining (`SOCKS5/HTTP`), full JSON backup export/import, and editor for all 10 domain/subnet lists (`UDP ports`, `UDP TTL`). |
-| **`Logs`** | Collapsible `L3` channel scoreboard across all 24 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and full log export to clipboard. |
+| **`Logs`** | Collapsible `L3` channel scoreboard across all 28 recipes, category filter (`desync`, `tun`, `proxy`, `quic`, `probe`, `system`), click-to-copy log rows, and one-click export of logs & full `DiagnosticReport` to clipboard. |
 
 ---
 
 <p align="center">
-  <img src="assets/readme/section-pipeline.en.svg" width="100%" alt="Desynchronization Pipeline and 24 Recipes">
+  <img src="assets/readme/section-pipeline.en.svg" width="100%" alt="Desynchronization Pipeline and 28 Recipes">
 </p>
 
-## Desynchronization Pipeline & 24 Recipes
+## Desynchronization Pipeline & 28 Recipes
 
-In **`Auto (24 recipes)`** mode, the engine inspects the first outbound payload (`TLS ClientHello` or `HTTP Request`), computes semantic markers (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`), and executes one of 24 TCP recipes or 6 UDP/QUIC recipes:
+In **`Auto (28 recipes)`** mode, the engine inspects the first outbound payload (`TLS ClientHello` or `HTTP Request`), computes semantic markers (`pos 1`, `sni_ext`, `host_start`, `sld_start`, `midsld`, `sld_end`, `host_end`), and executes one of 28 TCP recipes or 6 UDP/QUIC recipes:
 
 | ID | Recipe Name | Wire-Level Transformation |
 | :---: | :--- | :--- |
@@ -107,6 +108,10 @@ In **`Auto (24 recipes)`** mode, the engine inspects the first outbound payload 
 | **`#21`** | `FakeDisorder SYNData (SYN decoy + Md5BadAck + PadEncap)` | `SYN`-phase decoy payload (`Linux SOCK_RAW`) or `PadEncap + seqovl=10` with `Md5BadAck`. |
 | **`#22`** | `FakeSplit + TlsRec + wsize=64 (host+1, BadSum, ya.ru)` | `wsize=64` receive-window clamping during handshake + TLS record split and `host+1` `BadSum` decoy. |
 | **`#23`** | `MultiDisorder + wsize=1:scale=1 (midsld, AutoTTL + sni_del)` | Out-of-order slicing at `midsld` paired with pre-connect `wsize=1`, `TCP Window Scale = 1`, `AutoTTL`, and an `SNI`-stripped clone. |
+| **`#24`** | `FakeDisorder + IPFrag (midsld, Md5BadAck, max.ru)` | Reverse IP fragmentation (`ipfrag`) combined with `FakeDisorder`, `Md5BadAck`, and `max.ru` decoy profile. |
+| **`#25`** | `5-Seg HostFakeSplit (Md5BadAck, vk.com)` | 5-segment `HostFakeSplit` with pre- and post-position `vk.com` decoys and `Md5BadAck` fooling. |
+| **`#26`** | `FakeDisorder FinRst + PadEncap (midsld)` | `Md5BadAck` decoy followed by a hop-limited `FIN\|RST\|ACK` state-flush probe and `PadEncap` framing. |
+| **`#27`** | `IPv6 DestOpt2 + FakeDisorder + TlsRec (fonts.google.com)` | Dual `IPv6 Destination Options` extension headers paired with `FakeDisorder`, `TlsRec`, and `fonts.google.com` template. |
 
 For **UDP / QUIC** and voice datagrams, 6 dedicated recipes are applied automatically (`#0..#5`: `QUIC Initial` decoy bursts, 24-byte pseudo-random `opaque` datagrams with `udplen` padding, `IPv6 HopByHop` headers, and stepped `TTL 2..5`), along with instant `QUIC UDP/443 -> TCP/TLS` fallback via `ICMP Port Unreachable`.
 
@@ -140,13 +145,42 @@ Download the prebuilt package for your platform from **[GitHub Releases](https:/
 | **macOS 11+ (Universal: Apple Silicon & Intel)** | `Universal` (`M1–M4` + `x86_64`) | `tachyon-desync-macos-universal.dmg` | Open the `.dmg` and drag **`Tachyon Desync.app`** to `/Applications`. Prompts for administrator privileges via macOS dialog when activating `utun`. |
 | **macOS 11+ (Standalone Binaries)** | `ARM64` (`M1–M4`)<br>`Intel` (`x86_64`) | `tachyon-desync-macos-arm64.tar.gz`<br>`tachyon-desync-macos-amd64.tar.gz` | Standalone native `tachyon-desync` binaries for terminal or script execution. |
 
-### Command-Line Flags & Hotkeys
+### Command-Line Interface (CLI) & Hotkeys
 
-- `tachyon-desync --minimized` (or `--tray`) — starts minimized in the background and automatically activates packet capture (used when **Autostart** is enabled).
+All CLI subcommands automatically attach to the parent console on Windows (`AttachConsole`) and support machine-readable `--json` output:
+
+```bash
+# Help, version, and list of 28 adaptive recipes
+tachyon-desync --help
+tachyon-desync --version --json
+tachyon-desync recipes
+
+# Headless daemon mode with mode/port overrides
+tachyon-desync run --mode tun --port 7897
+
+# Per-domain probing, 192 KiB verification, Auto-TTL & diagnostics
+tachyon-desync probe youtube.com --stream-192k --ttl
+tachyon-desync dns bench --apply
+tachyon-desync dns speed
+tachyon-desync doctor
+
+# Live control of an active GUI/headless instance via Control-IPC
+tachyon-desync status
+tachyon-desync flows
+tachyon-desync pin example.com 14
+tachyon-desync toggle
+tachyon-desync stop --exit
+
+# Export/import state and start minimized to tray
+tachyon-desync config export backup-state.json
+tachyon-desync --minimized
+```
+
 - **`Ctrl + Alt + D`** — global hotkey to toggle packet capture on or off from any window.
-- **Configuration & state files** are stored next to the executable in `data/`:
-  - `data/config.json` — capture mode, UI language (`ru` / `en`), domain/subnet lists, selected processes, local `hosts` overrides, and custom generator profile;
-  - `data/runtime-state.json` — persistent `AdaptiveBrain` state (`L1` domain pins, `L2` `/24` subnet cache, `L3` recipe scoreboard).
+- **Configuration & state files** are stored in the platform data directory (`%LOCALAPPDATA%\TachyonDesync` on Windows, `~/.config/tachyon-desync` on Linux/macOS):
+  - `state.json` — `v4` schema: capture mode, `DNS` settings (`DoH`/`DoT`/`UDP`), network stack tuning (`BBR`/`MTU`/`IPv6`), domain/subnet lists, per-app rules, and custom profiles;
+  - `adaptive_cache.json` — persistent `AdaptiveBrain` memory (`L1` domain pins, `L2` `/24` subnet cache, `L3` recipe scoreboard);
+  - `.control.json` — ephemeral loopback Control-IPC port and auth token (removed on exit).
 
 ---
 
@@ -182,6 +216,7 @@ sudo apt-get install -y pkg-config libx11-dev libxcb-render0-dev libxcb-shape0-d
 If Tachyon is useful in your infrastructure or daily workflow, you can support ongoing development:
 
 - **Boosty:** [boosty.to/tachyon](https://boosty.to/tachyon)
+- **SBP (Ozon Bank):** [finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
 - **Russian Cards & SBP (CloudTips):** [pay.cloudtips.ru/p/449c5ef9](https://pay.cloudtips.ru/p/449c5ef9)
 - **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
 - **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
